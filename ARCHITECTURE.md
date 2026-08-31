@@ -21,11 +21,16 @@ ADALM-Pluto SDR at a **nonstandard carrier of 1250 MHz**.
 crates/
   s1g-phy        # pure DSP, no SDR deps. TX: PSDU -> IQ samples @2 MS/s.
                  # RX: streaming state machine, IQ samples -> events (SIG, PSDU, errors).
+  s1g-mac        # OCB (non-BSS) MAC: 802.11 data/ACK frames, wildcard BSSID, FCS,
+                 # A-MPDU, LLC/SNAP, CSMA/backoff, ACK/retry, dedup. IO-free,
+                 # clock-injected engine driven by PHY events; testable standalone.
   s1g-dsp        # rate conversion + generic DSP (halfband 2x resamplers) used at the SDR boundary.
   s1g-sdr        # hardware abstraction: SdrTx / SdrRx / SdrDevice traits. No hardware deps.
   s1g-sdr-pluto  # PlutoSDR backend: pure-Rust iiod network-protocol client (TCP 30431,
                  # docs/iiod-protocol.md) — no native libiio dependency. Optional feature of s1g-tools.
-  s1g-tools      # binaries: s1g-tx, s1g-rx, s1g-sim (loopback with impairments), file I/O (.cf32).
+  s1g-tools      # binaries: s1g-tx, s1g-rx, s1g-sim (loopback with impairments),
+                 # s1g-node (NIC <-> MAC <-> PHY <-> Pluto), file I/O (.cf32),
+                 # Nic trait: TAP via tappers (unix, feature "tap") or Ethernet-over-UDP.
 ```
 
 Dependency direction (arrows = "depends on"):

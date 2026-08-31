@@ -1,0 +1,13 @@
+[package]
+name = "s1g-mac"
+description = "OCB (non-BSS) MAC for the S1G PHY: 802.11 data frames, A-MPDU, CSMA/backoff, optional ACK/retry"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+s1g-phy.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+num-complex.workspace = true

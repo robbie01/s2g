@@ -42,11 +42,17 @@ pub fn detect_stf(buf: &[Complex32], from: usize, threshold: f32) -> Option<(usi
     if from > last {
         return None;
     }
-    // Sliding sums.
+    // Sliding sums. The half-period (lag-8) correlation is tracked as a
+    // guard: the STF's occupied tones (multiples of 4) cancel exactly at
+    // lag 8 through any LTI channel, while DC offset (Pluto LO leakage!)
+    // and CW interferers correlate at *every* lag. Requiring low lag-8
+    // correlation rejects those without touching real preambles.
     let mut c = Complex32::new(0.0, 0.0);
+    let mut c8 = Complex32::new(0.0, 0.0);
     let mut e = 0.0f32;
     for i in 0..WIN {
         c += buf[from + i] * buf[from + i + LAG].conj();
+        c8 += buf[from + i] * buf[from + i + LAG / 2].conj();
         e += buf[from + i + LAG].norm_sqr();
     }
     let mut run = 0usize;
@@ -54,7 +60,8 @@ pub fn detect_stf(buf: &[Complex32], from: usize, threshold: f32) -> Option<(usi
     let mut n = from;
     loop {
         let m = c.norm() / e.max(1e-12);
-        if m > threshold && e > 1e-9 {
+        let m8 = c8.norm() / e.max(1e-12);
+        if m > threshold && m8 < 0.7 * m && e > 1e-9 {
             run += 1;
             acc += c;
             if run >= RUN {
@@ -70,6 +77,7 @@ pub fn detect_stf(buf: &[Complex32], from: usize, threshold: f32) -> Option<(usi
             return None;
         }
         c += buf[n + WIN] * buf[n + WIN + LAG].conj() - buf[n] * buf[n + LAG].conj();
+        c8 += buf[n + WIN] * buf[n + WIN + LAG / 2].conj() - buf[n] * buf[n + LAG / 2].conj();
         e += buf[n + WIN + LAG].norm_sqr() - buf[n + LAG].norm_sqr();
         n += 1;
     }
@@ -183,6 +191,24 @@ mod tests {
     fn no_false_detect_on_noise() {
         let v = noise(4000, 0.5, 3);
         assert!(detect_stf(&v, 0, 0.6).is_none());
+    }
+
+    #[test]
+    fn no_false_detect_on_dc_or_cw() {
+        // Constant DC (LO leakage) correlates at every lag; the lag-8 guard
+        // must reject it.
+        let dc = vec![Complex32::new(1e-3, 1e-3); 4000];
+        assert!(detect_stf(&dc, 0, 0.55).is_none());
+        // Same for a slow CW tone.
+        let cw: Vec<Complex32> = (0..4000)
+            .map(|i| Complex32::from_polar(0.1, 2.0 * core::f32::consts::PI * 0.01 * i as f32))
+            .collect();
+        assert!(detect_stf(&cw, 0, 0.55).is_none());
+        // And a real preamble on top of a DC offset still detects.
+        let (v, start) = preamble_stream(5e3, 400);
+        let with_dc: Vec<Complex32> = v.iter().map(|&s| s + Complex32::new(2e-3, -1e-3)).collect();
+        let (pos, _) = detect_stf(&with_dc, 0, 0.55).expect("detect with DC");
+        assert!(pos + 24 >= start && pos < start + 120);
     }
 
     #[test]

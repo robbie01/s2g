@@ -1,12 +1,13 @@
 [package]
 name = "s1g-tools"
-description = "CLI tools: s1g-tx, s1g-rx, s1g-sim"
+description = "CLI tools: s1g-tx, s1g-rx, s1g-sim, s1g-node"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
 s1g-phy.workspace = true
+s1g-mac.workspace = true
 s1g-dsp.workspace = true
 s1g-sdr.workspace = true
 num-complex.workspace = true
@@ -18,9 +19,15 @@ rand.workspace = true
 workspace = true
 optional = true
 
+# TAP devices via tappers (Linux, macOS, *BSD; Windows has no L2 TAP there —
+# use the UDP NIC on Windows until a tap-windows6 backend lands).
+[target.'cfg(unix)'.dependencies]
+tappers = { version = "0.4", optional = true }
+
 [features]
 default = ["pluto"]
 pluto = ["dep:s1g-sdr-pluto"]
+tap = ["dep:tappers"]
 
 [[bin]]
 name = "s1g-tx"
@@ -33,3 +40,7 @@ path = "src/bin/s1g-rx.rs"
 [[bin]]
 name = "s1g-sim"
 path = "src/bin/s1g-sim.rs"
+
+[[bin]]
+name = "s1g-node"
+path = "src/bin/s1g-node.rs"

@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/s1g-phy",
+    "crates/s1g-mac",
     "crates/s1g-dsp",
     "crates/s1g-sdr",
     "crates/s1g-sdr-pluto",
@@ -22,6 +23,7 @@ clap = { version = "4", features = ["derive"] }
 rand = "0.9"
 
 s1g-phy = { path = "crates/s1g-phy" }
+s1g-mac = { path = "crates/s1g-mac" }
 s1g-dsp = { path = "crates/s1g-dsp" }
 s1g-sdr = { path = "crates/s1g-sdr" }
 s1g-sdr-pluto = { path = "crates/s1g-sdr-pluto" }

@@ -2,6 +2,8 @@
 //! interleaved little-endian f32 I,Q), hex PSDU parsing, and the impairment
 //! channel used by s1g-sim.
 
+pub mod nic;
+
 use anyhow::{bail, Context, Result};
 use num_complex::Complex;
 use std::io::{Read, Write};

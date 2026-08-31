@@ -225,8 +225,9 @@ impl Receiver {
             State::LtfSync { trig, coarse_cfo } => (trig, coarse_cfo),
             _ => unreachable!(),
         };
-        // Need the rest of STF + GI2 + 2×LTS + margin.
-        const SPAN: usize = 420;
+        // Need the rest of STF + GI2 + 2×LTS + margin. The search span
+        // tolerates a trigger up to ~160 samples before the true STF start.
+        const SPAN: usize = 480;
         let Some(slice) = self.extract(trig, SPAN, coarse, trig) else {
             return false;
         };
@@ -290,7 +291,11 @@ impl Receiver {
             }
             Err(_) => {
                 events.push(RxEvent::Error { sample_index: anchor, kind: RxErrorKind::SigInvalid });
-                self.rearm(anchor + 96);
+                // Re-arm AT the anchor: if this was a false sync, a real
+                // preamble may begin only slightly later and must not be
+                // skipped (LTF/Data don't autocorrelate at the STF period,
+                // so re-triggering on the same signal is not a risk).
+                self.rearm(anchor);
             }
         }
         true

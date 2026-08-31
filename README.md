@@ -51,6 +51,31 @@ the Pluto at its usual USB-network address `192.168.2.1`.
 - Frequency accuracy: the RX tolerates ≳ ±40 kHz CFO (±32 ppm at 1.25 GHz), comfortably
   above the spec's ±20 ppm budget, so a stock Pluto TCXO on both ends is fine.
 
+## Networking: OCB MAC + TAP (`s1g-node`)
+
+`s1g-mac` implements a nonstandard-where-it-matters OCB (non-BSS) MAC: 802.11 Data
+frames with the wildcard BSSID, FCS, sequence numbers + dedup, RFC 1042 LLC/SNAP for
+Ethernet payloads, spec-format A-MPDU aggregation for frames over 511 octets, CSMA
+with DIFS + exponential backoff, and optional ACK/retry for unicast (timeouts relaxed
+to SDR-latency scale; real SIFS needs hardware timestamping). The engine is IO-free
+and clock-injected — fully unit-tested plus a two-node over-the-air simulation test.
+
+`s1g-node` wires NIC ↔ MAC ↔ PHY ↔ Pluto:
+
+```sh
+# Linux / macOS / *BSD: a real L2 TAP interface (build with the tap feature)
+cargo build --release --features tap
+sudo target/release/s1g-node --tap s1g0 --uri 192.168.2.1 --mcs 2
+# then: ip addr add 10.99.0.1/24 dev s1g0   (etc. on each node)
+
+# Windows (no L2 TAP backend yet): Ethernet-over-UDP NIC instead
+target\release\s1g-node.exe --udp 127.0.0.1:5001 --uri 192.168.2.1
+```
+
+The `Nic` trait in `s1g-tools` keeps the attachment point pluggable; TAP is via the
+cross-platform `tappers` crate (Linux/macOS/FreeBSD/OpenBSD/NetBSD — all cross-checked
+to compile). Two nodes need distinct `--mac` addresses (default is randomized).
+
 ## Status / roadmap
 
 - [x] TX chain: preamble (STF/LTF1), SIG (CRC-4, QBPSK), scrambler, BCC + puncturing,
@@ -60,7 +85,8 @@ the Pluto at its usual USB-network address `192.168.2.1`.
       (SNR/CFO/EVM/RSSI)
 - [x] NDP CMAC PPDU TX/RX (37-bit body PHY transport for MAC control)
 - [x] PlutoSDR TX/RX backend (pure-Rust iiod client) at arbitrary carrier
-- [ ] MAC (OCB/non-BSS mode) — next; PHY exposes TXVECTOR/RXVECTOR, TXTIME,
-      `params::characteristics` (SIFS/slot), and Response Indication for it
+- [x] OCB MAC: data/ACK frames, A-MPDU, CSMA/backoff, retries, dedup
+- [x] `s1g-node`: TAP (Unix) / UDP (Windows) network interface over the radio
+- [ ] Windows L2 TAP backend (tap-windows6); hardware-timestamped SIFS/ACK timing
 - [ ] Short GI, LDPC, 1/4/8/16 MHz, multi-stream: out of scope for v1, module
       boundaries chosen so they slot in

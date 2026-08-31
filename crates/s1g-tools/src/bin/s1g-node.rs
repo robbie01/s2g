@@ -1,0 +1,272 @@
+//! Full network node: NIC (TAP or UDP) ↔ OCB MAC ↔ S1G PHY ↔ PlutoSDR.
+//!
+//! On Unix with `--features tap`: `s1g-node --tap s1g0` creates a real L2
+//! interface the OS can route through. On Windows (no L2 TAP support yet):
+//! `s1g-node --udp 127.0.0.1:5001` shuttles raw Ethernet frames as UDP
+//! datagrams instead.
+
+use anyhow::{bail, Result};
+use clap::Parser;
+use s1g_mac::{Mac, MacAction, MacConfig, MacEvent};
+use s1g_tools::nic::Nic;
+use s1g_tools::DEFAULT_CENTER_FREQ_HZ;
+
+#[derive(Parser, Debug)]
+#[command(name = "s1g-node", about = "S1G OCB network node (NIC ↔ MAC ↔ PHY ↔ Pluto)")]
+struct Args {
+    /// Create/attach a TAP interface (optionally named). Unix + feature "tap".
+    #[arg(long, num_args = 0..=1, default_missing_value = "", conflicts_with = "udp")]
+    tap: Option<String>,
+    /// Ethernet-over-UDP NIC: local bind address (e.g. 127.0.0.1:5001)
+    #[arg(long)]
+    udp: Option<String>,
+    /// UDP NIC: fixed peer (default: lock onto first sender)
+    #[arg(long)]
+    udp_peer: Option<String>,
+
+    /// Our MAC address (default: locally-administered random)
+    #[arg(long)]
+    mac: Option<String>,
+    /// Data MCS (0-8 or 11)
+    #[arg(long, default_value_t = 2)]
+    mcs: u8,
+    /// Disable ACK/retry for unicast
+    #[arg(long)]
+    no_ack: bool,
+    /// ACK timeout in ms (SDR buffering makes SIFS-scale impossible)
+    #[arg(long, default_value_t = 150)]
+    ack_timeout_ms: u64,
+    #[arg(long, default_value_t = 3)]
+    retries: u32,
+
+    /// Pluto iiod address
+    #[arg(long, default_value = "192.168.2.1")]
+    uri: String,
+    /// RF center frequency, Hz
+    #[arg(long, default_value_t = DEFAULT_CENTER_FREQ_HZ)]
+    freq: f64,
+    /// RX gain: "auto" or dB
+    #[arg(long, default_value = "auto")]
+    gain: String,
+    /// TX gain (attenuation), dB ≤ 0
+    #[arg(long, default_value_t = -10.0)]
+    tx_gain: f64,
+    #[arg(long, default_value_t = 2_200_000.0)]
+    rf_bandwidth: f64,
+    /// Verbose per-frame logging
+    #[arg(long)]
+    verbose: bool,
+}
+
+fn parse_mac(s: &str) -> Result<[u8; 6]> {
+    let parts: Vec<&str> = s.split([':', '-']).collect();
+    if parts.len() != 6 {
+        bail!("MAC address must be six octets");
+    }
+    let mut m = [0u8; 6];
+    for (i, p) in parts.iter().enumerate() {
+        m[i] = u8::from_str_radix(p, 16)?;
+    }
+    Ok(m)
+}
+
+fn random_mac() -> [u8; 6] {
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x5151);
+    let mut m = [0x02, 0x53, 0x31, 0x47, 0, 0]; // 02:"S1G"
+    m[4] = (t >> 8) as u8;
+    m[5] = t as u8;
+    m
+}
+
+fn fmt_mac(m: &[u8; 6]) -> String {
+    m.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(":")
+}
+
+fn make_nic(args: &Args) -> Result<Box<dyn Nic>> {
+    if let Some(udp) = &args.udp {
+        return Ok(Box::new(s1g_tools::nic::UdpNic::new(udp, args.udp_peer.as_deref())?));
+    }
+    #[cfg(all(unix, feature = "tap"))]
+    if let Some(name) = &args.tap {
+        let n = if name.is_empty() { None } else { Some(name.as_str()) };
+        return Ok(Box::new(s1g_tools::nic::TapNic::new(n)?));
+    }
+    #[cfg(not(all(unix, feature = "tap")))]
+    if args.tap.is_some() {
+        bail!("TAP support needs a Unix OS and --features tap; on Windows use --udp BIND");
+    }
+    bail!("choose a NIC: --tap [NAME] (Unix) or --udp BIND")
+}
+
+fn main() -> Result<()> {
+    let args = Args::parse();
+    let addr = match &args.mac {
+        Some(s) => parse_mac(s)?,
+        None => random_mac(),
+    };
+    let mut cfg = MacConfig::new(addr);
+    cfg.mcs = args.mcs;
+    cfg.ack_enabled = !args.no_ack;
+    cfg.ack_timeout_us = args.ack_timeout_ms * 1000;
+    cfg.max_retries = args.retries;
+    let nic = make_nic(&args)?;
+    eprintln!("s1g-node: mac {} | mcs {} | ack {} | nic {}", fmt_mac(&addr), args.mcs, cfg.ack_enabled, nic.describe());
+    run_radio(&args, Mac::new(cfg), nic)
+}
+
+#[cfg(feature = "pluto")]
+fn run_radio(args: &Args, mut mac: Mac, nic: Box<dyn Nic>) -> Result<()> {
+    use num_complex::Complex;
+    use s1g_phy::rx::{Receiver, RxConfig, RxEvent};
+    use s1g_phy::Transmitter;
+    use s1g_sdr::{RxGain, SdrDevice, SdrRx, SdrTx, StreamConfig};
+    use s1g_tools::DEFAULT_DEVICE_RATE_HZ;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    type C32 = Complex<f32>;
+
+    enum Msg {
+        Phy(RxEvent),
+        Eth(Vec<u8>),
+    }
+
+    let gain = if args.gain == "auto" {
+        RxGain::Auto
+    } else {
+        RxGain::Manual(args.gain.parse().map_err(|_| anyhow::anyhow!("--gain must be 'auto' or dB"))?)
+    };
+    let mut pluto = s1g_sdr_pluto::Pluto::open(&args.uri).map_err(|e| anyhow::anyhow!("pluto: {e}"))?;
+    let scfg = StreamConfig {
+        center_freq_hz: args.freq,
+        sample_rate_hz: DEFAULT_DEVICE_RATE_HZ,
+        rf_bandwidth_hz: args.rf_bandwidth,
+    };
+    let mut sdr_rx = pluto.open_rx(&scfg, gain).map_err(|e| anyhow::anyhow!("pluto rx: {e}"))?;
+    let mut sdr_tx = pluto.open_tx(&scfg, args.tx_gain).map_err(|e| anyhow::anyhow!("pluto tx: {e}"))?;
+    eprintln!("radio: {} @ {} Hz, {} S/s device rate", args.uri, args.freq, DEFAULT_DEVICE_RATE_HZ);
+
+    let (msg_tx, msg_rx) = mpsc::channel::<Msg>();
+    let (nic_out_tx, nic_out_rx) = mpsc::channel::<Vec<u8>>();
+
+    // RX thread: radio → decimate → PHY receiver → events.
+    {
+        let msg_tx = msg_tx.clone();
+        std::thread::spawn(move || {
+            let mut dec = s1g_dsp::HalfbandDecim2::new();
+            let mut rx = Receiver::new(RxConfig::default());
+            let mut dev = vec![C32::new(0.0, 0.0); 16384];
+            let mut native = Vec::with_capacity(8192);
+            let mut events = Vec::new();
+            loop {
+                match sdr_rx.recv(&mut dev) {
+                    Ok(n) => {
+                        native.clear();
+                        dec.process(&dev[..n], &mut native);
+                        rx.process(&native, &mut events);
+                        for e in events.drain(..) {
+                            if msg_tx.send(Msg::Phy(e)).is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("radio rx error: {e}");
+                        std::thread::sleep(Duration::from_millis(200));
+                    }
+                }
+            }
+        });
+    }
+
+    // NIC thread: owns the NIC; shuttles frames both ways.
+    {
+        let msg_tx = msg_tx.clone();
+        let mut nic = nic;
+        std::thread::spawn(move || loop {
+            while let Ok(f) = nic_out_rx.try_recv() {
+                if let Err(e) = nic.send_frame(&f) {
+                    eprintln!("nic send error: {e}");
+                }
+            }
+            match nic.recv_frame(Duration::from_millis(2)) {
+                Ok(Some(f)) => {
+                    if msg_tx.send(Msg::Eth(f)).is_err() {
+                        return;
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    eprintln!("nic recv error: {e}");
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+            }
+        });
+    }
+
+    // Main loop: MAC engine + transmit path.
+    let phy_tx = Transmitter::new();
+    let t0 = Instant::now();
+    let mut interp = s1g_dsp::HalfbandInterp2::new();
+    let mut mac_events: Vec<MacEvent> = Vec::new();
+    loop {
+        let now_us = t0.elapsed().as_micros() as u64;
+        match msg_rx.recv_timeout(Duration::from_millis(2)) {
+            Ok(Msg::Phy(ev)) => {
+                if args.verbose {
+                    if let RxEvent::PsduReceived { metrics, rxvector, .. } = &ev {
+                        eprintln!("rx: mcs {} {}B snr {:.1} dB cfo {:+.0} Hz", rxvector.mcs, rxvector.psdu_length, metrics.snr_db, metrics.cfo_hz);
+                    }
+                }
+                mac.on_phy_event(&ev, now_us, &mut mac_events);
+            }
+            Ok(Msg::Eth(f)) => {
+                if let Err(e) = mac.enqueue_eth(&f) {
+                    eprintln!("drop outgoing frame: {e}");
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => bail!("worker thread died"),
+        }
+        for e in mac_events.drain(..) {
+            match e {
+                MacEvent::EthReceived(f) => {
+                    let _ = nic_out_tx.send(f);
+                }
+                MacEvent::TxComplete { dest, acked, retries } => {
+                    if args.verbose {
+                        eprintln!("tx done → {} acked={acked} retries={retries}", fmt_mac(&dest));
+                    }
+                }
+                MacEvent::TxDropped { dest, reason } => {
+                    eprintln!("tx DROPPED → {}: {reason}", fmt_mac(&dest));
+                }
+                MacEvent::NdpReceived { body } => {
+                    eprintln!("ndp: 0x{body:010x}");
+                }
+            }
+        }
+        let now_us = t0.elapsed().as_micros() as u64;
+        if let Some(MacAction::Transmit { txv, psdu }) = mac.poll(now_us, &mut mac_events) {
+            match phy_tx.generate(&txv, &psdu) {
+                Ok(wave) => {
+                    let mut up = Vec::with_capacity(wave.len() * 2 + 64);
+                    interp.process(&wave, &mut up);
+                    interp.process(&vec![C32::new(0.0, 0.0); 32], &mut up);
+                    if let Err(e) = sdr_tx.send(&up) {
+                        eprintln!("radio tx error: {e}");
+                    }
+                }
+                Err(e) => eprintln!("phy tx error: {e}"),
+            }
+        }
+    }
+}
+
+#[cfg(not(feature = "pluto"))]
+fn run_radio(_args: &Args, _mac: Mac, _nic: Box<dyn Nic>) -> Result<()> {
+    bail!("s1g-node requires the 'pluto' feature (default) — rebuild without --no-default-features")
+}
