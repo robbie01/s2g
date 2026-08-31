@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/s1g-phy",
+    "crates/s1g-dsp",
+    "crates/s1g-sdr",
+    "crates/s1g-sdr-pluto",
+    "crates/s1g-tools",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+num-complex = "0.4"
+rustfft = "6.4"
+thiserror = "2"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+rand = "0.9"
+
+s1g-phy = { path = "crates/s1g-phy" }
+s1g-dsp = { path = "crates/s1g-dsp" }
+s1g-sdr = { path = "crates/s1g-sdr" }
+s1g-sdr-pluto = { path = "crates/s1g-sdr-pluto" }
+
+[profile.release]
+lto = "thin"

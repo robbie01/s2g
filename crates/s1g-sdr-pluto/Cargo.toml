@@ -1,0 +1,11 @@
+[package]
+name = "s1g-sdr-pluto"
+description = "ADALM-Pluto backend for s1g-sdr — pure-Rust iiod network client, no native deps"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+s1g-sdr.workspace = true
+num-complex.workspace = true
+thiserror.workspace = true

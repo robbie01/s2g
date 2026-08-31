@@ -1,0 +1,12 @@
+[package]
+name = "s1g-dsp"
+description = "Rate conversion and generic DSP used at the SDR boundary"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+num-complex.workspace = true
+
+[dev-dependencies]
+rustfft.workspace = true
