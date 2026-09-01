@@ -1,19 +1,26 @@
 //! Full TX chain: TXVECTOR + PSDU → S1G_SHORT 2 MHz PPDU samples at 2 MS/s
 //! [23.3.4.3, 23.3.4.6.1; digest coding-chain §11].
 //!
-//! PPDU = STF ‖ LTF1 ‖ SIG ‖ Data. Data field: SERVICE(8×0) + PSDU bits
-//! (LSB-first per octet) + pad → scramble → append 6 zero tail bits →
-//! BCC encode/puncture → per-symbol interleave → map → pilots → OFDM with
-//! 8 µs GI. Each field has unit average power before the output `amplitude`
-//! scaling (default 0.25 ≈ −12 dBFS, leaving OFDM PAPR headroom in a ±1.0
-//! full-scale DAC).
+//! PPDU = STF ‖ LTF1 ‖ SIG ‖ Data. Data field:
+//!
+//! * **BCC**: SERVICE(8×0) + PSDU bits (LSB-first per octet) + pad →
+//!   scramble → append 6 zero tail bits → BCC encode/puncture → per-symbol
+//!   interleave → map → pilots → OFDM with 8 µs GI.
+//! * **LDPC** [23.3.9.4.4]: SERVICE + PSDU + pad (no tail) → scramble
+//!   everything → LDPC PPDU encoding (codeword selection, shortening,
+//!   puncturing/repetition, possibly one extra symbol) → map → LDPC tone
+//!   map → pilots → OFDM.
+//!
+//! Pilots are fixed or traveling per TXVECTOR [23.3.9.10]. Each field has
+//! unit average power before the output `amplitude` scaling (default 0.25 ≈
+//! −12 dBFS, leaving OFDM PAPR headroom in a ±1.0 full-scale DAC).
 
 use crate::bits::bytes_to_bits;
 use crate::error::PhyError;
-use crate::ofdm::{self, DATA_SUBCARRIER_INDICES};
+use crate::ldpc::PpduParams;
 use crate::params::{self, McsParams, N_GI_LONG, N_SERVICE, N_SYM_MAX, N_TAIL, N_TONE_DATA, PSDU_MAX_NO_AGG};
-use crate::vector::{GuardInterval, TxVector};
-use crate::{bcc, interleaver, mapping, pilots, preamble, scrambler, sig, Complex32};
+use crate::vector::{Coding, GuardInterval, TxVector};
+use crate::{bcc, interleaver, mapping, ofdm, pilots, preamble, scrambler, sig, Complex32};
 
 /// Transmitter for 2 MHz S1G_SHORT PPDUs.
 pub struct Transmitter {
@@ -27,24 +34,73 @@ impl Default for Transmitter {
     }
 }
 
-/// Number of Data-field OFDM symbols [Eq 23-79/23-80 specialized:
-/// ceil((8·LEN + 14) / N_DBPS)].
-pub fn n_sym(mcs: u8, psdu_len: usize, aggregation: bool) -> Result<usize, PhyError> {
-    let p = params::mcs_params(mcs)?;
-    let n = (8 * psdu_len + N_SERVICE + N_TAIL).div_ceil(p.n_dbps);
-    if aggregation {
-        if n > N_SYM_MAX {
-            return Err(PhyError::InvalidLength { len: psdu_len, reason: "needs more than 511 symbols" });
-        }
-    } else if psdu_len == 0 || psdu_len > PSDU_MAX_NO_AGG {
-        return Err(PhyError::InvalidLength { len: psdu_len, reason: "non-aggregated PSDU must be 1..=511 octets" });
-    }
-    Ok(n)
+/// Data-field geometry chosen by the TX chain for a PSDU.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DataGeometry {
+    /// Symbols actually transmitted.
+    pub n_sym: usize,
+    /// N_SYM,init (LDPC) — equals `n_sym` for BCC.
+    pub n_sym_init: usize,
+    /// LDPC Extra OFDM Symbol flag.
+    pub ldpc_extra: bool,
+    /// Value of the SIG Length field (octets or `n_sym`).
+    pub length_field: u16,
 }
 
-/// PPDU airtime in µs [Eq 23-74 specialized: 240 + 40·N_SYM].
+/// Choose the Data-field geometry for `psdu_len` octets [Eq 23-79/23-80
+/// (BCC), 23-46/23-47 + 19.3.11.7.5 (LDPC)].
+pub fn data_geometry(mcs: u8, psdu_len: usize, aggregation: bool, coding: Coding) -> Result<DataGeometry, PhyError> {
+    let p = params::mcs_params(mcs)?;
+    if !aggregation && (psdu_len == 0 || psdu_len > PSDU_MAX_NO_AGG) {
+        return Err(PhyError::InvalidLength { len: psdu_len, reason: "non-aggregated PSDU must be 1..=511 octets" });
+    }
+    if aggregation && psdu_len == 0 {
+        return Err(PhyError::InvalidLength { len: 0, reason: "empty A-MPDU" });
+    }
+    let (n_sym, n_sym_init, ldpc_extra) = match coding {
+        Coding::Bcc => {
+            let n = (8 * psdu_len + N_SERVICE + N_TAIL).div_ceil(p.n_dbps);
+            (n, n, false)
+        }
+        Coding::Ldpc => {
+            let n_init = (8 * psdu_len + N_SERVICE).div_ceil(p.n_dbps);
+            let lp = PpduParams::new(n_init, p.n_dbps, p.n_cbps, p.rate);
+            (lp.n_sym, n_init, lp.extra_symbol)
+        }
+    };
+    if n_sym > N_SYM_MAX {
+        return Err(PhyError::InvalidLength { len: psdu_len, reason: "needs more than 511 symbols" });
+    }
+    let length_field = if aggregation { n_sym as u16 } else { psdu_len as u16 };
+    Ok(DataGeometry { n_sym, n_sym_init, ldpc_extra, length_field })
+}
+
+/// Number of Data-field OFDM symbols for a BCC PPDU [Eq 23-79/23-80
+/// specialized: ceil((8·LEN + 14) / N_DBPS)].
+pub fn n_sym(mcs: u8, psdu_len: usize, aggregation: bool) -> Result<usize, PhyError> {
+    Ok(data_geometry(mcs, psdu_len, aggregation, Coding::Bcc)?.n_sym)
+}
+
+/// PPDU airtime in µs for a BCC PPDU [Eq 23-74 specialized: 240 + 40·N_SYM].
 pub fn txtime_us(mcs: u8, psdu_len: usize, aggregation: bool) -> Result<u32, PhyError> {
-    Ok(240 + 40 * n_sym(mcs, psdu_len, aggregation)? as u32)
+    txtime_us_coded(mcs, psdu_len, aggregation, Coding::Bcc)
+}
+
+/// PPDU airtime in µs for either coding.
+pub fn txtime_us_coded(mcs: u8, psdu_len: usize, aggregation: bool, coding: Coding) -> Result<u32, PhyError> {
+    Ok(params::T_PREAMBLE_US + params::T_SYML_US * data_geometry(mcs, psdu_len, aggregation, coding)?.n_sym as u32)
+}
+
+/// PSDU capacity in octets of an aggregated PPDU that must carry at least
+/// `min_octets`: the MAC pads its A-MPDU to exactly this size [23.3.9.4.3.2,
+/// 23.3.9.4.4.2; Eq 23-81/23-82].
+pub fn aggregated_capacity(mcs: u8, min_octets: usize, coding: Coding) -> Result<usize, PhyError> {
+    let p = params::mcs_params(mcs)?;
+    let g = data_geometry(mcs, min_octets, true, coding)?;
+    Ok(match coding {
+        Coding::Bcc => (g.n_sym * p.n_dbps - N_SERVICE - N_TAIL) / 8,
+        Coding::Ldpc => (g.n_sym_init * p.n_dbps - N_SERVICE) / 8,
+    })
 }
 
 fn pick_seed() -> u8 {
@@ -56,6 +112,15 @@ fn pick_seed() -> u8 {
     (nanos % 127) as u8 + 1
 }
 
+/// What the PHY reports back after building a PPDU (PHY-TXEND.confirm
+/// SCRAMBLER_OR_CRC plus the geometry).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TxInfo {
+    pub scrambler_seed: u8,
+    pub geometry: DataGeometry,
+    pub txtime_us: u32,
+}
+
 impl Transmitter {
     pub fn new() -> Self {
         Self::default()
@@ -63,47 +128,76 @@ impl Transmitter {
 
     /// Generate the complete PPDU waveform at 2 MS/s.
     pub fn generate(&self, txv: &TxVector, psdu: &[u8]) -> Result<Vec<Complex32>, PhyError> {
+        Ok(self.generate_with_info(txv, psdu)?.0)
+    }
+
+    /// Generate the PPDU and report the scrambler seed and geometry used.
+    pub fn generate_with_info(&self, txv: &TxVector, psdu: &[u8]) -> Result<(Vec<Complex32>, TxInfo), PhyError> {
         if txv.gi != GuardInterval::Long {
             return Err(PhyError::Unsupported("short GI"));
         }
         let p: &McsParams = params::mcs_params(txv.mcs)?;
-        let nsym = n_sym(txv.mcs, psdu.len(), txv.aggregation)?;
-        let length_field = if txv.aggregation { nsym as u16 } else { psdu.len() as u16 };
-        let fields = sig::SigFields::from_txvector(txv, length_field)?;
+        let geom = data_geometry(txv.mcs, psdu.len(), txv.aggregation, txv.fec_coding)?;
+        let fields = sig::SigFields::from_txvector(txv, geom.length_field, geom.ldpc_extra)?;
         let seed = match txv.scrambler_seed {
             Some(s) if (1..=127).contains(&s) => s,
             Some(_) => return Err(PhyError::InvalidTxVector("scrambler seed must be 1..=127")),
             None => pick_seed(),
         };
 
-        // ---- Data-field bits [coding-chain §11] ----
-        let n_pad = nsym * p.n_dbps - 8 * psdu.len() - N_SERVICE - N_TAIL;
-        let mut bits = Vec::with_capacity(nsym * p.n_dbps);
-        bits.extend_from_slice(&[0u8; N_SERVICE]);
-        bits.extend(bytes_to_bits(psdu));
-        bits.extend(std::iter::repeat_n(0u8, n_pad));
-        scrambler::scramble_in_place(seed, &mut bits);
-        bits.extend_from_slice(&[0u8; N_TAIL]); // unscrambled zero tail
-        debug_assert_eq!(bits.len(), nsym * p.n_dbps);
-        let coded = bcc::encode(&bits, p.rate);
-        debug_assert_eq!(coded.len(), nsym * p.n_cbps);
+        // ---- Data-field coded bits ----
+        let coded: Vec<u8> = match txv.fec_coding {
+            Coding::Bcc => {
+                let n_pad = geom.n_sym * p.n_dbps - 8 * psdu.len() - N_SERVICE - N_TAIL;
+                let mut bits = Vec::with_capacity(geom.n_sym * p.n_dbps);
+                bits.extend_from_slice(&[0u8; N_SERVICE]);
+                bits.extend(bytes_to_bits(psdu));
+                bits.extend(std::iter::repeat_n(0u8, n_pad));
+                scrambler::scramble_in_place(seed, &mut bits);
+                bits.extend_from_slice(&[0u8; N_TAIL]); // unscrambled zero tail
+                debug_assert_eq!(bits.len(), geom.n_sym * p.n_dbps);
+                bcc::encode(&bits, p.rate)
+            }
+            Coding::Ldpc => {
+                let n_pad = geom.n_sym_init * p.n_dbps - 8 * psdu.len() - N_SERVICE;
+                let mut bits = Vec::with_capacity(geom.n_sym_init * p.n_dbps);
+                bits.extend_from_slice(&[0u8; N_SERVICE]);
+                bits.extend(bytes_to_bits(psdu));
+                bits.extend(std::iter::repeat_n(0u8, n_pad));
+                scrambler::scramble_in_place(seed, &mut bits); // pad bits scrambled too
+                let lp = PpduParams::new(geom.n_sym_init, p.n_dbps, p.n_cbps, p.rate);
+                debug_assert_eq!(lp.n_sym, geom.n_sym);
+                lp.encode_data(&bits)
+            }
+        };
+        debug_assert_eq!(coded.len(), geom.n_sym * p.n_cbps);
 
         // ---- Waveform assembly ----
         let scale = 1.0 / (N_TONE_DATA as f32).sqrt();
-        let mut out = Vec::with_capacity(480 + nsym * 80);
+        let mut out = Vec::with_capacity(480 + geom.n_sym * 80);
         out.extend(preamble::stf_time());
         out.extend(preamble::ltf1_time());
         out.extend(sig::encode(&fields));
-        for n in 0..nsym {
-            let ilv = interleaver::interleave(&coded[n * p.n_cbps..(n + 1) * p.n_cbps], p.n_bpscs);
-            let tones = mapping::map(&ilv, p.modulation);
-            let sym = ofdm::assemble_freq_symbol(&DATA_SUBCARRIER_INDICES, &tones, &pilots::data_pilots(n));
+        let tp = txv.traveling_pilots;
+        for n in 0..geom.n_sym {
+            let sym_bits = &coded[n * p.n_cbps..(n + 1) * p.n_cbps];
+            let tones = match txv.fec_coding {
+                Coding::Bcc => mapping::map(&interleaver::interleave(sym_bits, p.n_bpscs), p.modulation),
+                Coding::Ldpc => ofdm::ldpc_tone_map(&mapping::map(sym_bits, p.modulation)),
+            };
+            let sym = ofdm::assemble_freq_symbol(
+                &pilots::data_subcarriers(n, tp),
+                &tones,
+                &pilots::pilot_positions(n, tp),
+                &pilots::data_pilots(n, tp),
+            );
             out.extend(ofdm::to_time_domain(&sym, N_GI_LONG, scale));
         }
         for v in &mut out {
             *v *= self.amplitude;
         }
-        Ok(out)
+        let info = TxInfo { scrambler_seed: seed, geometry: geom, txtime_us: 240 + 40 * geom.n_sym as u32 };
+        Ok((out, info))
     }
 
     /// Generate an NDP CMAC PPDU (no Data field): STF ‖ LTF1 ‖ SIG carrying
@@ -138,6 +232,23 @@ mod tests {
     }
 
     #[test]
+    fn ldpc_geometry() {
+        // MCS 0, 100 octets, LDPC: N_SYM,init = ceil(808/26) = 32 and the
+        // PPDU encoding process adds an extra symbol (see ldpc tests).
+        let g = data_geometry(0, 100, false, Coding::Ldpc).unwrap();
+        assert_eq!(g.n_sym_init, 32);
+        assert_eq!(g.n_sym, 33);
+        assert!(g.ldpc_extra);
+        assert_eq!(g.length_field, 100);
+        let ga = data_geometry(0, 100, true, Coding::Ldpc).unwrap();
+        assert_eq!(ga.length_field, 33);
+        assert_eq!(txtime_us_coded(0, 100, false, Coding::Ldpc).unwrap(), 240 + 33 * 40);
+        // Capacity for the MAC: N_SYM,init·N_DBPS − 8 bits.
+        assert_eq!(aggregated_capacity(0, 100, Coding::Ldpc).unwrap(), (32 * 26 - 8) / 8);
+        assert_eq!(aggregated_capacity(0, 100, Coding::Bcc).unwrap(), (32 * 26 - 14) / 8);
+    }
+
+    #[test]
     fn length_limits() {
         assert!(n_sym(0, 0, false).is_err());
         assert!(n_sym(0, 512, false).is_err());
@@ -151,14 +262,18 @@ mod tests {
     fn waveform_shape_and_determinism() {
         let tx = Transmitter::new();
         for mcs in params::valid_mcs() {
-            let psdu: Vec<u8> = (0..137u32).map(|i| (i * 7 + mcs as u32) as u8).collect();
-            let txv = TxVector { mcs, scrambler_seed: Some(93), ..Default::default() };
-            let w = tx.generate(&txv, &psdu).unwrap();
-            let nsym = n_sym(mcs, psdu.len(), false).unwrap();
-            assert_eq!(w.len(), 480 + 80 * nsym, "MCS {mcs}");
-            // Deterministic with a fixed seed.
-            let w2 = tx.generate(&txv, &psdu).unwrap();
-            assert_eq!(w, w2);
+            for coding in [Coding::Bcc, Coding::Ldpc] {
+                let psdu: Vec<u8> = (0..137u32).map(|i| (i * 7 + mcs as u32) as u8).collect();
+                let txv = TxVector { mcs, fec_coding: coding, scrambler_seed: Some(93), ..Default::default() };
+                let (w, info) = tx.generate_with_info(&txv, &psdu).unwrap();
+                let g = data_geometry(mcs, psdu.len(), false, coding).unwrap();
+                assert_eq!(w.len(), 480 + 80 * g.n_sym, "MCS {mcs} {coding:?}");
+                assert_eq!(info.scrambler_seed, 93);
+                assert_eq!(info.geometry, g);
+                // Deterministic with a fixed seed.
+                let w2 = tx.generate(&txv, &psdu).unwrap();
+                assert_eq!(w, w2);
+            }
         }
     }
 
@@ -176,6 +291,24 @@ mod tests {
         // Preamble + SIG identical; data differs.
         assert_eq!(&a[..480], &b[..480]);
         assert_ne!(&a[480..], &b[480..]);
+    }
+
+    #[test]
+    fn traveling_pilots_change_only_data_symbols() {
+        let tx = Transmitter::new();
+        let psdu = [0x5Au8; 64];
+        let a = tx.generate(&TxVector { scrambler_seed: Some(9), ..Default::default() }, &psdu).unwrap();
+        let b = tx
+            .generate(&TxVector { scrambler_seed: Some(9), traveling_pilots: true, ..Default::default() }, &psdu)
+            .unwrap();
+        assert_eq!(a.len(), b.len());
+        assert_eq!(&a[..320], &b[..320]); // STF + LTF1
+        assert_ne!(&a[320..480], &b[320..480]); // SIG carries the TP bit
+        assert_ne!(&a[480..], &b[480..]);
+        // Unit power preserved (within the 1.5× pilot boost on 4 of 56 tones).
+        let p: f32 = b[480..].iter().map(|v| v.norm_sqr()).sum::<f32>() / (b.len() - 480) as f32;
+        let expect = 0.25f32 * 0.25 * (52.0 + 4.0 * 2.25) / 56.0;
+        assert!((p / expect - 1.0).abs() < 0.1, "power {p} vs {expect}");
     }
 
     #[test]

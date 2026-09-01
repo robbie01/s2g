@@ -5,7 +5,7 @@ use anyhow::Result;
 use clap::Parser;
 use s2g_phy::params::valid_mcs;
 use s2g_phy::rx::{Receiver, RxConfig, RxEvent};
-use s2g_phy::vector::TxVector;
+use s2g_phy::vector::{Coding, TxVector};
 use s2g_phy::Transmitter;
 use s2g_tools::{apply_channel, Complex32, Impairments, Rng};
 
@@ -15,6 +15,15 @@ struct Args {
     /// MCS to test: "all" or an index
     #[arg(long, default_value = "all")]
     mcs: String,
+    /// Use LDPC instead of BCC
+    #[arg(long)]
+    ldpc: bool,
+    /// Use traveling pilots
+    #[arg(long)]
+    traveling_pilots: bool,
+    /// Send as A-MPDU (aggregation bit)
+    #[arg(long)]
+    aggregation: bool,
     /// SNR points in dB, comma separated
     #[arg(long, default_value = "5,10,15,20,25,30,40")]
     snr_db: String,
@@ -30,6 +39,15 @@ struct Args {
     /// Fractional-sample timing offset (0..1)
     #[arg(long, default_value_t = 0.35)]
     frac_delay: f32,
+    /// Sampling-clock offset, ppm (receiver fast when positive)
+    #[arg(long, default_value_t = 0.0)]
+    sfo_ppm: f64,
+    /// Static echo delay in samples (0 = none)
+    #[arg(long, default_value_t = 0)]
+    echo_delay: usize,
+    /// Static echo gain (linear)
+    #[arg(long, default_value_t = 0.5)]
+    echo_gain: f32,
     /// RNG seed
     #[arg(long, default_value_t = 1)]
     seed: u64,
@@ -43,6 +61,7 @@ fn main() -> Result<()> {
         vec![args.mcs.parse()?]
     };
     let snrs: Vec<f32> = args.snr_db.split(',').map(|s| s.trim().parse().unwrap()).collect();
+    let coding = if args.ldpc { Coding::Ldpc } else { Coding::Bcc };
     let tx = Transmitter::new();
     let mut rng = Rng(args.seed);
 
@@ -51,7 +70,14 @@ fn main() -> Result<()> {
         "MCS",
         snrs.iter().map(|s| format!("{s:>7.1}")).collect::<Vec<_>>().join(" ")
     );
-    println!("     | PER at each SNR (dB); cfo={:+.0} Hz, mu={}", args.cfo_hz, args.frac_delay);
+    println!(
+        "     | PER at each SNR (dB); {coding:?}{} cfo={:+.0} Hz, mu={}, sfo={} ppm, echo={}",
+        if args.traveling_pilots { " + traveling pilots" } else { "" },
+        args.cfo_hz,
+        args.frac_delay,
+        args.sfo_ppm,
+        if args.echo_delay > 0 { format!("{}@{} samples", args.echo_gain, args.echo_delay) } else { "none".into() }
+    );
     println!("-----+{}", "-".repeat(8 * snrs.len()));
 
     for mcs in mcs_list {
@@ -60,9 +86,14 @@ fn main() -> Result<()> {
             let mut errors = 0usize;
             for _ in 0..args.count {
                 let psdu = rng.bytes(args.len);
-                let wave = tx
-                    .generate(&TxVector { mcs, ..Default::default() }, &psdu)
-                    .expect("tx");
+                let txv = TxVector {
+                    mcs,
+                    fec_coding: coding,
+                    traveling_pilots: args.traveling_pilots,
+                    aggregation: args.aggregation,
+                    ..Default::default()
+                };
+                let wave = tx.generate(&txv, &psdu).expect("tx");
                 let mut stream: Vec<Complex32> = (0..400)
                     .map(|_| Complex32::new(rng.gauss(), rng.gauss()) * 1e-4)
                     .collect();
@@ -73,13 +104,18 @@ fn main() -> Result<()> {
                     cfo_hz: args.cfo_hz,
                     frac_delay: args.frac_delay,
                     amplitude: 1.0,
+                    sfo_ppm: args.sfo_ppm,
+                    echo: (args.echo_delay > 0).then_some((args.echo_delay, Complex32::new(args.echo_gain, -0.3 * args.echo_gain))),
                 };
                 let noisy = apply_channel(&stream, &imp, &mut rng);
-                let mut rx = Receiver::new(RxConfig::default());
+                let mut rx = Receiver::new(RxConfig { emit_cca: false, ..Default::default() });
                 let mut ev = Vec::new();
                 rx.process(&noisy, &mut ev);
                 rx.finish(&mut ev);
-                let ok = ev.iter().any(|e| matches!(e, RxEvent::PsduReceived { psdu: p, .. } if p == &psdu));
+                // An aggregated PSDU comes back padded to the symbol capacity.
+                let ok = ev.iter().any(|e| {
+                    matches!(e, RxEvent::PsduReceived { psdu: p, .. } if p.len() >= psdu.len() && p[..psdu.len()] == psdu[..])
+                });
                 if !ok {
                     errors += 1;
                 }

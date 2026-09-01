@@ -1,10 +1,13 @@
 //! Two full MAC+PHY nodes talking over a simulated air interface:
-//! Ethernet in on one side, Ethernet out on the other, ACKs and retries
-//! through the real waveform with noise and CFO.
+//! Ethernet in on one side, Ethernet out on the other, NDP Ack / NDP
+//! BlockAck / NDP CTS responses and retries through the real waveform with
+//! noise and CFO.
 
 use num_complex::Complex;
+use s2g_mac::ndp::NdpFrame;
 use s2g_mac::{Mac, MacAction, MacConfig, MacEvent};
 use s2g_phy::rx::{Receiver, RxConfig, RxEvent};
+use s2g_phy::vector::Coding;
 use s2g_phy::Transmitter;
 
 type C32 = Complex<f32>;
@@ -31,21 +34,27 @@ struct Node {
     tx: Transmitter,
     rx: Receiver,
     events: Vec<MacEvent>,
+    ndps_sent: usize,
 }
 
 impl Node {
-    fn new(addr: [u8; 6], mcs: u8, ack: bool) -> Self {
-        let mut cfg = MacConfig::new(addr);
-        cfg.mcs = mcs;
-        cfg.ack_enabled = ack;
-        cfg.ack_timeout_us = 30_000;
-        cfg.max_retries = 4;
+    fn new(cfg: MacConfig) -> Self {
         Self {
             mac: Mac::new(cfg),
             tx: Transmitter::new(),
             rx: Receiver::new(RxConfig::default()),
             events: Vec::new(),
+            ndps_sent: 0,
         }
+    }
+
+    fn config(addr: [u8; 6], mcs: u8, ack: bool) -> MacConfig {
+        let mut cfg = MacConfig::new(addr);
+        cfg.mcs = mcs;
+        cfg.ack_enabled = ack;
+        cfg.ack_timeout_us = 30_000;
+        cfg.max_retries = 4;
+        cfg
     }
 
     /// Receive a waveform: PHY → MAC events.
@@ -58,6 +67,16 @@ impl Node {
         for ev in &phy_events {
             self.mac.on_phy_event(ev, now_us, &mut self.events);
         }
+    }
+
+    fn ndps_received(&self) -> Vec<NdpFrame> {
+        self.events
+            .iter()
+            .filter_map(|e| match e {
+                MacEvent::NdpReceived { frame } => Some(*frame),
+                _ => None,
+            })
+            .collect()
     }
 }
 
@@ -97,14 +116,19 @@ fn run(a: &mut Node, b: &mut Node, max_ms: u64, mut drop_tx: impl FnMut(usize) -
         tx_count: &mut usize,
         drop_tx: &mut impl FnMut(usize) -> bool,
     ) {
-        if let Some(MacAction::Transmit { txv, psdu }) = me.mac.poll(now, &mut me.events) {
-            let idx = *tx_count;
-            *tx_count += 1;
-            let wave = me.tx.generate(&txv, &psdu).expect("phy tx");
-            if !drop_tx(idx) {
-                let air = channel(&wave, 25.0, 9_000.0, rng);
-                peer.hear(&air, now);
+        let wave = match me.mac.poll(now, &mut me.events) {
+            Some(MacAction::Transmit { txv, psdu }) => me.tx.generate(&txv, &psdu).expect("phy tx"),
+            Some(MacAction::TransmitNdp { body }) => {
+                me.ndps_sent += 1;
+                me.tx.generate_ndp(body).expect("phy ndp tx")
             }
+            None => return,
+        };
+        let idx = *tx_count;
+        *tx_count += 1;
+        if !drop_tx(idx) {
+            let air = channel(&wave, 25.0, 9_000.0, rng);
+            peer.hear(&air, now);
         }
     }
     let mut rng = Rng(0xABCD);
@@ -116,55 +140,93 @@ fn run(a: &mut Node, b: &mut Node, max_ms: u64, mut drop_tx: impl FnMut(usize) -
     }
 }
 
-#[test]
-fn unicast_large_frame_with_ack() {
-    let mut a = Node::new(A, 5, true);
-    let mut b = Node::new(B, 5, true);
-    let frame = eth(B, A, 1400); // forces A-MPDU aggregation
-    a.mac.enqueue_eth(&frame).unwrap();
-    run(&mut a, &mut b, 200, |_| false);
-
-    let delivered: Vec<_> = b
-        .events
+fn delivered(n: &Node) -> Vec<&Vec<u8>> {
+    n.events
         .iter()
         .filter_map(|e| match e {
             MacEvent::EthReceived(f) => Some(f),
             _ => None,
         })
-        .collect();
-    assert_eq!(delivered.len(), 1, "B events: {:?}", b.events);
-    assert_eq!(delivered[0], &frame);
+        .collect()
+}
+
+#[test]
+fn unicast_large_frame_with_ndp_block_ack() {
+    let mut a = Node::new(Node::config(A, 5, true));
+    let mut b = Node::new(Node::config(B, 5, true));
+    let frame = eth(B, A, 1400); // forces A-MPDU aggregation
+    a.mac.enqueue_eth(&frame).unwrap();
+    run(&mut a, &mut b, 200, |_| false);
+
+    let got = delivered(&b);
+    assert_eq!(got.len(), 1, "B events: {:?}", b.events);
+    assert_eq!(got[0], &frame);
     assert!(
         a.events.iter().any(|e| matches!(e, MacEvent::TxComplete { acked: true, retries: 0, .. })),
         "A events: {:?}",
         a.events
     );
+    // The acknowledgement was an NDP BlockAck CMAC PPDU.
+    assert_eq!(b.ndps_sent, 1);
+    assert!(matches!(a.ndps_received()[..], [NdpFrame::BlockAck(_)]), "{:?}", a.ndps_received());
+}
+
+#[test]
+fn unicast_small_frame_with_ndp_ack_ldpc_traveling_pilots() {
+    let mut cfg_a = Node::config(A, 4, true);
+    cfg_a.fec_coding = Coding::Ldpc;
+    cfg_a.traveling_pilots = true;
+    let mut a = Node::new(cfg_a);
+    let mut b = Node::new(Node::config(B, 4, true));
+    let frame = eth(B, A, 200);
+    a.mac.enqueue_eth(&frame).unwrap();
+    run(&mut a, &mut b, 100, |_| false);
+    assert_eq!(delivered(&b), vec![&frame], "B events: {:?}", b.events);
+    assert!(a.events.iter().any(|e| matches!(e, MacEvent::TxComplete { acked: true, retries: 0, .. })), "{:?}", a.events);
+    assert!(matches!(a.ndps_received()[..], [NdpFrame::Ack(_)]), "{:?}", a.ndps_received());
+}
+
+#[test]
+fn rts_ndp_cts_protected_exchange() {
+    let mut cfg_a = Node::config(A, 3, true);
+    cfg_a.rts_threshold = Some(64);
+    let mut a = Node::new(cfg_a);
+    let mut b = Node::new(Node::config(B, 3, true));
+    let frame = eth(B, A, 400);
+    a.mac.enqueue_eth(&frame).unwrap();
+    run(&mut a, &mut b, 200, |_| false);
+    assert_eq!(delivered(&b), vec![&frame], "B events: {:?}", b.events);
+    assert!(a.events.iter().any(|e| matches!(e, MacEvent::TxComplete { acked: true, retries: 0, .. })), "{:?}", a.events);
+    // B sent an NDP CTS and then an NDP Ack.
+    assert_eq!(b.ndps_sent, 2);
+    let got = a.ndps_received();
+    assert!(matches!(got[..], [NdpFrame::Cts(_), NdpFrame::Ack(_)]), "{got:?}");
 }
 
 #[test]
 fn broadcast_no_ack() {
-    let mut a = Node::new(A, 2, true);
-    let mut b = Node::new(B, 2, true);
+    let mut a = Node::new(Node::config(A, 2, true));
+    let mut b = Node::new(Node::config(B, 2, true));
     let frame = eth([0xff; 6], A, 200);
     a.mac.enqueue_eth(&frame).unwrap();
     run(&mut a, &mut b, 100, |_| false);
     assert!(b.events.iter().any(|e| matches!(e, MacEvent::EthReceived(f) if f == &frame)));
     assert!(a.events.iter().any(|e| matches!(e, MacEvent::TxComplete { acked: false, .. })));
-    // No ACK should ever have been sent by B.
+    // No response should ever have been sent by B.
     assert_eq!(b.mac.poll(u64::MAX / 2, &mut b.events), None);
+    assert_eq!(b.ndps_sent, 0);
 }
 
 #[test]
 fn lost_first_transmission_retried() {
-    let mut a = Node::new(A, 3, true);
-    let mut b = Node::new(B, 3, true);
+    let mut a = Node::new(Node::config(A, 3, true));
+    let mut b = Node::new(Node::config(B, 3, true));
     let frame = eth(B, A, 300);
     a.mac.enqueue_eth(&frame).unwrap();
     // Drop the very first over-the-air transmission (A's initial data PPDU).
     run(&mut a, &mut b, 400, |idx| idx == 0);
 
-    let delivered: Vec<_> = b.events.iter().filter(|e| matches!(e, MacEvent::EthReceived(_))).collect();
-    assert_eq!(delivered.len(), 1, "B events: {:?}", b.events);
+    assert_eq!(delivered(&b).len(), 1, "B events: {:?}", b.events);
     assert!(
         a.events
             .iter()
@@ -172,4 +234,18 @@ fn lost_first_transmission_retried() {
         "A events: {:?}",
         a.events
     );
+}
+
+#[test]
+fn lost_ndp_ack_retried_and_deduplicated() {
+    let mut a = Node::new(Node::config(A, 2, true));
+    let mut b = Node::new(Node::config(B, 2, true));
+    let frame = eth(B, A, 120);
+    a.mac.enqueue_eth(&frame).unwrap();
+    // Drop B's first NDP Ack (transmission index 1): A retries, B must
+    // ack again but deliver the frame only once.
+    run(&mut a, &mut b, 400, |idx| idx == 1);
+    assert_eq!(delivered(&b).len(), 1, "B events: {:?}", b.events);
+    assert!(a.events.iter().any(|e| matches!(e, MacEvent::TxComplete { acked: true, retries: 1, .. })), "{:?}", a.events);
+    assert_eq!(b.ndps_sent, 2);
 }

@@ -38,6 +38,12 @@ struct Args {
     /// Detection threshold (0..1)
     #[arg(long, default_value_t = 0.55)]
     threshold: f32,
+    /// Calibration: dBm = dBFS + this offset (drives RCPI and the CCA thresholds)
+    #[arg(long, default_value_t = 0.0)]
+    cal_offset_db: f32,
+    /// CCA channel classification: 1 or 2
+    #[arg(long, default_value_t = 1)]
+    cca_type: u8,
 }
 
 struct Printer {
@@ -48,16 +54,34 @@ struct Printer {
 impl Printer {
     fn handle(&mut self, ev: &RxEvent) {
         match ev {
+            RxEvent::Cca { sample_index, busy, reason, hold_us } => {
+                if !self.quiet {
+                    eprintln!("[{sample_index}] CCA {} {reason:?} hold={hold_us} µs", if *busy { "BUSY" } else { "IDLE" });
+                }
+            }
             RxEvent::PpduStart { sample_index, coarse_cfo_hz } => {
                 if !self.quiet {
                     eprintln!("[{sample_index}] detect (coarse CFO {coarse_cfo_hz:+.0} Hz)");
                 }
             }
-            RxEvent::SigDecoded { sample_index, rxvector } => {
+            RxEvent::RxStart { sample_index, rxvector } => {
                 if !self.quiet {
                     eprintln!(
-                        "[{sample_index}] SIG: MCS {} | {} octets | {} sym | agg {} | ri {:?}",
-                        rxvector.mcs, rxvector.psdu_length, rxvector.n_sym, rxvector.aggregation, rxvector.response_indication
+                        "[{sample_index}] RXSTART {:?}{}: MCS {} {:?} | {} octets | {} sym | agg {} | ri {:?} | tp {} | rssi {} rcpi {} ({:.1} dBm) snr {:.1} dB | {} µs",
+                        rxvector.preamble_type,
+                        if rxvector.mu { " MU" } else { "" },
+                        rxvector.mcs,
+                        rxvector.fec_coding,
+                        rxvector.psdu_length,
+                        rxvector.n_sym,
+                        rxvector.aggregation,
+                        rxvector.response_indication,
+                        rxvector.traveling_pilots,
+                        rxvector.rssi,
+                        rxvector.rcpi,
+                        rxvector.rcpi_dbm,
+                        rxvector.snr_db,
+                        rxvector.ppdu_duration_us()
                     );
                 }
             }
@@ -72,13 +96,23 @@ impl Printer {
                 self.psdus += 1;
                 let hex: String = psdu.iter().map(|b| format!("{b:02x}")).collect();
                 println!(
-                    "[{sample_index}] PSDU mcs={} len={} seed={} snr={:.1}dB cfo={:+.0}Hz evm={:.1}dB rssi={:.1}dBFS\n{hex}",
-                    rxvector.mcs, psdu.len(), rxvector.scrambler_seed, metrics.snr_db, metrics.cfo_hz, metrics.evm_db, metrics.rssi_dbfs
+                    "[{sample_index}] PSDU mcs={} {:?} len={} seed={} snr={:.1}dB cfo={:+.0}Hz evm={:.1}dB rssi={:.1}dBFS drift={:+.2} ldpc_fail={}
+{hex}",
+                    rxvector.mcs,
+                    rxvector.fec_coding,
+                    psdu.len(),
+                    rxvector.scrambler_seed,
+                    metrics.snr_db,
+                    metrics.cfo_hz,
+                    metrics.evm_db,
+                    metrics.rssi_dbfs,
+                    metrics.timing_drift_samples,
+                    metrics.ldpc_failures
                 );
             }
-            RxEvent::Error { sample_index, kind } => {
-                if !self.quiet {
-                    eprintln!("[{sample_index}] error: {kind:?}");
+            RxEvent::RxEnd { sample_index, status } => {
+                if !self.quiet && *status != s2g_phy::RxEndStatus::NoError {
+                    eprintln!("[{sample_index}] RXEND {status:?}");
                 }
             }
         }
@@ -87,7 +121,14 @@ impl Printer {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let mut rx = Receiver::new(RxConfig { detect_threshold: args.threshold, emit_ppdu_start: !args.quiet });
+    let mut rx = Receiver::new(RxConfig {
+        detect_threshold: args.threshold,
+        emit_ppdu_start: !args.quiet,
+        emit_cca: !args.quiet,
+        cal_offset_db: args.cal_offset_db,
+        cca_type: if args.cca_type == 2 { s2g_phy::params::rf::CcaType::Type2 } else { s2g_phy::params::rf::CcaType::Type1 },
+        ..Default::default()
+    });
     let mut printer = Printer { quiet: args.quiet, psdus: 0 };
     let mut events: Vec<RxEvent> = Vec::new();
 

@@ -84,10 +84,29 @@ pub struct Impairments {
     /// Fractional-sample delay 0..1 (linear interpolation).
     pub frac_delay: f32,
     pub amplitude: f32,
+    /// Sampling-clock offset between transmitter and receiver, ppm
+    /// (positive = receiver clock fast).
+    pub sfo_ppm: f64,
+    /// Static echo: (delay in samples, complex gain).
+    pub echo: Option<(usize, Complex32)>,
+}
+
+impl Default for Impairments {
+    fn default() -> Self {
+        Self { snr_db: None, cfo_hz: 0.0, frac_delay: 0.0, amplitude: 1.0, sfo_ppm: 0.0, echo: None }
+    }
 }
 
 pub fn apply_channel(sig: &[Complex32], imp: &Impairments, rng: &mut Rng) -> Vec<Complex32> {
     let mut v: Vec<Complex32> = sig.iter().map(|&s| s * imp.amplitude).collect();
+    if let Some((delay, gain)) = imp.echo {
+        v = (0..v.len())
+            .map(|i| v[i] + if i >= delay { v[i - delay] * gain } else { Complex32::new(0.0, 0.0) })
+            .collect();
+    }
+    if imp.sfo_ppm != 0.0 {
+        v = s2g_dsp::apply_sfo_ppm(&v, imp.sfo_ppm);
+    }
     if imp.cfo_hz != 0.0 {
         let w = 2.0 * std::f64::consts::PI * imp.cfo_hz as f64 / 2.0e6;
         for (i, s) in v.iter_mut().enumerate() {

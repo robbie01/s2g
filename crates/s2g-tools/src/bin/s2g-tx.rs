@@ -3,7 +3,7 @@
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use s2g_phy::params::SAMPLE_RATE_HZ;
-use s2g_phy::vector::TxVector;
+use s2g_phy::vector::{Coding, TxVector};
 use s2g_phy::Transmitter;
 use s2g_tools::{parse_hex_psdu, write_cf32, Complex32, Rng, DEFAULT_CENTER_FREQ_HZ, DEFAULT_DEVICE_RATE_HZ};
 use std::path::PathBuf;
@@ -26,6 +26,15 @@ struct Args {
     /// Send as A-MPDU (aggregation bit; PSDU must fill the symbol payload)
     #[arg(long)]
     aggregation: bool,
+    /// LDPC coding instead of BCC
+    #[arg(long)]
+    ldpc: bool,
+    /// Traveling pilots
+    #[arg(long)]
+    traveling_pilots: bool,
+    /// Transmit an NDP CMAC PPDU with this 37-bit body (hex) instead of a data PPDU
+    #[arg(long, conflicts_with_all = ["hex", "file", "random"])]
+    ndp: Option<String>,
     /// Scrambler seed 1..=127 (default: random per PPDU)
     #[arg(long)]
     seed: Option<u8>,
@@ -81,23 +90,35 @@ fn main() -> Result<()> {
         Rng(0xC0FFEE).bytes(n)
     };
 
+    let coding = if args.ldpc { Coding::Ldpc } else { Coding::Bcc };
     let txv = TxVector {
         mcs: args.mcs,
         aggregation: args.aggregation,
+        fec_coding: coding,
+        traveling_pilots: args.traveling_pilots,
         scrambler_seed: args.seed,
         ..Default::default()
     };
     let tx = Transmitter { amplitude: args.amplitude };
-    let wave = tx.generate(&txv, &psdu).map_err(|e| anyhow::anyhow!("PHY: {e}"))?;
-    let txtime = s2g_phy::tx::txtime_us(args.mcs, psdu.len(), args.aggregation).unwrap();
-    eprintln!(
-        "PPDU: MCS {} | {} octets | {} samples @ 2 MS/s | TXTIME {} µs | seed {:?}",
-        args.mcs,
-        psdu.len(),
-        wave.len(),
-        txtime,
-        args.seed
-    );
+    let wave = if let Some(body_hex) = &args.ndp {
+        let body = u64::from_str_radix(body_hex.trim_start_matches("0x"), 16).context("--ndp must be hex")?;
+        let w = tx.generate_ndp(body).map_err(|e| anyhow::anyhow!("PHY: {e}"))?;
+        eprintln!("NDP CMAC PPDU: body 0x{body:010x} | {} samples @ 2 MS/s | 240 µs", w.len());
+        w
+    } else {
+        let (w, info) = tx.generate_with_info(&txv, &psdu).map_err(|e| anyhow::anyhow!("PHY: {e}"))?;
+        eprintln!(
+            "PPDU: MCS {} {:?}{} | {} octets | {} samples @ 2 MS/s | TXTIME {} µs | seed {}",
+            args.mcs,
+            coding,
+            if args.traveling_pilots { " + traveling pilots" } else { "" },
+            psdu.len(),
+            w.len(),
+            info.txtime_us,
+            info.scrambler_seed
+        );
+        w
+    };
 
     if let Some(out) = &args.out {
         let gap = vec![Complex32::new(0.0, 0.0); (args.interval_ms / 1000.0 * SAMPLE_RATE_HZ) as usize];

@@ -8,6 +8,7 @@
 use anyhow::{bail, Result};
 use clap::Parser;
 use s2g_mac::{Mac, MacAction, MacConfig, MacEvent};
+use s2g_phy::vector::Coding;
 use s2g_tools::nic::Nic;
 use s2g_tools::DEFAULT_CENTER_FREQ_HZ;
 
@@ -30,10 +31,22 @@ struct Args {
     /// Data MCS (0-8 or 11)
     #[arg(long, default_value_t = 2)]
     mcs: u8,
+    /// LDPC coding for data frames (optional feature; peer must support it)
+    #[arg(long)]
+    ldpc: bool,
+    /// Traveling pilots on data frames (optional feature; peer must support it)
+    #[arg(long)]
+    traveling_pilots: bool,
     /// Disable ACK/retry for unicast
     #[arg(long)]
     no_ack: bool,
-    /// ACK timeout in ms (SDR buffering makes SIFS-scale impossible)
+    /// Solicit legacy Ack frames instead of NDP Ack / NDP BlockAck
+    #[arg(long)]
+    no_ndp_ack: bool,
+    /// Protect unicast MPDUs longer than this with RTS / NDP CTS
+    #[arg(long)]
+    rts_threshold: Option<usize>,
+    /// Response timeout in ms (SDR buffering makes SIFS-scale impossible)
     #[arg(long, default_value_t = 150)]
     ack_timeout_ms: u64,
     #[arg(long, default_value_t = 3)]
@@ -53,6 +66,12 @@ struct Args {
     tx_gain: f64,
     #[arg(long, default_value_t = 2_200_000.0)]
     rf_bandwidth: f64,
+    /// Receiver calibration: dBm = dBFS + this offset (RCPI, CCA thresholds)
+    #[arg(long, default_value_t = 0.0)]
+    cal_offset_db: f32,
+    /// CCA channel classification: 1 or 2
+    #[arg(long, default_value_t = 1)]
+    cca_type: u8,
     /// Verbose per-frame logging
     #[arg(long)]
     verbose: bool,
@@ -109,11 +128,25 @@ fn main() -> Result<()> {
     };
     let mut cfg = MacConfig::new(addr);
     cfg.mcs = args.mcs;
+    cfg.fec_coding = if args.ldpc { Coding::Ldpc } else { Coding::Bcc };
+    cfg.traveling_pilots = args.traveling_pilots;
     cfg.ack_enabled = !args.no_ack;
+    cfg.ndp_ack = !args.no_ndp_ack;
+    cfg.rts_threshold = args.rts_threshold;
     cfg.ack_timeout_us = args.ack_timeout_ms * 1000;
     cfg.max_retries = args.retries;
     let nic = make_nic(&args)?;
-    eprintln!("s2g-node: mac {} | mcs {} | ack {} | nic {}", fmt_mac(&addr), args.mcs, cfg.ack_enabled, nic.describe());
+    eprintln!(
+        "s2g-node: mac {} | mcs {} {:?}{} | ack {} ({}) | rts {:?} | nic {}",
+        fmt_mac(&addr),
+        args.mcs,
+        cfg.fec_coding,
+        if args.traveling_pilots { " + traveling pilots" } else { "" },
+        cfg.ack_enabled,
+        if cfg.ndp_ack { "NDP" } else { "legacy" },
+        cfg.rts_threshold,
+        nic.describe()
+    );
     run_radio(&args, Mac::new(cfg), nic)
 }
 
@@ -148,6 +181,11 @@ fn run_radio(args: &Args, mut mac: Mac, nic: Box<dyn Nic>) -> Result<()> {
     let mut sdr_rx = pluto.open_rx(&scfg, gain).map_err(|e| anyhow::anyhow!("pluto rx: {e}"))?;
     let mut sdr_tx = pluto.open_tx(&scfg, args.tx_gain).map_err(|e| anyhow::anyhow!("pluto tx: {e}"))?;
     eprintln!("radio: {} @ {} Hz, {} S/s device rate", args.uri, args.freq, DEFAULT_DEVICE_RATE_HZ);
+    let rx_cfg = RxConfig {
+        cal_offset_db: args.cal_offset_db,
+        cca_type: if args.cca_type == 2 { s2g_phy::params::rf::CcaType::Type2 } else { s2g_phy::params::rf::CcaType::Type1 },
+        ..Default::default()
+    };
 
     let (msg_tx, msg_rx) = mpsc::channel::<Msg>();
     let (nic_out_tx, nic_out_rx) = mpsc::channel::<Vec<u8>>();
@@ -157,7 +195,7 @@ fn run_radio(args: &Args, mut mac: Mac, nic: Box<dyn Nic>) -> Result<()> {
         let msg_tx = msg_tx.clone();
         std::thread::spawn(move || {
             let mut dec = s2g_dsp::HalfbandDecim2::new();
-            let mut rx = Receiver::new(RxConfig::default());
+            let mut rx = Receiver::new(rx_cfg);
             let mut dev = vec![C32::new(0.0, 0.0); 16384];
             let mut native = Vec::with_capacity(8192);
             let mut events = Vec::new();
@@ -217,8 +255,16 @@ fn run_radio(args: &Args, mut mac: Mac, nic: Box<dyn Nic>) -> Result<()> {
         match msg_rx.recv_timeout(Duration::from_millis(2)) {
             Ok(Msg::Phy(ev)) => {
                 if args.verbose {
-                    if let RxEvent::PsduReceived { metrics, rxvector, .. } = &ev {
-                        eprintln!("rx: mcs {} {}B snr {:.1} dB cfo {:+.0} Hz", rxvector.mcs, rxvector.psdu_length, metrics.snr_db, metrics.cfo_hz);
+                    match &ev {
+                        RxEvent::PsduReceived { metrics, rxvector, .. } => eprintln!(
+                            "rx: mcs {} {:?} {}B snr {:.1} dB cfo {:+.0} Hz rcpi {:.1} dBm evm {:.1} dB",
+                            rxvector.mcs, rxvector.fec_coding, rxvector.psdu_length, metrics.snr_db, metrics.cfo_hz, rxvector.rcpi_dbm, metrics.evm_db
+                        ),
+                        RxEvent::RxEnd { status, .. } if *status != s2g_phy::RxEndStatus::NoError => eprintln!("rx end: {status:?}"),
+                        RxEvent::RxStart { rxvector, .. } if rxvector.preamble_type == s2g_phy::PreambleType::S1gLong => {
+                            eprintln!("rx: S1G_LONG PPDU ({} µs), not decoded", rxvector.ppdu_duration_us())
+                        }
+                        _ => {}
                     }
                 }
                 mac.on_phy_event(&ev, now_us, &mut mac_events);
@@ -244,23 +290,37 @@ fn run_radio(args: &Args, mut mac: Mac, nic: Box<dyn Nic>) -> Result<()> {
                 MacEvent::TxDropped { dest, reason } => {
                     eprintln!("tx DROPPED → {}: {reason}", fmt_mac(&dest));
                 }
-                MacEvent::NdpReceived { body } => {
-                    eprintln!("ndp: 0x{body:010x}");
+                MacEvent::NdpReceived { frame } => {
+                    if args.verbose {
+                        eprintln!("ndp: {frame:?}");
+                    }
                 }
             }
         }
         let now_us = t0.elapsed().as_micros() as u64;
-        if let Some(MacAction::Transmit { txv, psdu }) = mac.poll(now_us, &mut mac_events) {
-            match phy_tx.generate(&txv, &psdu) {
-                Ok(wave) => {
-                    let mut up = Vec::with_capacity(wave.len() * 2 + 64);
-                    interp.process(&wave, &mut up);
-                    interp.process(&vec![C32::new(0.0, 0.0); 32], &mut up);
-                    if let Err(e) = sdr_tx.send(&up) {
-                        eprintln!("radio tx error: {e}");
-                    }
+        let wave = match mac.poll(now_us, &mut mac_events) {
+            Some(MacAction::Transmit { txv, psdu }) => match phy_tx.generate(&txv, &psdu) {
+                Ok(w) => Some(w),
+                Err(e) => {
+                    eprintln!("phy tx error: {e}");
+                    None
                 }
-                Err(e) => eprintln!("phy tx error: {e}"),
+            },
+            Some(MacAction::TransmitNdp { body }) => match phy_tx.generate_ndp(body) {
+                Ok(w) => Some(w),
+                Err(e) => {
+                    eprintln!("phy ndp tx error: {e}");
+                    None
+                }
+            },
+            None => None,
+        };
+        if let Some(wave) = wave {
+            let mut up = Vec::with_capacity(wave.len() * 2 + 64);
+            interp.process(&wave, &mut up);
+            interp.process(&vec![C32::new(0.0, 0.0); 32], &mut up);
+            if let Err(e) = sdr_tx.send(&up) {
+                eprintln!("radio tx error: {e}");
             }
         }
     }

@@ -1,4 +1,5 @@
-//! OFDM symbol assembly for 2 MHz: subcarrier layout, IFFT/FFT, GI insertion.
+//! OFDM symbol assembly for 2 MHz: subcarrier layout, IFFT/FFT, GI insertion,
+//! LDPC tone mapping.
 //!
 //! Subcarrier convention: logical indices −32..31 (DC = 0); a `FreqSymbol`
 //! array index a holds subcarrier k = a − 32 (fftshift order). TX waveform
@@ -17,9 +18,10 @@ use crate::Complex32;
 use rustfft::{Fft, FftPlanner};
 use std::sync::{Arc, OnceLock};
 
-/// The 52 Data-field subcarrier indices, ascending (±1..±28 minus pilots at
-/// ±7, ±21). Ascending order matches M'_2(k) [Eq 23-30]: data symbol i goes
-/// on the i-th of these tones.
+/// The 52 Data-field subcarrier indices with fixed pilots, ascending
+/// (±1..±28 minus pilots at ±7, ±21). Ascending order matches M'_2(k)
+/// [Eq 23-30]: data symbol i goes on the i-th of these tones. With traveling
+/// pilots the set varies per symbol — see `pilots::data_subcarriers`.
 pub const DATA_SUBCARRIER_INDICES: [i32; 52] = data_indices();
 
 const fn data_indices() -> [i32; 52] {
@@ -54,6 +56,42 @@ const fn sig_indices() -> [i32; 48] {
     out
 }
 
+/// LDPC tone-mapping distance D_TM for 2 MHz (= VHT 20 MHz) [Table 21-19;
+/// 23.3.9.9.2].
+pub const LDPC_D_TM: usize = 4;
+
+/// LDPC tone mapper permutation t(k) [Eq 21-86] for N_SD = 52, D_TM = 4:
+/// t(k) = D_TM·(k mod (N_SD/D_TM)) + ⌊k·D_TM/N_SD⌋. Constellation point k
+/// is transmitted on data tone t(k), so consecutive points land ≥ D_TM − 1
+/// data tones apart.
+pub fn ldpc_tone_map_index(k: usize) -> usize {
+    let n_sd = 52;
+    LDPC_D_TM * (k % (n_sd / LDPC_D_TM)) + (k * LDPC_D_TM) / n_sd
+}
+
+/// Apply the LDPC tone mapper to 52 constellation points (output index =
+/// data-tone index).
+pub fn ldpc_tone_map(points: &[Complex32]) -> Vec<Complex32> {
+    debug_assert_eq!(points.len(), 52);
+    let mut out = vec![Complex32::new(0.0, 0.0); 52];
+    for (k, &p) in points.iter().enumerate() {
+        out[ldpc_tone_map_index(k)] = p;
+    }
+    out
+}
+
+/// Undo the LDPC tone mapper on per-bit LLRs (`n_bpscs` LLRs per data tone,
+/// in data-tone order) → LLRs in constellation-point order.
+pub fn ldpc_tone_demap_llrs(llrs: &[f32], n_bpscs: usize) -> Vec<f32> {
+    debug_assert_eq!(llrs.len(), 52 * n_bpscs);
+    let mut out = vec![0.0f32; llrs.len()];
+    for k in 0..52 {
+        let t = ldpc_tone_map_index(k);
+        out[k * n_bpscs..(k + 1) * n_bpscs].copy_from_slice(&llrs[t * n_bpscs..(t + 1) * n_bpscs]);
+    }
+    out
+}
+
 /// Freq-domain symbol: 64 bins, array index a = subcarrier (a − 32).
 pub type FreqSymbol = [Complex32; 64];
 
@@ -63,14 +101,20 @@ pub fn bin(k: i32) -> usize {
     (k + 32) as usize
 }
 
-/// Place values onto the given subcarrier indices of a zeroed symbol.
-pub fn assemble_freq_symbol(indices: &[i32], values: &[Complex32], pilots: &[Complex32; 4]) -> FreqSymbol {
+/// Place data values onto `indices` and pilot values onto `pilot_indices`
+/// of a zeroed symbol.
+pub fn assemble_freq_symbol(
+    indices: &[i32],
+    values: &[Complex32],
+    pilot_indices: &[i32; 4],
+    pilots: &[Complex32; 4],
+) -> FreqSymbol {
     debug_assert_eq!(indices.len(), values.len());
     let mut sym = [Complex32::new(0.0, 0.0); 64];
     for (&k, &v) in indices.iter().zip(values) {
         sym[bin(k)] = v;
     }
-    for (&k, &p) in crate::pilots::PILOT_INDICES.iter().zip(pilots) {
+    for (&k, &p) in pilot_indices.iter().zip(pilots) {
         sym[bin(k)] = p;
     }
     sym
@@ -152,7 +196,7 @@ mod tests {
             .map(|i| Complex32::new(((i % 3) as f32) - 1.0, ((i % 5) as f32) / 2.0 - 1.0))
             .collect();
         let pilots = [Complex32::new(1.0, 0.0); 4];
-        let sym = assemble_freq_symbol(&DATA_SUBCARRIER_INDICES, &vals, &pilots);
+        let sym = assemble_freq_symbol(&DATA_SUBCARRIER_INDICES, &vals, &PILOT_INDICES, &pilots);
         let scale = 1.0 / (56.0f32).sqrt();
         let t = to_time_domain(&sym, 16, scale);
         assert_eq!(t.len(), 80);
@@ -182,9 +226,38 @@ mod tests {
         // 56 unit tones scaled 1/sqrt(56) → unit average time-domain power.
         let vals: Vec<Complex32> = (0..52).map(|i| Complex32::new(if i % 2 == 0 { 1.0 } else { -1.0 }, 0.0)).collect();
         let pilots = [Complex32::new(1.0, 0.0), Complex32::new(1.0, 0.0), Complex32::new(1.0, 0.0), Complex32::new(-1.0, 0.0)];
-        let sym = assemble_freq_symbol(&DATA_SUBCARRIER_INDICES, &vals, &pilots);
+        let sym = assemble_freq_symbol(&DATA_SUBCARRIER_INDICES, &vals, &PILOT_INDICES, &pilots);
         let x = idft(&sym, 1.0 / (56.0f32).sqrt());
         let p: f32 = x.iter().map(|v| v.norm_sqr()).sum::<f32>() / 64.0;
         assert!((p - 1.0).abs() < 1e-4, "power {p}");
+    }
+
+    #[test]
+    fn ldpc_tone_mapper_is_a_spread_bijection() {
+        let mut seen = [false; 52];
+        for k in 0..52 {
+            let t = ldpc_tone_map_index(k);
+            assert!(!seen[t]);
+            seen[t] = true;
+        }
+        // Consecutive points ≥ D_TM − 1 tones apart (except the row wrap).
+        for k in 0..51 {
+            let (a, b) = (ldpc_tone_map_index(k) as i64, ldpc_tone_map_index(k + 1) as i64);
+            if k % 13 != 12 {
+                assert!((a - b).abs() >= LDPC_D_TM as i64, "k {k}: {a} {b}");
+            }
+        }
+        assert_eq!(ldpc_tone_map_index(0), 0);
+        assert_eq!(ldpc_tone_map_index(1), 4);
+        assert_eq!(ldpc_tone_map_index(13), 1);
+        // LLR demap inverts the point permutation.
+        let pts: Vec<Complex32> = (0..52).map(|i| Complex32::new(i as f32, 0.0)).collect();
+        let mapped = ldpc_tone_map(&pts);
+        let llrs: Vec<f32> = mapped.iter().flat_map(|p| [p.re, p.re + 0.5]).collect();
+        let back = ldpc_tone_demap_llrs(&llrs, 2);
+        for k in 0..52 {
+            assert_eq!(back[2 * k], k as f32);
+            assert_eq!(back[2 * k + 1], k as f32 + 0.5);
+        }
     }
 }
