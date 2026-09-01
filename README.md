@@ -53,6 +53,27 @@ The Pluto backend speaks the **iiod network protocol directly** (TCP 30431, the 
 path libiio's `ip:` backend uses) — no native libiio install needed on the host. Reach
 the Pluto at its usual USB-network address `192.168.2.1`.
 
+## Validation on real captures
+
+`s2g-rx` replays SigMF / ci16 / cf32 recordings at any sample rate (`--rate`, `--shift-hz`),
+parses the MAC frames (`--mac`) and writes them to a PCAP (`--pcap`). Run against
+[Daniel Estévez's 35 s baby-monitor capture](https://destevez.net/2025/01/decoding-ieee-802-11ah/)
+(a commercial HaLow chip at 866 MHz, 2 MHz channel, Pluto at 3.84 MS/s):
+
+```sh
+target/release/s2g-rx --in baby-monitor.sigmf --mac --quiet --pcap s2g.pcap
+python scripts/compare_pcap.py 802_11_ah.pcap s2g.pcap
+```
+
+| PPDUs | s2g result | vs. ground-truth PCAP |
+|---|---|---|
+| 1469 S1G_SHORT (MCS 1–2, BCC, some with traveling pilots) | 1469 decoded, FCS valid | byte-exact match for all 1467 non-Data frames (223 RTS, 51 Action, 71 S1G Beacons, 1122 +HTC-wrapped CTS/BlockAck) plus 2 valid frames the reference decoder missed |
+| 1072 S1G_LONG (MCS 4/7 data, aggregated, traveling pilots) | SIG-A decoded → `RxEnd(UnsupportedRate)` with duration | consistent with the 1296 data MPDUs in the PCAP |
+| SIG CRC failures | 2 in 35 s | — |
+
+The chip rounds non-aggregated PSDU lengths up to a multiple of 4 octets and pads after the
+FCS; `frame::locate_mpdu` tolerates that.
+
 ## Hardware notes
 
 - The AD9363 can't stream at 2 MS/s, so the radio runs at **4 MS/s** and `s2g-dsp`

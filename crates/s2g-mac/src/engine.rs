@@ -310,7 +310,8 @@ impl Mac {
                 let mpdus: Vec<Vec<u8>> = if rxvector.aggregation {
                     ampdu::deaggregate(psdu)
                 } else {
-                    vec![psdu.clone()]
+                    // Tolerate chips that pad the PSDU after the FCS.
+                    vec![frame::locate_mpdu(psdu).unwrap_or(psdu).to_vec()]
                 };
                 for mpdu in mpdus {
                     self.on_mpdu(&mpdu, rxvector, now_us, out);

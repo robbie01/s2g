@@ -75,6 +75,14 @@ pub enum ParsedFrame {
     Other { fc: [u8; 2], duration_us: u16 },
 }
 
+/// Locate the MPDU inside a non-aggregated PSDU. Some S1G chips (seen on a
+/// commercial HaLow baby monitor) round the SIG Length up to a multiple of
+/// 4 octets and pad after the FCS, so try the full PSDU first and then up
+/// to 3 shorter prefixes; returns the longest prefix whose FCS verifies.
+pub fn locate_mpdu(psdu: &[u8]) -> Option<&[u8]> {
+    (0..4usize).filter_map(|trim| psdu.len().checked_sub(trim)).find(|&len| len >= 10 && fcs::check_and_strip(&psdu[..len]).is_some()).map(|len| &psdu[..len])
+}
+
 fn addr(b: &[u8]) -> MacAddr {
     let mut a = [0u8; 6];
     a.copy_from_slice(&b[..6]);
@@ -162,6 +170,18 @@ mod tests {
         let f = build_rts(B, A, 1234);
         assert_eq!(f.len(), RTS_LEN);
         assert_eq!(parse(&f).unwrap(), ParsedFrame::Rts { ra: B, ta: A, duration_us: 1234 });
+    }
+
+    #[test]
+    fn padded_psdu_is_located() {
+        let f = build_ack(A);
+        let mut padded = f.clone();
+        padded.extend_from_slice(&[1, 0]);
+        assert_eq!(locate_mpdu(&padded), Some(&f[..]));
+        assert_eq!(locate_mpdu(&f), Some(&f[..]));
+        let mut bad = f.clone();
+        bad[5] ^= 1;
+        assert_eq!(locate_mpdu(&bad), None);
     }
 
     #[test]

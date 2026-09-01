@@ -246,4 +246,4 @@ mod tests {
 }
 
 pub mod resample;
-pub use resample::{apply_sfo_ppm, resample};
+pub use resample::{apply_sfo_ppm, frequency_shift, resample, resample_lowpass};

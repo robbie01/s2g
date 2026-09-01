@@ -2,3 +2,4 @@
 *.cf32
 # IEEE spec PDF: copyrighted, 53 MB — keep local only
 80211-2024.pdf
+data/
