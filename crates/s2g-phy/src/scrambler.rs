@@ -7,9 +7,10 @@
 //! sequence bits — that is how a receiver recovers the seed.
 
 /// Generate `len` bits of the scrambling sequence for `seed` (1..=127; only
-/// the low 7 bits are used, and they must not all be zero).
+/// the low 7 bits are used). A zero seed is forbidden on transmit
+/// [17.3.5.5], but some chips do send it; it simply yields the all-zero
+/// sequence (no scrambling), which is what a receiver must apply.
 pub fn sequence(seed: u8, len: usize) -> Vec<u8> {
-    debug_assert!(seed & 0x7f != 0, "scrambler seed must be nonzero");
     let mut s = Vec::with_capacity(len.max(7));
     for i in 0..7.min(len) {
         s.push((seed >> i) & 1);
@@ -31,15 +32,15 @@ pub fn scramble_in_place(seed: u8, bits: &mut [u8]) {
 }
 
 /// Recover the seed from the first 7 scrambled bits of the SERVICE field
-/// (valid because SERVICE B0–B6 are zero before scrambling). Returns None if
-/// the recovered seed is zero (invalid).
-pub fn recover_seed(first7: &[u8]) -> Option<u8> {
+/// (valid because SERVICE B0–B6 are zero before scrambling). A zero result
+/// means the transmitter used the (illegal but observed in the wild)
+/// all-zero state, i.e. no scrambling.
+pub fn recover_seed(first7: &[u8]) -> u8 {
     debug_assert!(first7.len() >= 7);
-    let seed = first7[..7]
+    first7[..7]
         .iter()
         .enumerate()
-        .fold(0u8, |acc, (i, &b)| acc | ((b & 1) << i));
-    (seed != 0).then_some(seed)
+        .fold(0u8, |acc, (i, &b)| acc | ((b & 1) << i))
 }
 
 #[cfg(test)]
@@ -78,12 +79,15 @@ mod tests {
 
     #[test]
     fn seed_recovery() {
-        for seed in 1..=127u8 {
+        for seed in 0..=127u8 {
             // SERVICE B0..B6 = 0 -> scrambled bits are the sequence itself.
             let mut service = vec![0u8; 7];
             scramble_in_place(seed, &mut service);
-            assert_eq!(recover_seed(&service), Some(seed));
+            assert_eq!(recover_seed(&service), seed);
         }
-        assert_eq!(recover_seed(&[0; 7]), None);
+        // Seed 0: identity.
+        let mut x = vec![1u8, 0, 1, 1, 0, 0, 1, 0, 1, 1];
+        scramble_in_place(0, &mut x);
+        assert_eq!(x, vec![1u8, 0, 1, 1, 0, 0, 1, 0, 1, 1]);
     }
 }

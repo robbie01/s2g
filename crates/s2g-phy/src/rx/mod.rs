@@ -127,6 +127,13 @@ pub enum RxEvent {
     RxEnd { sample_index: u64, status: RxEndStatus },
 }
 
+/// Per-symbol tracking trace on stderr when the `S2G_TRACE` environment
+/// variable is set (diagnostics for recordings).
+fn trace_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("S2G_TRACE").is_some())
+}
+
 /// FFT-window backoff into the preceding GI, samples. With a 16-sample GI
 /// this tolerates a channel delay spread of up to 16 − 6 = 10 samples
 /// (5 µs) together with ±6 samples of timing error before ISI appears; the
@@ -155,21 +162,39 @@ struct TimingTracker {
     filtered: f32,
     shift: i64,
     total: f32,
+    last_raw: Option<f32>,
 }
 
 impl TimingTracker {
     fn new() -> Self {
-        Self { filtered: 0.0, shift: 0, total: 0.0 }
+        Self { filtered: 0.0, shift: 0, total: 0.0, last_raw: None }
     }
 
     /// Feed one symbol's timing-offset estimate (samples, relative to the
     /// current window). Returns the residual offset to correct for *this*
     /// symbol; the window shift for later symbols is in `shift`.
+    ///
+    /// Slow drift is low-pass filtered; a sudden discontinuity (a dropped
+    /// sample in an SDR stream, seen on RTL-SDR captures) is detected as a
+    /// measurement far from the filter and is applied immediately, and the
+    /// filter snaps once two consecutive measurements agree on it.
     fn update(&mut self, offset: f32) -> f32 {
         const ALPHA: f32 = 1.0 / 12.0;
         const STEP_AT: f32 = 0.7;
-        self.filtered += ALPHA * (offset - self.filtered);
-        let applied = self.filtered;
+        const JUMP: f32 = 0.35;
+        const AGREE: f32 = 0.15;
+        let jump = (offset - self.filtered).abs() > JUMP;
+        if jump {
+            if let Some(prev) = self.last_raw {
+                if (offset - prev).abs() < AGREE && (prev - self.filtered).abs() > JUMP {
+                    self.filtered = 0.5 * (offset + prev);
+                }
+            }
+        } else {
+            self.filtered += ALPHA * (offset - self.filtered);
+        }
+        self.last_raw = Some(offset);
+        let applied = if jump { offset } else { self.filtered };
         if self.filtered > STEP_AT {
             self.shift += 1;
             self.filtered -= 1.0;
@@ -624,9 +649,9 @@ impl Receiver {
         let indices = pilots::data_subcarriers(n, tp);
 
         // ---- Carrier-lost detection [23.3.20] ----
-        let est = ds.eq.estimate();
+        let (sig_pow, noise_var) = (ds.eq.estimate().signal_power, ds.eq.estimate().noise_var);
         let p_sym = chanest::used_tone_power(&w);
-        let lost = p_sym < 0.15 * est.signal_power && p_sym < 3.0 * est.noise_var;
+        let lost = p_sym < 0.15 * sig_pow && p_sym < 3.0 * noise_var;
         ds.lost_run = if lost { ds.lost_run + 1 } else { 0 };
         if ds.lost_run >= self.cfg.carrier_lost_symbols {
             events.push(RxEvent::RxEnd { sample_index: payload, status: RxEndStatus::CarrierLost });
@@ -649,6 +674,18 @@ impl Receiver {
         let e = ds.eq.apply(&w, &indices, cpe, slope);
         if tp {
             ds.eq.track_pilots(&w, &positions, &expected, cpe, slope, 0.5);
+        }
+        if trace_enabled() {
+            eprintln!(
+                "trace sym {n:3} raw_off {:+.3} filt {:+.3} shift {:+} cpe {:+.3} meas_cpe {:+.3} q {:.3} p_sym/sig {:.2}",
+                m.timing_offset_samples(),
+                ds.timing.filtered,
+                ds.timing.shift,
+                cpe,
+                m.cpe,
+                m.quality,
+                p_sym / sig_pow.max(1e-12)
+            );
         }
 
         let result = ds.dec.push_symbol(&e.data, &e.csi);

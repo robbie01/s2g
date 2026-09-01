@@ -98,7 +98,7 @@ impl DataDecoder {
         };
         // Recover the seed from the first 7 bits (SERVICE B0..B6 are zero
         // before scrambling), then descramble.
-        let seed = scrambler::recover_seed(&bits[..7]).unwrap_or(1);
+        let seed = scrambler::recover_seed(&bits[..7]);
         scrambler::scramble_in_place(seed, &mut bits[..scr_len]);
         let end = (N_SERVICE + 8 * self.psdu_length).min(bits.len());
         let psdu_bits = &bits[N_SERVICE..end];

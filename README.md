@@ -88,8 +88,28 @@ target/release/s2g-rx --in baseband_862004550Hz_09-28-46_19-07-2026.wav --shift-
 | same capture, 866 MHz channel | 93/93 FCS-valid |
 | "15 MB transfer", 866 MHz, 8 s | 263/263 FCS-valid (119 RTS, 129 wrapped CTS/BlockAck, 5 S1G Beacons, 6 Action No Ack, 4 Action) + 109 S1G_LONG data PPDUs identified |
 
-`scripts/mega_get.py` fetches the Mega-hosted files; `scripts/convert_mat.py` converts the
-`.mat` captures of the imec Sub-GHz dataset.
+`scripts/mega_get.py` fetches the Mega-hosted files.
+
+The [imec Sub-GHz IQ dataset](https://github.com/JaronFontaine/Sub-GHz-IQ-signals-dataset)
+(RTL-SDR at 2.048 MS/s over coax, `.mat` files with an `IQ_samples` vector) has ten 2 MHz
+802.11ah captures of 4 s each (`*_chan2_*`; the `mcs0`/`mcs7` in the file names is not what
+the device sent — every PPDU is MCS 2, 280-octet QoS Data):
+
+```sh
+python scripts/nextcloud_zip_filter.py "https://cloud.ilabt.imec.be/public.php/dav/files/bqXtdp9QsfXLbb3/864/80211ah?accept=zip" chan2 mat/
+python scripts/convert_mat.py mat/*chan2*.mat
+target/release/s2g-rx --in mat/80211ah_mcs0_chan2_g0.0dB_att10dB_freq864.0MHz_0.cf32 --rate 2.048e6 --mac --quiet
+```
+
+| Result over the ten files | |
+|---|---|
+| PPDUs with valid SIG | 15 663 (about 400 per second) |
+| MPDUs with valid FCS | 15 505 (99.0 %) |
+| Remaining failures | RTL-SDR stream discontinuities mid-PPDU (a sudden half-sample timing jump visible with `S2G_TRACE=1`); the tracker now snaps to such jumps, which recovers most of them |
+| Chip quirk handled | about 1 in 128 PPDUs is scrambled with the all-zero seed, which the standard forbids; the receiver treats it as "no scrambling" |
+
+`S2G_TRACE=1` prints per-symbol pilot tracking (timing offset, CPE, pilot coherence, symbol
+power) for any decode.
 
 ## Hardware notes
 

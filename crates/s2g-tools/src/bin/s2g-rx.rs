@@ -66,6 +66,9 @@ struct Args {
     /// CCA channel classification: 1 or 2
     #[arg(long, default_value_t = 1)]
     cca_type: u8,
+    /// Disable sampling-clock drift tracking (diagnostics)
+    #[arg(long)]
+    no_timing_tracking: bool,
 }
 
 #[derive(Default)]
@@ -276,6 +279,7 @@ fn main() -> Result<()> {
         emit_cca: !args.quiet,
         cal_offset_db: args.cal_offset_db,
         cca_type: if args.cca_type == 2 { s2g_phy::params::rf::CcaType::Type2 } else { s2g_phy::params::rf::CcaType::Type1 },
+        timing_tracking: !args.no_timing_tracking,
         ..Default::default()
     });
     let pcap = match &args.pcap {
