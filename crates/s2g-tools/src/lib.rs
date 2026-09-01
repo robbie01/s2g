@@ -1,6 +1,6 @@
 //! Shared helpers for the CLI tools: .cf32 file I/O (GNU Radio compatible:
 //! interleaved little-endian f32 I,Q), hex PSDU parsing, and the impairment
-//! channel used by s1g-sim.
+//! channel used by s2g-sim.
 
 pub mod nic;
 
@@ -114,7 +114,7 @@ mod tests {
 
     #[test]
     fn cf32_roundtrip() {
-        let dir = std::env::temp_dir().join("s1g_tools_test.cf32");
+        let dir = std::env::temp_dir().join("s2g_tools_test.cf32");
         let v: Vec<Complex32> = (0..100).map(|i| Complex32::new(i as f32, -i as f32 / 2.0)).collect();
         write_cf32(&dir, &v).unwrap();
         let r = read_cf32(&dir).unwrap();

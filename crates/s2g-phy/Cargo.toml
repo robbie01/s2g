@@ -1,5 +1,5 @@
 [package]
-name = "s1g-phy"
+name = "s2g-phy"
 description = "IEEE 802.11ah (S1G) PHY baseband: TX and RX chains, SDR-agnostic"
 version.workspace = true
 edition.workspace = true

@@ -2,12 +2,12 @@
 
 use anyhow::{bail, Result};
 use clap::Parser;
-use s1g_phy::rx::{Receiver, RxConfig, RxEvent};
-use s1g_tools::{read_cf32, Complex32, DEFAULT_CENTER_FREQ_HZ, DEFAULT_DEVICE_RATE_HZ};
+use s2g_phy::rx::{Receiver, RxConfig, RxEvent};
+use s2g_tools::{read_cf32, Complex32, DEFAULT_CENTER_FREQ_HZ, DEFAULT_DEVICE_RATE_HZ};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
-#[command(name = "s1g-rx", about = "S1G (802.11ah) 2 MHz PPDU receiver")]
+#[command(name = "s2g-rx", about = "S1G (802.11ah) 2 MHz PPDU receiver")]
 struct Args {
     /// Replay a .cf32 file instead of a radio
     #[arg(long, conflicts_with = "uri")]
@@ -95,7 +95,7 @@ fn main() -> Result<()> {
         let samples = read_cf32(path)?;
         eprintln!("read {} samples from {}", samples.len(), path.display());
         let native = if (args.rate - 4e6).abs() < 1.0 {
-            let mut dec = s1g_dsp::HalfbandDecim2::new();
+            let mut dec = s2g_dsp::HalfbandDecim2::new();
             let mut out = Vec::with_capacity(samples.len() / 2);
             dec.process(&samples, &mut out);
             out
@@ -126,14 +126,14 @@ fn main() -> Result<()> {
 
 #[cfg(feature = "pluto")]
 fn receive_pluto(args: &Args, rx: &mut Receiver, printer: &mut Printer) -> Result<()> {
-    use s1g_sdr::{RxGain, SdrDevice, SdrRx, StreamConfig};
+    use s2g_sdr::{RxGain, SdrDevice, SdrRx, StreamConfig};
     let uri = args.uri.as_deref().unwrap_or("192.168.2.1");
     let gain = if args.gain == "auto" {
         RxGain::Auto
     } else {
         RxGain::Manual(args.gain.parse().map_err(|_| anyhow::anyhow!("--gain must be 'auto' or a dB value"))?)
     };
-    let mut pluto = s1g_sdr_pluto::Pluto::open(uri).map_err(|e| anyhow::anyhow!("pluto: {e}"))?;
+    let mut pluto = s2g_sdr_pluto::Pluto::open(uri).map_err(|e| anyhow::anyhow!("pluto: {e}"))?;
     let cfg = StreamConfig {
         center_freq_hz: args.freq,
         sample_rate_hz: DEFAULT_DEVICE_RATE_HZ,
@@ -141,7 +141,7 @@ fn receive_pluto(args: &Args, rx: &mut Receiver, printer: &mut Printer) -> Resul
     };
     let mut stream = pluto.open_rx(&cfg, gain).map_err(|e| anyhow::anyhow!("pluto rx: {e}"))?;
     eprintln!("Pluto RX @ {} Hz, {} S/s (decimating to 2 MS/s)", args.freq, DEFAULT_DEVICE_RATE_HZ);
-    let mut dec = s1g_dsp::HalfbandDecim2::new();
+    let mut dec = s2g_dsp::HalfbandDecim2::new();
     let mut dev_buf = vec![Complex32::new(0.0, 0.0); 16384];
     let mut native = Vec::with_capacity(8192);
     let mut events = Vec::new();

@@ -1,5 +1,5 @@
 [package]
-name = "s1g-dsp"
+name = "s2g-dsp"
 description = "Rate conversion and generic DSP used at the SDR boundary"
 version.workspace = true
 edition.workspace = true

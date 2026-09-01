@@ -244,7 +244,7 @@ SIG-2 (24 bits):
   1101 1001 1101 1010 0111 1011 11 → c3..c0 = 0101):
 
 ```rust
-fn s1g_crc4(bits: &[u8]) -> [u8; 4] {          // bits = m0..mN in transmit order
+fn s2g_crc4(bits: &[u8]) -> [u8; 4] {          // bits = m0..mN in transmit order
     let (mut c3, mut c2, mut c1, mut c0) = (1u8, 1, 1, 1);
     for &b in bits {
         let fb = b ^ c3;

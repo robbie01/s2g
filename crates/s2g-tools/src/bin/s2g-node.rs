@@ -1,18 +1,18 @@
 //! Full network node: NIC (TAP or UDP) ↔ OCB MAC ↔ S1G PHY ↔ PlutoSDR.
 //!
-//! On Unix with `--features tap`: `s1g-node --tap s1g0` creates a real L2
+//! On Unix with `--features tap`: `s2g-node --tap s2g0` creates a real L2
 //! interface the OS can route through. On Windows (no L2 TAP support yet):
-//! `s1g-node --udp 127.0.0.1:5001` shuttles raw Ethernet frames as UDP
+//! `s2g-node --udp 127.0.0.1:5001` shuttles raw Ethernet frames as UDP
 //! datagrams instead.
 
 use anyhow::{bail, Result};
 use clap::Parser;
-use s1g_mac::{Mac, MacAction, MacConfig, MacEvent};
-use s1g_tools::nic::Nic;
-use s1g_tools::DEFAULT_CENTER_FREQ_HZ;
+use s2g_mac::{Mac, MacAction, MacConfig, MacEvent};
+use s2g_tools::nic::Nic;
+use s2g_tools::DEFAULT_CENTER_FREQ_HZ;
 
 #[derive(Parser, Debug)]
-#[command(name = "s1g-node", about = "S1G OCB network node (NIC ↔ MAC ↔ PHY ↔ Pluto)")]
+#[command(name = "s2g-node", about = "S1G OCB network node (NIC ↔ MAC ↔ PHY ↔ Pluto)")]
 struct Args {
     /// Create/attach a TAP interface (optionally named). Unix + feature "tap".
     #[arg(long, num_args = 0..=1, default_missing_value = "", conflicts_with = "udp")]
@@ -75,7 +75,7 @@ fn random_mac() -> [u8; 6] {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0x5151);
-    let mut m = [0x02, 0x53, 0x31, 0x47, 0, 0]; // 02:"S1G"
+    let mut m = [0x02, 0x53, 0x32, 0x47, 0, 0]; // 02:"S2G"
     m[4] = (t >> 8) as u8;
     m[5] = t as u8;
     m
@@ -87,12 +87,12 @@ fn fmt_mac(m: &[u8; 6]) -> String {
 
 fn make_nic(args: &Args) -> Result<Box<dyn Nic>> {
     if let Some(udp) = &args.udp {
-        return Ok(Box::new(s1g_tools::nic::UdpNic::new(udp, args.udp_peer.as_deref())?));
+        return Ok(Box::new(s2g_tools::nic::UdpNic::new(udp, args.udp_peer.as_deref())?));
     }
     #[cfg(all(unix, feature = "tap"))]
     if let Some(name) = &args.tap {
         let n = if name.is_empty() { None } else { Some(name.as_str()) };
-        return Ok(Box::new(s1g_tools::nic::TapNic::new(n)?));
+        return Ok(Box::new(s2g_tools::nic::TapNic::new(n)?));
     }
     #[cfg(not(all(unix, feature = "tap")))]
     if args.tap.is_some() {
@@ -113,17 +113,17 @@ fn main() -> Result<()> {
     cfg.ack_timeout_us = args.ack_timeout_ms * 1000;
     cfg.max_retries = args.retries;
     let nic = make_nic(&args)?;
-    eprintln!("s1g-node: mac {} | mcs {} | ack {} | nic {}", fmt_mac(&addr), args.mcs, cfg.ack_enabled, nic.describe());
+    eprintln!("s2g-node: mac {} | mcs {} | ack {} | nic {}", fmt_mac(&addr), args.mcs, cfg.ack_enabled, nic.describe());
     run_radio(&args, Mac::new(cfg), nic)
 }
 
 #[cfg(feature = "pluto")]
 fn run_radio(args: &Args, mut mac: Mac, nic: Box<dyn Nic>) -> Result<()> {
     use num_complex::Complex;
-    use s1g_phy::rx::{Receiver, RxConfig, RxEvent};
-    use s1g_phy::Transmitter;
-    use s1g_sdr::{RxGain, SdrDevice, SdrRx, SdrTx, StreamConfig};
-    use s1g_tools::DEFAULT_DEVICE_RATE_HZ;
+    use s2g_phy::rx::{Receiver, RxConfig, RxEvent};
+    use s2g_phy::Transmitter;
+    use s2g_sdr::{RxGain, SdrDevice, SdrRx, SdrTx, StreamConfig};
+    use s2g_tools::DEFAULT_DEVICE_RATE_HZ;
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
@@ -139,7 +139,7 @@ fn run_radio(args: &Args, mut mac: Mac, nic: Box<dyn Nic>) -> Result<()> {
     } else {
         RxGain::Manual(args.gain.parse().map_err(|_| anyhow::anyhow!("--gain must be 'auto' or dB"))?)
     };
-    let mut pluto = s1g_sdr_pluto::Pluto::open(&args.uri).map_err(|e| anyhow::anyhow!("pluto: {e}"))?;
+    let mut pluto = s2g_sdr_pluto::Pluto::open(&args.uri).map_err(|e| anyhow::anyhow!("pluto: {e}"))?;
     let scfg = StreamConfig {
         center_freq_hz: args.freq,
         sample_rate_hz: DEFAULT_DEVICE_RATE_HZ,
@@ -156,7 +156,7 @@ fn run_radio(args: &Args, mut mac: Mac, nic: Box<dyn Nic>) -> Result<()> {
     {
         let msg_tx = msg_tx.clone();
         std::thread::spawn(move || {
-            let mut dec = s1g_dsp::HalfbandDecim2::new();
+            let mut dec = s2g_dsp::HalfbandDecim2::new();
             let mut rx = Receiver::new(RxConfig::default());
             let mut dev = vec![C32::new(0.0, 0.0); 16384];
             let mut native = Vec::with_capacity(8192);
@@ -210,7 +210,7 @@ fn run_radio(args: &Args, mut mac: Mac, nic: Box<dyn Nic>) -> Result<()> {
     // Main loop: MAC engine + transmit path.
     let phy_tx = Transmitter::new();
     let t0 = Instant::now();
-    let mut interp = s1g_dsp::HalfbandInterp2::new();
+    let mut interp = s2g_dsp::HalfbandInterp2::new();
     let mut mac_events: Vec<MacEvent> = Vec::new();
     loop {
         let now_us = t0.elapsed().as_micros() as u64;
@@ -268,5 +268,5 @@ fn run_radio(args: &Args, mut mac: Mac, nic: Box<dyn Nic>) -> Result<()> {
 
 #[cfg(not(feature = "pluto"))]
 fn run_radio(_args: &Args, _mac: Mac, _nic: Box<dyn Nic>) -> Result<()> {
-    bail!("s1g-node requires the 'pluto' feature (default) — rebuild without --no-default-features")
+    bail!("s2g-node requires the 'pluto' feature (default) — rebuild without --no-default-features")
 }

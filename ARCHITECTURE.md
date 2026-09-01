@@ -19,42 +19,42 @@ ADALM-Pluto SDR at a **nonstandard carrier of 1250 MHz**.
 
 ```
 crates/
-  s1g-phy        # pure DSP, no SDR deps. TX: PSDU -> IQ samples @2 MS/s.
+  s2g-phy        # pure DSP, no SDR deps. TX: PSDU -> IQ samples @2 MS/s.
                  # RX: streaming state machine, IQ samples -> events (SIG, PSDU, errors).
-  s1g-mac        # OCB (non-BSS) MAC: 802.11 data/ACK frames, wildcard BSSID, FCS,
+  s2g-mac        # OCB (non-BSS) MAC: 802.11 data/ACK frames, wildcard BSSID, FCS,
                  # A-MPDU, LLC/SNAP, CSMA/backoff, ACK/retry, dedup. IO-free,
                  # clock-injected engine driven by PHY events; testable standalone.
-  s1g-dsp        # rate conversion + generic DSP (halfband 2x resamplers) used at the SDR boundary.
-  s1g-sdr        # hardware abstraction: SdrTx / SdrRx / SdrDevice traits. No hardware deps.
-  s1g-sdr-pluto  # PlutoSDR backend: pure-Rust iiod network-protocol client (TCP 30431,
-                 # docs/iiod-protocol.md) — no native libiio dependency. Optional feature of s1g-tools.
-  s1g-tools      # binaries: s1g-tx, s1g-rx, s1g-sim (loopback with impairments),
-                 # s1g-node (NIC <-> MAC <-> PHY <-> Pluto), file I/O (.cf32),
+  s2g-dsp        # rate conversion + generic DSP (halfband 2x resamplers) used at the SDR boundary.
+  s2g-sdr        # hardware abstraction: SdrTx / SdrRx / SdrDevice traits. No hardware deps.
+  s2g-sdr-pluto  # PlutoSDR backend: pure-Rust iiod network-protocol client (TCP 30431,
+                 # docs/iiod-protocol.md) — no native libiio dependency. Optional feature of s2g-tools.
+  s2g-tools      # binaries: s2g-tx, s2g-rx, s2g-sim (loopback with impairments),
+                 # s2g-node (NIC <-> MAC <-> PHY <-> Pluto), file I/O (.cf32),
                  # Nic trait: TAP via tappers (unix, feature "tap") or Ethernet-over-UDP.
 ```
 
 Dependency direction (arrows = "depends on"):
 
 ```
-s1g-tools -> s1g-phy, s1g-dsp, s1g-sdr, [s1g-sdr-pluto]
-s1g-sdr-pluto -> s1g-sdr
-s1g-phy -> (num-complex, rustfft only)
+s2g-tools -> s2g-phy, s2g-dsp, s2g-sdr, [s2g-sdr-pluto]
+s2g-sdr-pluto -> s2g-sdr
+s2g-phy -> (num-complex, rustfft only)
 ```
 
-A future RX-only system on a different SDR = `s1g-phy` + `s1g-sdr` + a new backend crate.
-A future MAC sits on top of `s1g-phy`'s TXVECTOR/RXVECTOR-shaped API (`vector.rs`) and the
+A future RX-only system on a different SDR = `s2g-phy` + `s2g-sdr` + a new backend crate.
+A future MAC sits on top of `s2g-phy`'s TXVECTOR/RXVECTOR-shaped API (`vector.rs`) and the
 `RxEvent` stream; PHY characteristics needed for MAC timing (SIFS, slot time) are exported
-from `s1g_phy::params`.
+from `s2g_phy::params`.
 
 ## Sample-rate plan
 
 The PHY natively runs at **2 MS/s** (64-pt FFT, 31.25 kHz spacing; long-GI symbol = 80
 samples = 40 µs). The AD9363 cannot stream below ~2.08 MS/s, so the Pluto runs at
-**4 MS/s** and `s1g-dsp` halfband-resamples 2×: interpolate on TX, decimate on RX. The
-resampler lives outside `s1g-phy`, so a different SDR that runs at 2 MS/s natively (or any
+**4 MS/s** and `s2g-dsp` halfband-resamples 2×: interpolate on TX, decimate on RX. The
+resampler lives outside `s2g-phy`, so a different SDR that runs at 2 MS/s natively (or any
 other integer relation) plugs in without touching the PHY.
 
-## RX pipeline (inside s1g-phy)
+## RX pipeline (inside s2g-phy)
 
 Push-based: `Receiver::process(&mut self, &[Complex32], &mut Vec<RxEvent>)`. Internally:
 STF autocorrelation detect -> coarse CFO -> LTF cross-correlation timing + fine CFO ->

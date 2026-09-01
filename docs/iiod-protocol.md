@@ -53,7 +53,7 @@ name.
   (12-bit left-shifted? Pluto DAC uses upper 12 bits: shift left by 4); interleaved
   I,Q per sample, little endian.
 - The AD9363 cannot run below ~2.083 MS/s without custom FIR coefficients → run the
-  device at 4 MS/s and resample ×2 in `s1g-dsp`.
+  device at 4 MS/s and resample ×2 in `s2g-dsp`.
 - Frequency range officially 325 MHz–3.8 GHz; 1250 MHz is fine.
 - Set `TIMEOUT` generously (e.g. 3000 ms) before streaming; `SET <dev> BUFFERS_COUNT 4`.
 

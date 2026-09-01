@@ -13,9 +13,9 @@
 
 use crate::frame::{self, MacAddr, ParsedFrame};
 use crate::{ampdu, eth};
-use s1g_phy::params;
-use s1g_phy::rx::RxEvent;
-use s1g_phy::vector::{ResponseIndication, TxVector};
+use s2g_phy::params;
+use s2g_phy::rx::RxEvent;
+use s2g_phy::vector::{ResponseIndication, TxVector};
 use std::collections::{HashMap, VecDeque};
 use thiserror::Error;
 
@@ -28,7 +28,7 @@ pub enum MacError {
     #[error("frame too large for any PPDU at this MCS")]
     FrameTooBig,
     #[error("PHY: {0}")]
-    Phy(#[from] s1g_phy::PhyError),
+    Phy(#[from] s2g_phy::PhyError),
 }
 
 #[derive(Debug, Clone)]
@@ -160,7 +160,7 @@ impl Mac {
         let mpdu_len = frame::DATA_HDR_LEN + body.len() + 4;
         if mpdu_len > 511 {
             let pre = ampdu::pre_eof_len(mpdu_len);
-            if mpdu_len > ampdu::MAX_MPDU_LEN || s1g_phy::tx::n_sym(self.cfg.mcs, pre, true).is_err() {
+            if mpdu_len > ampdu::MAX_MPDU_LEN || s2g_phy::tx::n_sym(self.cfg.mcs, pre, true).is_err() {
                 return Err(MacError::FrameTooBig);
             }
         }
@@ -253,7 +253,7 @@ impl Mac {
             return Ok((mpdu, false));
         }
         let pre = ampdu::pre_eof_len(mpdu.len());
-        let n_sym = s1g_phy::tx::n_sym(self.cfg.mcs, pre, true)?;
+        let n_sym = s2g_phy::tx::n_sym(self.cfg.mcs, pre, true)?;
         let p = params::mcs_params(self.cfg.mcs)?;
         let cap = (n_sym * p.n_dbps - 14) / 8;
         Ok((ampdu::aggregate(&mpdu, cap), true))
@@ -324,7 +324,7 @@ impl Mac {
                 response_indication: if want_ack { ResponseIndication::Normal } else { ResponseIndication::None },
                 ..Default::default()
             };
-            let airtime = s1g_phy::tx::txtime_us(self.cfg.mcs, psdu.len(), aggregated).unwrap_or(10_000) as u64;
+            let airtime = s2g_phy::tx::txtime_us(self.cfg.mcs, psdu.len(), aggregated).unwrap_or(10_000) as u64;
             if want_ack {
                 self.state = TxState::AwaitAck { deadline_us: now_us + airtime + self.cfg.ack_timeout_us };
             } else {
@@ -394,7 +394,7 @@ mod tests {
         assert!(txv.aggregation);
         // PSDU fills the symbol capacity exactly.
         let p = params::mcs_params(5).unwrap();
-        let n_sym = s1g_phy::tx::n_sym(5, psdu.len(), true).unwrap();
+        let n_sym = s2g_phy::tx::n_sym(5, psdu.len(), true).unwrap();
         assert_eq!(psdu.len(), (n_sym * p.n_dbps - 14) / 8);
         // And deaggregates back to one valid data frame.
         let mpdus = ampdu::deaggregate(&psdu);
@@ -446,7 +446,7 @@ mod tests {
         let MacAction::Transmit { psdu, .. } = drain_tx(&mut mac_a, &mut now, &mut out_a).unwrap();
 
         // Deliver to B twice (simulating a duplicate).
-        let rxv = s1g_phy::vector::RxVector {
+        let rxv = s2g_phy::vector::RxVector {
             mcs: 0,
             gi: Default::default(),
             aggregation: false,
@@ -466,7 +466,7 @@ mod tests {
                 sample_index: 0,
                 rxvector: rxv.clone(),
                 psdu: psdu.clone(),
-                metrics: s1g_phy::rx::RxMetrics { snr_db: 30.0, cfo_hz: 0.0, evm_db: -30.0, rssi_dbfs: -30.0 },
+                metrics: s2g_phy::rx::RxMetrics { snr_db: 30.0, cfo_hz: 0.0, evm_db: -30.0, rssi_dbfs: -30.0 },
             };
             mac_b.on_phy_event(&ev, now, &mut out_b);
         }
@@ -478,9 +478,9 @@ mod tests {
         assert_eq!(ack_txv.mcs, 0);
         let ev = RxEvent::PsduReceived {
             sample_index: 0,
-            rxvector: s1g_phy::vector::RxVector { psdu_length: ack.len(), ..rxv.clone() },
+            rxvector: s2g_phy::vector::RxVector { psdu_length: ack.len(), ..rxv.clone() },
             psdu: ack,
-            metrics: s1g_phy::rx::RxMetrics { snr_db: 30.0, cfo_hz: 0.0, evm_db: -30.0, rssi_dbfs: -30.0 },
+            metrics: s2g_phy::rx::RxMetrics { snr_db: 30.0, cfo_hz: 0.0, evm_db: -30.0, rssi_dbfs: -30.0 },
         };
         mac_a.on_phy_event(&ev, now, &mut out_a);
         assert!(out_a.iter().any(|e| matches!(e, MacEvent::TxComplete { acked: true, retries: 0, .. })));
@@ -497,7 +497,7 @@ mod tests {
         mac.on_phy_event(&rxv_dummy, 0, &mut out);
         let sig = RxEvent::SigDecoded {
             sample_index: 0,
-            rxvector: s1g_phy::vector::RxVector {
+            rxvector: s2g_phy::vector::RxVector {
                 mcs: 0,
                 gi: Default::default(),
                 aggregation: false,

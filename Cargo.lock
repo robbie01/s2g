@@ -271,7 +271,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "s1g-dsp"
+name = "s2g-dsp"
 version = "0.1.0"
 dependencies = [
  "num-complex",
@@ -279,16 +279,16 @@ dependencies = [
 ]
 
 [[package]]
-name = "s1g-mac"
+name = "s2g-mac"
 version = "0.1.0"
 dependencies = [
  "num-complex",
- "s1g-phy",
+ "s2g-phy",
  "thiserror",
 ]
 
 [[package]]
-name = "s1g-phy"
+name = "s2g-phy"
 version = "0.1.0"
 dependencies = [
  "num-complex",
@@ -298,7 +298,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "s1g-sdr"
+name = "s2g-sdr"
 version = "0.1.0"
 dependencies = [
  "num-complex",
@@ -306,27 +306,27 @@ dependencies = [
 ]
 
 [[package]]
-name = "s1g-sdr-pluto"
+name = "s2g-sdr-pluto"
 version = "0.1.0"
 dependencies = [
  "num-complex",
- "s1g-sdr",
+ "s2g-sdr",
  "thiserror",
 ]
 
 [[package]]
-name = "s1g-tools"
+name = "s2g-tools"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
  "num-complex",
  "rand",
- "s1g-dsp",
- "s1g-mac",
- "s1g-phy",
- "s1g-sdr",
- "s1g-sdr-pluto",
+ "s2g-dsp",
+ "s2g-mac",
+ "s2g-phy",
+ "s2g-sdr",
+ "s2g-sdr-pluto",
  "tappers",
 ]
 

@@ -1,21 +1,21 @@
 [package]
-name = "s1g-tools"
-description = "CLI tools: s1g-tx, s1g-rx, s1g-sim, s1g-node"
+name = "s2g-tools"
+description = "CLI tools: s2g-tx, s2g-rx, s2g-sim, s2g-node"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-s1g-phy.workspace = true
-s1g-mac.workspace = true
-s1g-dsp.workspace = true
-s1g-sdr.workspace = true
+s2g-phy.workspace = true
+s2g-mac.workspace = true
+s2g-dsp.workspace = true
+s2g-sdr.workspace = true
 num-complex.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 rand.workspace = true
 
-[dependencies.s1g-sdr-pluto]
+[dependencies.s2g-sdr-pluto]
 workspace = true
 optional = true
 
@@ -26,21 +26,21 @@ tappers = { version = "0.4", optional = true }
 
 [features]
 default = ["pluto"]
-pluto = ["dep:s1g-sdr-pluto"]
+pluto = ["dep:s2g-sdr-pluto"]
 tap = ["dep:tappers"]
 
 [[bin]]
-name = "s1g-tx"
-path = "src/bin/s1g-tx.rs"
+name = "s2g-tx"
+path = "src/bin/s2g-tx.rs"
 
 [[bin]]
-name = "s1g-rx"
-path = "src/bin/s1g-rx.rs"
+name = "s2g-rx"
+path = "src/bin/s2g-rx.rs"
 
 [[bin]]
-name = "s1g-sim"
-path = "src/bin/s1g-sim.rs"
+name = "s2g-sim"
+path = "src/bin/s2g-sim.rs"
 
 [[bin]]
-name = "s1g-node"
-path = "src/bin/s1g-node.rs"
+name = "s2g-node"
+path = "src/bin/s2g-node.rs"

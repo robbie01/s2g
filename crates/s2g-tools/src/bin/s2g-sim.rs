@@ -3,14 +3,14 @@
 
 use anyhow::Result;
 use clap::Parser;
-use s1g_phy::params::valid_mcs;
-use s1g_phy::rx::{Receiver, RxConfig, RxEvent};
-use s1g_phy::vector::TxVector;
-use s1g_phy::Transmitter;
-use s1g_tools::{apply_channel, Complex32, Impairments, Rng};
+use s2g_phy::params::valid_mcs;
+use s2g_phy::rx::{Receiver, RxConfig, RxEvent};
+use s2g_phy::vector::TxVector;
+use s2g_phy::Transmitter;
+use s2g_tools::{apply_channel, Complex32, Impairments, Rng};
 
 #[derive(Parser, Debug)]
-#[command(name = "s1g-sim", about = "S1G PHY loopback simulator (PER vs SNR)")]
+#[command(name = "s2g-sim", about = "S1G PHY loopback simulator (PER vs SNR)")]
 struct Args {
     /// MCS to test: "all" or an index
     #[arg(long, default_value = "all")]

@@ -2,7 +2,7 @@
 //! Verified against libiio `iiod-client.c` / `iiod/parser.y`; see
 //! docs/iiod-protocol.md at the workspace root.
 
-use s1g_sdr::SdrError;
+use s2g_sdr::SdrError;
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;

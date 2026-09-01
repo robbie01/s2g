@@ -1,4 +1,4 @@
-//! SDR hardware abstraction. `s1g-phy` never sees these traits — apps wire
+//! SDR hardware abstraction. `s2g-phy` never sees these traits — apps wire
 //! PHY ↔ SDR together — but every backend (Pluto today, others later)
 //! implements this interface so apps are backend-agnostic.
 //!

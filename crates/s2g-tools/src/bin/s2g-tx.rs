@@ -2,14 +2,14 @@
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
-use s1g_phy::params::SAMPLE_RATE_HZ;
-use s1g_phy::vector::TxVector;
-use s1g_phy::Transmitter;
-use s1g_tools::{parse_hex_psdu, write_cf32, Complex32, Rng, DEFAULT_CENTER_FREQ_HZ, DEFAULT_DEVICE_RATE_HZ};
+use s2g_phy::params::SAMPLE_RATE_HZ;
+use s2g_phy::vector::TxVector;
+use s2g_phy::Transmitter;
+use s2g_tools::{parse_hex_psdu, write_cf32, Complex32, Rng, DEFAULT_CENTER_FREQ_HZ, DEFAULT_DEVICE_RATE_HZ};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
-#[command(name = "s1g-tx", about = "S1G (802.11ah) 2 MHz PPDU transmitter")]
+#[command(name = "s2g-tx", about = "S1G (802.11ah) 2 MHz PPDU transmitter")]
 struct Args {
     /// MCS index (0-8 or 11)
     #[arg(long, default_value_t = 0)]
@@ -62,7 +62,7 @@ struct Args {
 
 fn interpolate_2x(wave: &[Complex32]) -> Vec<Complex32> {
     let mut up = Vec::with_capacity(wave.len() * 2 + 128);
-    let mut it = s1g_dsp::HalfbandInterp2::new();
+    let mut it = s2g_dsp::HalfbandInterp2::new();
     it.process(wave, &mut up);
     // Flush the filter tail.
     let tail = vec![Complex32::new(0.0, 0.0); 32];
@@ -89,7 +89,7 @@ fn main() -> Result<()> {
     };
     let tx = Transmitter { amplitude: args.amplitude };
     let wave = tx.generate(&txv, &psdu).map_err(|e| anyhow::anyhow!("PHY: {e}"))?;
-    let txtime = s1g_phy::tx::txtime_us(args.mcs, psdu.len(), args.aggregation).unwrap();
+    let txtime = s2g_phy::tx::txtime_us(args.mcs, psdu.len(), args.aggregation).unwrap();
     eprintln!(
         "PPDU: MCS {} | {} octets | {} samples @ 2 MS/s | TXTIME {} µs | seed {:?}",
         args.mcs,
@@ -118,18 +118,18 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let uri = args.uri.as_deref().unwrap_or(s1g_tools_default_uri());
+    let uri = args.uri.as_deref().unwrap_or(s2g_tools_default_uri());
     transmit_pluto(&args, uri, &wave)
 }
 
-fn s1g_tools_default_uri() -> &'static str {
+fn s2g_tools_default_uri() -> &'static str {
     "192.168.2.1"
 }
 
 #[cfg(feature = "pluto")]
 fn transmit_pluto(args: &Args, uri: &str, wave: &[Complex32]) -> Result<()> {
-    use s1g_sdr::{SdrDevice, SdrTx, StreamConfig};
-    let mut pluto = s1g_sdr_pluto::Pluto::open(uri).map_err(|e| anyhow::anyhow!("pluto: {e}"))?;
+    use s2g_sdr::{SdrDevice, SdrTx, StreamConfig};
+    let mut pluto = s2g_sdr_pluto::Pluto::open(uri).map_err(|e| anyhow::anyhow!("pluto: {e}"))?;
     let cfg = StreamConfig {
         center_freq_hz: args.freq,
         sample_rate_hz: DEFAULT_DEVICE_RATE_HZ,

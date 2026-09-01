@@ -1,12 +1,12 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/s1g-phy",
-    "crates/s1g-mac",
-    "crates/s1g-dsp",
-    "crates/s1g-sdr",
-    "crates/s1g-sdr-pluto",
-    "crates/s1g-tools",
+    "crates/s2g-phy",
+    "crates/s2g-mac",
+    "crates/s2g-dsp",
+    "crates/s2g-sdr",
+    "crates/s2g-sdr-pluto",
+    "crates/s2g-tools",
 ]
 
 [workspace.package]
@@ -22,11 +22,11 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 rand = "0.9"
 
-s1g-phy = { path = "crates/s1g-phy" }
-s1g-mac = { path = "crates/s1g-mac" }
-s1g-dsp = { path = "crates/s1g-dsp" }
-s1g-sdr = { path = "crates/s1g-sdr" }
-s1g-sdr-pluto = { path = "crates/s1g-sdr-pluto" }
+s2g-phy = { path = "crates/s2g-phy" }
+s2g-mac = { path = "crates/s2g-mac" }
+s2g-dsp = { path = "crates/s2g-dsp" }
+s2g-sdr = { path = "crates/s2g-sdr" }
+s2g-sdr-pluto = { path = "crates/s2g-sdr-pluto" }
 
 [profile.release]
 lto = "thin"

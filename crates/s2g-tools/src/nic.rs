@@ -1,4 +1,4 @@
-//! Local network attachment for `s1g-node`: where decoded Ethernet frames
+//! Local network attachment for `s2g-node`: where decoded Ethernet frames
 //! go and where outgoing ones come from.
 //!
 //! Backends:
@@ -6,7 +6,7 @@
 //!   interface via `tappers` — the OS routes traffic through the radio.
 //! - [`UdpNic`] (all platforms, incl. Windows): raw Ethernet frames as UDP
 //!   datagrams to/from a local endpoint. Anything that speaks this trivial
-//!   framing (another s1g-node's UDP side, a test script, a future
+//!   framing (another s2g-node's UDP side, a test script, a future
 //!   user-space bridge) can attach. This is the Windows path until a
 //!   tap-windows6 backend is added.
 

@@ -3,9 +3,9 @@
 //! through the real waveform with noise and CFO.
 
 use num_complex::Complex;
-use s1g_mac::{Mac, MacAction, MacConfig, MacEvent};
-use s1g_phy::rx::{Receiver, RxConfig, RxEvent};
-use s1g_phy::Transmitter;
+use s2g_mac::{Mac, MacAction, MacConfig, MacEvent};
+use s2g_phy::rx::{Receiver, RxConfig, RxEvent};
+use s2g_phy::Transmitter;
 
 type C32 = Complex<f32>;
 

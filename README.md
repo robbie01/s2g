@@ -1,5 +1,8 @@
 # s2g — IEEE 802.11ah (S1G) PHY in Rust for PlutoSDR
 
+**s2g** ("sub-2 GHz") is the working name of this mode — a pun on S1G, since this
+deployment runs in the 24 cm band rather than sub-1 GHz.
+
 A from-scratch, modular implementation of the IEEE 802.11-2024 Clause 23 **S1G PHY**:
 2 MHz bandwidth, long GI (8 µs), single spatial stream, BCC, S1G_SHORT preamble,
 **all valid MCSes (0–8 and 11**, i.e. BPSK½ … 256-QAM¾ and 1024-QAM¾; MCS 9/10/12 are
@@ -22,19 +25,19 @@ cargo test --workspace           # 71 tests: golden vectors, roundtrips, full lo
 
 ```sh
 # Simulate: PER vs SNR for every MCS with CFO + timing offset impairments
-target/release/s1g-sim --count 100 --snr-db "3,6,9,12,15,18,21,25,30,36"
+target/release/s2g-sim --count 100 --snr-db "3,6,9,12,15,18,21,25,30,36"
 
 # Generate a waveform file (GNU Radio-compatible .cf32), 3 PPDUs at MCS 4
-target/release/s1g-tx --mcs 4 --random 200 --count 3 --out wave.cf32 --out-rate 4e6
+target/release/s2g-tx --mcs 4 --random 200 --count 3 --out wave.cf32 --out-rate 4e6
 
 # Decode a waveform file (native 2 MS/s, or 4 MS/s with ×2 decimation)
-target/release/s1g-rx --in wave.cf32 --rate 4e6
+target/release/s2g-rx --in wave.cf32 --rate 4e6
 
 # Live TX on a Pluto at 1250 MHz (device streams at 4 MS/s, ×2 interpolated)
-target/release/s1g-tx --uri 192.168.2.1 --mcs 2 --hex "dead beef 0102" --count 10
+target/release/s2g-tx --uri 192.168.2.1 --mcs 2 --hex "dead beef 0102" --count 10
 
 # Live RX on a Pluto at 1250 MHz
-target/release/s1g-rx --uri 192.168.2.1 --gain auto
+target/release/s2g-rx --uri 192.168.2.1 --gain auto
 ```
 
 The Pluto backend speaks the **iiod network protocol directly** (TCP 30431, the same
@@ -43,7 +46,7 @@ the Pluto at its usual USB-network address `192.168.2.1`.
 
 ## Hardware notes
 
-- The AD9363 can't stream at 2 MS/s, so the radio runs at **4 MS/s** and `s1g-dsp`
+- The AD9363 can't stream at 2 MS/s, so the radio runs at **4 MS/s** and `s2g-dsp`
   halfband-resamples ×2 in software (TX interpolate / RX decimate).
 - 1250 MHz is inside the AD9363 tuning range but **outside every S1G regulatory band —
   transmit into a dummy load / cable / shielded box unless you're licensed for that
@@ -51,28 +54,28 @@ the Pluto at its usual USB-network address `192.168.2.1`.
 - Frequency accuracy: the RX tolerates ≳ ±40 kHz CFO (±32 ppm at 1.25 GHz), comfortably
   above the spec's ±20 ppm budget, so a stock Pluto TCXO on both ends is fine.
 
-## Networking: OCB MAC + TAP (`s1g-node`)
+## Networking: OCB MAC + TAP (`s2g-node`)
 
-`s1g-mac` implements a nonstandard-where-it-matters OCB (non-BSS) MAC: 802.11 Data
+`s2g-mac` implements a nonstandard-where-it-matters OCB (non-BSS) MAC: 802.11 Data
 frames with the wildcard BSSID, FCS, sequence numbers + dedup, RFC 1042 LLC/SNAP for
 Ethernet payloads, spec-format A-MPDU aggregation for frames over 511 octets, CSMA
 with DIFS + exponential backoff, and optional ACK/retry for unicast (timeouts relaxed
 to SDR-latency scale; real SIFS needs hardware timestamping). The engine is IO-free
 and clock-injected — fully unit-tested plus a two-node over-the-air simulation test.
 
-`s1g-node` wires NIC ↔ MAC ↔ PHY ↔ Pluto:
+`s2g-node` wires NIC ↔ MAC ↔ PHY ↔ Pluto:
 
 ```sh
 # Linux / macOS / *BSD: a real L2 TAP interface (build with the tap feature)
 cargo build --release --features tap
-sudo target/release/s1g-node --tap s1g0 --uri 192.168.2.1 --mcs 2
-# then: ip addr add 10.99.0.1/24 dev s1g0   (etc. on each node)
+sudo target/release/s2g-node --tap s2g0 --uri 192.168.2.1 --mcs 2
+# then: ip addr add 10.99.0.1/24 dev s2g0   (etc. on each node)
 
 # Windows (no L2 TAP backend yet): Ethernet-over-UDP NIC instead
-target\release\s1g-node.exe --udp 127.0.0.1:5001 --uri 192.168.2.1
+target\release\s2g-node.exe --udp 127.0.0.1:5001 --uri 192.168.2.1
 ```
 
-The `Nic` trait in `s1g-tools` keeps the attachment point pluggable; TAP is via the
+The `Nic` trait in `s2g-tools` keeps the attachment point pluggable; TAP is via the
 cross-platform `tappers` crate (Linux/macOS/FreeBSD/OpenBSD/NetBSD — all cross-checked
 to compile). Two nodes need distinct `--mac` addresses (default is randomized).
 
@@ -86,7 +89,7 @@ to compile). Two nodes need distinct `--mac` addresses (default is randomized).
 - [x] NDP CMAC PPDU TX/RX (37-bit body PHY transport for MAC control)
 - [x] PlutoSDR TX/RX backend (pure-Rust iiod client) at arbitrary carrier
 - [x] OCB MAC: data/ACK frames, A-MPDU, CSMA/backoff, retries, dedup
-- [x] `s1g-node`: TAP (Unix) / UDP (Windows) network interface over the radio
+- [x] `s2g-node`: TAP (Unix) / UDP (Windows) network interface over the radio
 - [ ] Windows L2 TAP backend (tap-windows6); hardware-timestamped SIFS/ACK timing
 - [ ] Short GI, LDPC, 1/4/8/16 MHz, multi-stream: out of scope for v1, module
       boundaries chosen so they slot in

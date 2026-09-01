@@ -3,10 +3,10 @@
 //! (integer + fractional), amplitude scaling, chunked streaming, multiple
 //! PPDUs, truncation, NDP.
 
-use s1g_phy::params::valid_mcs;
-use s1g_phy::rx::{Receiver, RxConfig, RxErrorKind, RxEvent};
-use s1g_phy::vector::TxVector;
-use s1g_phy::{Complex32, Transmitter};
+use s2g_phy::params::valid_mcs;
+use s2g_phy::rx::{Receiver, RxConfig, RxErrorKind, RxEvent};
+use s2g_phy::vector::TxVector;
+use s2g_phy::{Complex32, Transmitter};
 
 struct Rng(u64);
 
@@ -313,7 +313,7 @@ fn tx_spectral_occupancy() {
     let mut used = vec![0.0f64; 64];
     for n in 0..nsym {
         let payload = &wave[480 + n * 80 + 16..480 + n * 80 + 80];
-        let f = s1g_phy::ofdm::fft_symbol(payload);
+        let f = s2g_phy::ofdm::fft_symbol(payload);
         for a in 0..64 {
             used[a] += f[a].norm_sqr() as f64;
         }

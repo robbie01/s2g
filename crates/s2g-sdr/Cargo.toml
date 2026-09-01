@@ -1,5 +1,5 @@
 [package]
-name = "s1g-sdr"
+name = "s2g-sdr"
 description = "SDR hardware abstraction traits (no hardware dependencies)"
 version.workspace = true
 edition.workspace = true

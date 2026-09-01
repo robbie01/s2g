@@ -1,4 +1,4 @@
-//! ADALM-Pluto (AD9363) backend implementing the `s1g-sdr` traits via a
+//! ADALM-Pluto (AD9363) backend implementing the `s2g-sdr` traits via a
 //! pure-Rust client for the iiod network protocol (TCP port 30431) — the
 //! same path libiio's `ip:` backend uses. No native dependencies.
 //!
@@ -9,7 +9,7 @@
 pub mod iiod;
 
 use iiod::{Client, Dir};
-use s1g_sdr::{RxGain, SdrDevice, SdrError, SdrRx, SdrTx, StreamConfig};
+use s2g_sdr::{RxGain, SdrDevice, SdrError, SdrRx, SdrTx, StreamConfig};
 use std::time::Duration;
 
 pub type Complex32 = num_complex::Complex<f32>;
@@ -93,7 +93,7 @@ impl SdrDevice for Pluto {
     fn open_rx(&mut self, cfg: &StreamConfig, gain: RxGain) -> Result<PlutoRx, SdrError> {
         if cfg.sample_rate_hz < 2.083e6 {
             return Err(SdrError::Config(format!(
-                "AD9363 cannot stream below ~2.083 MS/s (asked {}); run at 4 MS/s and decimate in s1g-dsp",
+                "AD9363 cannot stream below ~2.083 MS/s (asked {}); run at 4 MS/s and decimate in s2g-dsp",
                 cfg.sample_rate_hz
             )));
         }
@@ -123,7 +123,7 @@ impl SdrDevice for Pluto {
 
     fn open_tx(&mut self, cfg: &StreamConfig, tx_gain_db: f64) -> Result<PlutoTx, SdrError> {
         if cfg.sample_rate_hz < 2.083e6 {
-            return Err(SdrError::Config("AD9363 cannot stream below ~2.083 MS/s; interpolate in s1g-dsp".into()));
+            return Err(SdrError::Config("AD9363 cannot stream below ~2.083 MS/s; interpolate in s2g-dsp".into()));
         }
         // TX LO = altvoltage1.
         self.cfg_common(cfg, Dir::Output, "altvoltage1")?;
