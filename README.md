@@ -74,6 +74,23 @@ python scripts/compare_pcap.py 802_11_ah.pcap s2g.pcap
 The chip rounds non-aggregated PSDU lengths up to a multiple of 4 octets and pads after the
 FCS; `frame::locate_mpdu` tolerates that.
 
+Two further captures from [sigidwiki](https://www.sigidwiki.com/wiki/802.11ah) (a HaLow
+router, SDR# WAV at 20 MS/s centred on 862.005 MHz, so the 864 / 866 MHz channels sit
+2 / 4 MHz off-centre and the receiver decimates 10× past a strong adjacent channel):
+
+```sh
+target/release/s2g-rx --in baseband_862004550Hz_09-28-46_19-07-2026.wav --shift-hz 2.0e6 --mac --quiet
+```
+
+| Capture | Result |
+|---|---|
+| "router looking for client", 864 MHz, 6 s | 102/102 PSDUs FCS-valid (MCS 0 A-MPDUs with traveling pilots, Action No Ack) |
+| same capture, 866 MHz channel | 93/93 FCS-valid |
+| "15 MB transfer", 866 MHz, 8 s | 263/263 FCS-valid (119 RTS, 129 wrapped CTS/BlockAck, 5 S1G Beacons, 6 Action No Ack, 4 Action) + 109 S1G_LONG data PPDUs identified |
+
+`scripts/mega_get.py` fetches the Mega-hosted files; `scripts/convert_mat.py` converts the
+`.mat` captures of the imec Sub-GHz dataset.
+
 ## Hardware notes
 
 - The AD9363 can't stream at 2 MS/s, so the radio runs at **4 MS/s** and `s2g-dsp`

@@ -68,6 +68,9 @@ pub fn read_recording(path: &Path, skip: usize, max_samples: Option<usize>) -> R
         let samples = decode_samples(&raw, datatype.as_deref().unwrap_or("ci16_le"), skip, max_samples)?;
         return Ok(Recording { samples, sample_rate_hz: rate, center_freq_hz: freq });
     }
+    if name.to_ascii_lowercase().ends_with(".wav") {
+        return read_wav_iq(path, skip, max_samples);
+    }
     if name.ends_with(".ci16") || name.ends_with(".cs16") {
         let raw = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
         return Ok(Recording { samples: decode_samples(&raw, "ci16_le", skip, max_samples)?, sample_rate_hz: None, center_freq_hz: None });
@@ -75,6 +78,75 @@ pub fn read_recording(path: &Path, skip: usize, max_samples: Option<usize>) -> R
     let all = read_cf32(path)?;
     let end = max_samples.map(|n| (skip + n).min(all.len())).unwrap_or(all.len());
     Ok(Recording { samples: all[skip.min(end)..end].to_vec(), sample_rate_hz: None, center_freq_hz: None })
+}
+
+/// Two-channel (I, Q) WAV as written by SDR#, SDRuno, GQRX etc.: 16-bit
+/// PCM, 32-bit float or 32-bit PCM. The centre frequency is taken from a
+/// `baseband_<Hz>Hz_…` / `..._<Hz>Hz_…` file name when present.
+fn read_wav_iq(path: &Path, skip: usize, max_samples: Option<usize>) -> Result<Recording> {
+    use std::io::{Seek, SeekFrom};
+    let mut f = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let file_len = f.metadata()?.len() as usize;
+    let mut head = vec![0u8; 4096.min(file_len)];
+    f.read_exact(&mut head)?;
+    if head.len() < 12 || &head[..4] != b"RIFF" || &head[8..12] != b"WAVE" {
+        bail!("{}: not a RIFF/WAVE file", path.display());
+    }
+    let mut pos = 12;
+    let mut fmt: Option<(u16, u16, u32, u16)> = None; // tag, channels, rate, bits
+    let mut data: Option<(usize, usize)> = None;
+    while pos + 8 <= head.len() {
+        let id = &head[pos..pos + 4];
+        let size = u32::from_le_bytes([head[pos + 4], head[pos + 5], head[pos + 6], head[pos + 7]]) as usize;
+        let body = pos + 8;
+        if id == b"fmt " && size >= 16 && body + 16 <= head.len() {
+            let tag = u16::from_le_bytes([head[body], head[body + 1]]);
+            let channels = u16::from_le_bytes([head[body + 2], head[body + 3]]);
+            let rate = u32::from_le_bytes([head[body + 4], head[body + 5], head[body + 6], head[body + 7]]);
+            let bits = u16::from_le_bytes([head[body + 14], head[body + 15]]);
+            fmt = Some((tag, channels, rate, bits));
+        } else if id == b"data" {
+            // Some recorders write a bogus size for > 4 GB files: clamp.
+            data = Some((body, size.min(file_len - body)));
+            break;
+        }
+        pos = body + size + (size & 1);
+    }
+    let (tag, channels, rate, bits) = fmt.ok_or_else(|| anyhow::anyhow!("{}: no fmt chunk", path.display()))?;
+    let (start, len) = data.ok_or_else(|| anyhow::anyhow!("{}: no data chunk", path.display()))?;
+    if channels != 2 {
+        bail!("{}: {channels} channels (need 2 = I,Q)", path.display());
+    }
+    let bps = (bits as usize / 8) * 2;
+    let total = len / bps;
+    let first = skip.min(total);
+    let count = max_samples.unwrap_or(total - first).min(total - first);
+    f.seek(SeekFrom::Start((start + first * bps) as u64))?;
+    let mut body = vec![0u8; count * bps];
+    f.read_exact(&mut body)?;
+    let samples: Vec<Complex32> = body
+        .chunks_exact(bps)
+        .map(|c| match (bits, tag) {
+            (16, _) => Complex32::new(
+                i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0,
+                i16::from_le_bytes([c[2], c[3]]) as f32 / 32768.0,
+            ),
+            (32, 3) => Complex32::new(
+                f32::from_le_bytes([c[0], c[1], c[2], c[3]]),
+                f32::from_le_bytes([c[4], c[5], c[6], c[7]]),
+            ),
+            (32, _) => Complex32::new(
+                i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f32 / 2147483648.0,
+                i32::from_le_bytes([c[4], c[5], c[6], c[7]]) as f32 / 2147483648.0,
+            ),
+            (8, _) => Complex32::new((c[0] as f32 - 128.0) / 128.0, (c[1] as f32 - 128.0) / 128.0),
+            _ => Complex32::new(0.0, 0.0),
+        })
+        .collect();
+    // SDR#-style names carry the centre frequency: "..._862004550Hz_...".
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    let center = name.split('_').find_map(|part| part.strip_suffix("Hz").and_then(|d| d.parse::<f64>().ok()));
+    Ok(Recording { samples, sample_rate_hz: Some(rate as f64), center_freq_hz: center })
 }
 
 /// Minimal SigMF metadata scan: (core:datatype, core:sample_rate, the
@@ -199,9 +271,12 @@ pub fn to_native_rate(samples: &[Complex32], in_rate: f64, shift_hz: f64) -> Vec
         return out;
     }
     let step = in_rate / native;
-    // Pass the occupied ±0.9 MHz, stop by the output Nyquist.
+    // Pass the occupied ±0.9 MHz, stop by the output Nyquist; the kernel
+    // grows with the decimation ratio so the transition band stays ~150 kHz
+    // (an adjacent 2 MHz channel must be rejected, not aliased in).
     let cutoff = (0.95e6 / in_rate).min(0.5 / step * 0.98);
-    s2g_dsp::resample_lowpass(src, step, cutoff, 48)
+    let half_taps = ((48.0 * step / 1.92).ceil() as usize).clamp(48, 512);
+    s2g_dsp::resample_lowpass(src, step, cutoff, half_taps)
 }
 
 /// Minimal PCAP writer for 802.11 frames (link type 105, no radiotap).
