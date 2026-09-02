@@ -88,7 +88,7 @@ target/release/s2g-rx --in baseband_862004550Hz_09-28-46_19-07-2026.wav --shift-
 |---|---|
 | "router looking for client", 864 MHz, 6 s | 102/102 PSDUs FCS-valid (MCS 0 A-MPDUs with traveling pilots, Action No Ack) |
 | same capture, 866 MHz channel | 93/93 FCS-valid |
-| "15 MB transfer", 866 MHz, 8 s | 263/263 FCS-valid (119 RTS, 129 wrapped CTS/BlockAck, 5 S1G Beacons, 6 Action No Ack, 4 Action) + 109 S1G_LONG data PPDUs identified |
+| "15 MB transfer", 866 MHz, 8 s | 263/263 S1G_SHORT FCS-valid (119 RTS, 129 wrapped CTS/BlockAck, 5 S1G Beacons, 6 Action No Ack, 4 Action); the 109 S1G_LONG data PPDUs (MCS 6/7, 7 with short GI) now decode, but this recording's noise floor leaves them only 14–24 dB SNR: 4 of the 7 short MCS 6 MPDUs pass FCS, the 482-symbol MCS 7 transfers at 15 dB do not (64-QAM 5/6 needs ~23 dB) |
 
 `scripts/mega_get.py` fetches the Mega-hosted files.
 
