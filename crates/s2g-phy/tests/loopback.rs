@@ -728,3 +728,105 @@ fn spectral_mask_after_interpolation() {
     assert!(r.pass, "mask violated: worst margin {} dB at {} MHz (psd {} dBr, mask {} dBr)", r.worst_margin_db, worst.0, worst.1, worst.2);
 }
 
+
+#[test]
+fn mid_packet_cca_without_preamble() {
+    // The receiver joins a PPDU after its preamble: no RXSTART is possible,
+    // but CCA must still report BUSY from the Data-symbol structure within
+    // aCCAMidTime, and go IDLE again after the PPDU ends.
+    let tx = Transmitter::new();
+    let mut rng = Rng(20);
+    let psdu = rng.bytes(600);
+    let w = tx.generate(&TxVector { mcs: 1, aggregation: true, ..Default::default() }, &psdu).unwrap();
+    let data = &w[480 + 400..]; // skip preamble and the first 5 symbols
+    let mut stream = silence(1000);
+    stream.extend(data);
+    stream.extend(silence(1500));
+    // Low level: below the energy-detect threshold (uncalibrated: -72 dBFS)
+    // but above the mid-packet threshold (-89 dBFS): -12 dBFS * 0.0003 = -82 dBFS.
+    let scaled: Vec<Complex32> = stream.iter().map(|&v| v * 0.0003).collect();
+    let ev = run_rx(&awgn(&scaled, 30.0, &mut rng), 500);
+    assert!(!ev.iter().any(|e| matches!(e, RxEvent::RxStart { .. })));
+    let busy: Vec<(u64, Option<CcaReason>)> = ev
+        .iter()
+        .filter_map(|e| match e {
+            RxEvent::Cca { sample_index, busy: true, reason, .. } => Some((*sample_index, *reason)),
+            _ => None,
+        })
+        .collect();
+    let mid = busy.iter().find(|(_, r)| *r == Some(CcaReason::MidPacket)).expect("mid-packet BUSY");
+    assert!(mid.0 >= 1000 && mid.0 <= 1000 + 424 + 80, "busy at {}", mid.0);
+    let idle = ev.iter().find_map(|e| match e {
+        RxEvent::Cca { sample_index, busy: false, .. } if *sample_index > mid.0 => Some(*sample_index),
+        _ => None,
+    });
+    let end = 1000 + data.len() as u64;
+    assert!(idle.is_some_and(|i| i >= end && i <= end + 424 + 80), "idle {idle:?} vs end {end}");
+}
+
+#[test]
+fn energy_detect_reports_within_acca_time() {
+    // A signal starting at an arbitrary sample must be BUSY within 40 us
+    // (80 samples) plus one 16-sample evaluation stride.
+    let mut rng = Rng(21);
+    let tx = Transmitter::new();
+    let psdu = rng.bytes(40);
+    let w = tx.generate(&TxVector { mcs: 0, ..Default::default() }, &psdu).unwrap();
+    let start = 811usize;
+    let mut stream = silence(start);
+    stream.extend(&w);
+    stream.extend(silence(400));
+    // Noise far below the (uncalibrated, dBFS) energy-detect threshold.
+    let ev = run_rx(&awgn(&stream, 90.0, &mut rng), 300);
+    let first_busy = ev
+        .iter()
+        .find_map(|e| match e {
+            RxEvent::Cca { sample_index, busy: true, .. } => Some(*sample_index),
+            _ => None,
+        })
+        .expect("BUSY");
+    assert!(first_busy >= start as u64 && first_busy <= start as u64 + 80 + 16, "busy at {first_busy}");
+}
+
+#[test]
+fn reserved_sig_indication_holds_cca_for_the_ppdu() {
+    // BCC with B18 = 0 is a Reserved SIG Indication: FormatViolation, but the
+    // MCS/Length still give the duration, so CCA is held for the PPDU.
+    let mut rng = Rng(22);
+    let fields = sig::SigFields {
+        stbc: false,
+        uplink_indication: false,
+        bandwidth: 0,
+        nsts: 0,
+        id: 0,
+        short_gi: false,
+        ldpc: false,
+        ldpc_extra: false, // reserved combination
+        mcs: 2,
+        smoothing: true,
+        aggregation: false,
+        length: 100, // 11 symbols at MCS 2
+        response_indication: ResponseIndication::None,
+        traveling_pilots: false,
+    };
+    let mut w = Vec::new();
+    w.extend(preamble::stf_time());
+    w.extend(preamble::ltf1_time());
+    w.extend(sig::encode(&fields));
+    while w.len() < 480 + 11 * 80 {
+        w.push(Complex32::new(rng.gauss(), rng.gauss()) * 0.7);
+    }
+    let w: Vec<Complex32> = w.iter().map(|&v| v * 0.25).collect();
+    let mut stream = silence(300);
+    stream.extend(&w);
+    stream.extend(silence(300));
+    let ev = run_rx(&awgn(&stream, 30.0, &mut rng), 256);
+    assert!(ends(&ev).contains(&&RxEndStatus::FormatViolation), "{:?}", ends(&ev));
+    assert!(!ev.iter().any(|e| matches!(e, RxEvent::RxStart { .. })));
+    let hold = ev.iter().find_map(|e| match e {
+        RxEvent::Cca { busy: true, reason: Some(CcaReason::PpduHold), hold_us, .. } => Some(*hold_us),
+        _ => None,
+    });
+    let hold = hold.expect("PpduHold for a reserved SIG with computable duration");
+    assert!((hold as i64 - 11 * 40).abs() <= 8, "hold {hold}");
+}

@@ -69,13 +69,16 @@ pub fn pre_eof_len(mpdu_len: usize) -> usize {
     DELIM_LEN + mpdu_len
 }
 
-/// Build a single-MPDU A-MPDU padded to exactly `capacity` octets
-/// (the PSDU capacity of the chosen symbol count).
+/// Build an **S-MPDU** — an A-MPDU carrying a single MPDU whose delimiter
+/// has EOF = 1 [9.7.3, 10.12.8] — padded to exactly `capacity` octets (the
+/// PSDU capacity of the chosen symbol count). An S-MPDU follows the rules
+/// of a non-aggregated frame: any MPDU that is valid on its own is valid
+/// inside it, and it is acknowledged with an (NDP) Ack, not a BlockAck.
 pub fn aggregate(mpdu: &[u8], capacity: usize) -> Vec<u8> {
     assert!(mpdu.len() <= MAX_MPDU_LEN);
     assert!(capacity >= DELIM_LEN + mpdu.len());
     let mut out = Vec::with_capacity(capacity);
-    out.extend_from_slice(&build_delimiter(mpdu.len(), false));
+    out.extend_from_slice(&build_delimiter(mpdu.len(), true));
     out.extend_from_slice(mpdu);
     // Final-subframe padding to a 4-octet boundary (0–3), then EOF
     // delimiters, then 0–3 loose octets.
@@ -90,21 +93,33 @@ pub fn aggregate(mpdu: &[u8], capacity: usize) -> Vec<u8> {
 }
 
 /// Extract MPDUs from an A-MPDU (deaggregation per Annex O.2: scan 4-octet
-/// aligned positions, resync on delimiter errors).
-pub fn deaggregate(psdu: &[u8]) -> Vec<Vec<u8>> {
+/// aligned positions, resync on delimiter errors). Each MPDU comes with its
+/// delimiter's EOF flag: a lone MPDU with EOF = 1 is an S-MPDU.
+pub fn deaggregate_with_eof(psdu: &[u8]) -> Vec<(Vec<u8>, bool)> {
     let mut out = Vec::new();
     let mut pos = 0usize;
     while pos + DELIM_LEN <= psdu.len() {
         match parse_delimiter(&psdu[pos..pos + DELIM_LEN]) {
             Some((0, _eof)) => pos += DELIM_LEN,
-            Some((len, _)) if pos + DELIM_LEN + len <= psdu.len() => {
-                out.push(psdu[pos + DELIM_LEN..pos + DELIM_LEN + len].to_vec());
+            Some((len, eof)) if pos + DELIM_LEN + len <= psdu.len() => {
+                out.push((psdu[pos + DELIM_LEN..pos + DELIM_LEN + len].to_vec(), eof));
                 pos = pad4(pos + DELIM_LEN + len);
             }
             _ => pos += DELIM_LEN, // bad delimiter or truncated: resync
         }
     }
     out
+}
+
+/// Extract MPDUs from an A-MPDU.
+pub fn deaggregate(psdu: &[u8]) -> Vec<Vec<u8>> {
+    deaggregate_with_eof(psdu).into_iter().map(|(m, _)| m).collect()
+}
+
+/// True when the PSDU is an S-MPDU: exactly one MPDU, with EOF set.
+pub fn is_s_mpdu(psdu: &[u8]) -> bool {
+    let m = deaggregate_with_eof(psdu);
+    m.len() == 1 && m[0].1
 }
 
 #[cfg(test)]
@@ -131,7 +146,17 @@ mod tests {
         let a = aggregate(&mpdu, cap);
         assert_eq!(a.len(), cap);
         let got = deaggregate(&a);
-        assert_eq!(got, vec![mpdu]);
+        assert_eq!(got, vec![mpdu.clone()]);
+        assert!(is_s_mpdu(&a));
+        // A two-MPDU A-MPDU is not an S-MPDU.
+        let mut two = Vec::new();
+        two.extend_from_slice(&build_delimiter(mpdu.len(), false));
+        two.extend_from_slice(&mpdu);
+        two.resize(two.len().div_ceil(4) * 4, 0);
+        two.extend_from_slice(&build_delimiter(mpdu.len(), false));
+        two.extend_from_slice(&mpdu);
+        assert!(!is_s_mpdu(&two));
+        assert_eq!(deaggregate(&two).len(), 2);
     }
 
     #[test]

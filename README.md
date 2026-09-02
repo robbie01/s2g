@@ -129,15 +129,43 @@ power) for any decode.
 
 `s2g-mac` implements a nonstandard-where-it-matters OCB (non-BSS) MAC: 802.11 Data
 frames with the wildcard BSSID, FCS, sequence numbers + dedup, RFC 1042 LLC/SNAP for
-Ethernet payloads, spec-format A-MPDU aggregation for frames over 511 octets, CSMA
-with DIFS + exponential backoff gated by PHY CCA, NAV and **RID** (response indication
-deferral), and acknowledgement via **NDP Ack / NDP BlockAck** CMAC PPDUs (Ack ID from
-the scrambler seed + FCS exactly as 23.3.12 specifies; legacy Ack frames selectable).
+Ethernet payloads, S-MPDU aggregation for frames over 511 octets, PV1 (short header)
+frame reception, CSMA with DIFS/EIFS + exponential backoff gated by PHY CCA, NAV and
+**RID** (response indication deferral), and acknowledgement via **NDP Ack** CMAC PPDUs
+(Ack ID from the scrambler seed + FCS exactly as 23.3.12 specifies; NDP BlockAck for
+received multi-MPDU A-MPDUs; legacy Ack frames selectable).
 Frames above `--rts-threshold` are protected by RTS → **NDP CTS**. None of this needs a
 BSS or association; the one OCB liberty is deriving the 9-bit partial AID from the MAC
 address. Timeouts are relaxed to SDR-latency scale; real SIFS needs hardware
 timestamping. The engine is IO-free and clock-injected — fully unit-tested plus
 two-node over-the-air simulation tests (NDP Ack, NDP BlockAck, RTS/NDP CTS, retries).
+
+### A-MPDUs, S-MPDUs and the partial AID (background for non-RF readers)
+
+*Aggregation.* An 802.11 PHY frame (PPDU) can carry several MAC frames back to back: an
+**A-MPDU** is a list of `[4-byte delimiter][MAC frame][pad]` records inside one PPDU, like
+a length-prefixed record stream. In S1G the PHY header's length field is only 9 bits, so any
+MAC frame over 511 octets *must* travel this way even if it is alone — the aggregation bit
+just switches the length units from octets to OFDM symbols. The standard then says what a
+real multi-frame A-MPDU may contain: QoS Data frames (they carry a traffic ID and an ack
+policy), acknowledged with a **BlockAck** bitmap covering all of them, which in turn needs a
+Block Ack agreement negotiated beforehand (ADDBA) — a stateful handshake this OCB MAC does
+not do.
+
+*What s2g does.* A frame over 511 octets is sent as an **S-MPDU**: an A-MPDU whose single
+record has the EOF bit set in its delimiter. The standard (10.12.8) defines an S-MPDU as
+"the rules of a non-aggregated frame apply": any MAC frame that is valid on its own is valid
+inside it, no Block Ack agreement is needed, and it is acknowledged with an ordinary
+(NDP) Ack. So plain Data frames inside our aggregated PSDUs are conformant, and a standard
+receiver deaggregates them with its normal A-MPDU parser. (Earlier versions sent the same
+thing with EOF = 0 and expected an NDP BlockAck; that was the deviation.)
+
+*Partial AID.* When an S1G station associates with an AP it is assigned an **AID** (a small
+integer, like a session id). The 9-bit "partial AID" in the PHY header and in an NDP CTS
+is derived from it, so receivers can tell early whether a PPDU is for them. There is no
+association in OCB and hence no AID, so s2g hashes the MAC address into those 9 bits
+(`ndp::ocb_partial_aid`). Both ends of an s2g link compute the same value, but a standard
+station would not, so only the RA field of our NDP CTS frames is affected.
 
 `s2g-node` wires NIC ↔ MAC ↔ PHY ↔ Pluto:
 
@@ -160,18 +188,19 @@ to compile). Two nodes need distinct `--mac` addresses (default is randomized).
 - [x] TX chain: preamble (STF/LTF1), SIG (CRC-4, QBPSK), scrambler, BCC + puncturing,
       interleaver, LDPC (Annex F codes, 19.3.11.7.5 encoding process, tone mapper),
       constellation mapping, fixed/traveling pilots, OFDM assembly — all MCSes
-- [x] RX chain: energy detect / CCA, STF detect, coarse/fine CFO, LTF timing + channel
-      estimate (+ smoothing), RSSI/RCPI/SNR, S1G_SHORT vs S1G_LONG discrimination, SIG and
-      SIG-A (SU/MU) decode with reserved-bit checks, PHY-RXSTART/RXEND statuses
-      (FormatViolation / UnsupportedRate / CarrierLost) with RXTIME hold, pilot CPE loop +
-      sampling-clock-drift tracking, soft Viterbi / layered min-sum LDPC, descrambling,
-      full RXVECTOR + metrics
+- [x] RX chain: CCA (energy detect within aCCATime, preamble detect, mid-packet detect
+      within aCCAMidTime, predicted-duration hold incl. reserved SIG indications), STF
+      detect, coarse/fine CFO, LTF timing + channel estimate (+ smoothing), RSSI/RCPI/SNR,
+      S1G_SHORT vs S1G_LONG discrimination, SIG and SIG-A (SU/MU) decode with reserved-bit
+      checks, PHY-RXSTART/RXEND statuses (FormatViolation / UnsupportedRate / CarrierLost)
+      with RXTIME hold, pilot CPE loop + sampling-clock-drift tracking with jump detection,
+      soft Viterbi / layered min-sum LDPC, descrambling, full RXVECTOR + metrics
 - [x] TX conformance measurements: spectral flatness, EVM vs Table 23-34, 2 MHz spectral
       mask, DC leakage
 - [x] NDP CMAC PPDU TX/RX; NDP CTS / Ack / BlockAck frame bodies (bitmap protection)
 - [x] PlutoSDR TX/RX backend (pure-Rust iiod client) at arbitrary carrier
-- [x] OCB MAC: data/RTS/ACK frames, A-MPDU, CSMA with PHY CCA + NAV + RID, NDP responses,
-      retries, dedup
+- [x] OCB MAC: data/RTS/ACK frames, S-MPDU, PV1 reception, CSMA with PHY CCA + NAV + RID +
+      EIFS, NDP responses, retries, dedup
 - [x] `s2g-node`: TAP (Unix) / UDP (Windows) network interface over the radio
 - [ ] Windows L2 TAP backend (tap-windows6); hardware-timestamped SIFS/ACK timing
 - [ ] S1G_LONG Data-field reception (optional for a ≤ 2 MHz STA), other NDP CMAC types

@@ -137,6 +137,59 @@ pub fn ltf_sync(buf: &[Complex32], search_from: usize, search_to: usize, coarse_
     })
 }
 
+/// Result of the mid-packet detector.
+#[derive(Debug, Clone, Copy)]
+pub struct MidPacket {
+    /// Peak guard-interval correlation, normalized (0..1).
+    pub metric: f32,
+    /// Symbol period that matched: 80 samples (long GI) or 72 (short GI).
+    pub symbol_len: usize,
+}
+
+/// Mid-packet PPDU detection [23.3.18.5.3.1, aCCAMidTime]: an S1G PPDU
+/// whose preamble was missed still shows the cyclic-prefix structure of
+/// its Data symbols. Correlates each sample with the one 64 samples later
+/// (the useful symbol length), sums over the guard interval and over the
+/// symbols in `buf` (≥ 212 µs = 424 samples), and looks for one symbol
+/// phase where that correlation is coherent. Tones (CW, DC) and the STF/LTF
+/// correlate at *every* phase, so a peak is only accepted when it clearly
+/// exceeds the mean over phases. Tries the long-GI (80-sample) and
+/// short-GI (72-sample) symbol periods.
+pub fn detect_mid_packet(buf: &[Complex32]) -> Option<MidPacket> {
+    const LAG: usize = 64;
+    if buf.len() < 3 * 80 {
+        return None;
+    }
+    let mean = buf.iter().sum::<Complex32>() / buf.len() as f32;
+    let x: Vec<Complex32> = buf.iter().map(|&v| v - mean).collect();
+    let mut best: Option<MidPacket> = None;
+    for (sym, gi) in [(80usize, 16usize), (72, 8)] {
+        let last = x.len() - gi - LAG;
+        let mut cph = vec![Complex32::new(0.0, 0.0); sym];
+        let mut eph = vec![0.0f32; sym];
+        // Sliding sums of the gi-sample correlation and energy.
+        let mut c = Complex32::new(0.0, 0.0);
+        let mut e = 0.0f32;
+        for i in 0..gi {
+            c += x[i] * x[i + LAG].conj();
+            e += 0.5 * (x[i].norm_sqr() + x[i + LAG].norm_sqr());
+        }
+        for k in 0..last {
+            cph[k % sym] += c;
+            eph[k % sym] += e;
+            c += x[k + gi] * x[k + gi + LAG].conj() - x[k] * x[k + LAG].conj();
+            e += 0.5 * (x[k + gi].norm_sqr() + x[k + gi + LAG].norm_sqr() - x[k].norm_sqr() - x[k + LAG].norm_sqr());
+        }
+        let m: Vec<f32> = cph.iter().zip(&eph).map(|(c, e)| c.norm() / e.max(1e-12)).collect();
+        let peak = m.iter().cloned().fold(0.0f32, f32::max);
+        let avg = m.iter().sum::<f32>() / m.len() as f32;
+        if peak > 0.5 && peak > 2.0 * avg && best.is_none_or(|b| peak > b.metric) {
+            best = Some(MidPacket { metric: peak, symbol_len: sym });
+        }
+    }
+    best
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -209,6 +262,44 @@ mod tests {
         let with_dc: Vec<Complex32> = v.iter().map(|&s| s + Complex32::new(2e-3, -1e-3)).collect();
         let (pos, _) = detect_stf(&with_dc, 0, 0.55).expect("detect with DC");
         assert!(pos + 24 >= start && pos < start + 120);
+    }
+
+    #[test]
+    fn mid_packet_detector() {
+        use crate::vector::TxVector;
+        use crate::Transmitter;
+        let tx = Transmitter::new();
+        let psdu: Vec<u8> = (0..300u32).map(|i| (i * 11) as u8).collect();
+        let wave = tx.generate(&TxVector { mcs: 3, scrambler_seed: Some(5), ..Default::default() }, &psdu).unwrap();
+        // Data symbols only (preamble cut off), with noise and CFO.
+        let data: Vec<Complex32> = add_cfo(&wave[480 + 160..480 + 160 + 424], 20e3)
+            .iter()
+            .zip(noise(424, 0.05, 4))
+            .map(|(&s, n)| s + n)
+            .collect();
+        let d = detect_mid_packet(&data).expect("long-GI data symbols");
+        assert_eq!(d.symbol_len, 80);
+        assert!(d.metric > 0.7, "{}", d.metric);
+        // Short-GI symbols: 8-sample cyclic prefix + 64-sample payload.
+        let mut sgi = Vec::new();
+        for n in 0..7 {
+            let payload = &wave[480 + n * 80 + 16..480 + n * 80 + 80];
+            sgi.extend_from_slice(&payload[56..]);
+            sgi.extend_from_slice(payload);
+        }
+        let d = detect_mid_packet(&sgi[..424]).expect("short-GI data symbols");
+        assert_eq!(d.symbol_len, 72);
+        // Noise, a CW tone, DC and the STF (which correlates at every
+        // phase) must not trigger it.
+        assert!(detect_mid_packet(&noise(424, 0.3, 9)).is_none());
+        let cw: Vec<Complex32> = (0..424).map(|i| Complex32::from_polar(0.3, 0.07 * i as f32)).collect();
+        assert!(detect_mid_packet(&cw).is_none());
+        let dc = vec![Complex32::new(0.2, -0.1); 424];
+        assert!(detect_mid_packet(&dc).is_none());
+        let mut stf = stf_time();
+        stf.extend(stf_time());
+        stf.extend(stf_time());
+        assert!(detect_mid_packet(&stf[..424]).is_none());
     }
 
     #[test]

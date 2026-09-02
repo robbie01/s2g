@@ -88,6 +88,9 @@ pub enum CcaReason {
     EnergyDetect,
     /// Start of an S1G PPDU detected (preamble).
     PreambleDetect,
+    /// An S1G PPDU already in progress detected from its Data-symbol
+    /// guard-interval structure (aCCAMidTime window).
+    MidPacket,
     /// A valid SIG/SIG-A predicted the PPDU duration; BUSY is held for it.
     PpduHold,
 }
@@ -142,8 +145,14 @@ const BACKOFF: u64 = 6;
 /// Overlap re-scanned across `process` calls so a detection run split by a
 /// chunk boundary is still found.
 const SCAN_OVERLAP: u64 = 112;
-/// Energy-detect window: aCCATime (40 µs) = 80 samples.
+/// Energy-detect window: aCCATime (40 µs) = 80 samples, evaluated every
+/// `ED_STRIDE` samples so a signal is reported within aCCATime of its start.
 const ED_WINDOW: u64 = 80;
+const ED_STRIDE: u64 = 16;
+/// Mid-packet detection window: aCCAMidTime (212 µs) = 424 samples,
+/// evaluated once per OFDM symbol.
+const MID_WINDOW: u64 = 424;
+const MID_STRIDE: u64 = 80;
 /// Samples per microsecond at the native rate.
 const SAMPLES_PER_US: u64 = 2;
 
@@ -274,9 +283,12 @@ pub struct Receiver {
     total_in: u64,
     state: State,
     // ---- CCA ----
-    /// Next energy-detect window start (absolute, multiple of ED_WINDOW).
+    /// Next energy-detect window start (absolute).
     ed_abs: u64,
     ed_busy: bool,
+    /// Next mid-packet detection window start (absolute).
+    mid_abs: u64,
+    mid_busy: bool,
     /// CCA BUSY held until this absolute sample (predicted PPDU end).
     hold_until: Option<u64>,
     /// A preamble has been detected and the PPDU is being received.
@@ -295,6 +307,8 @@ impl Receiver {
             state: State::Search,
             ed_abs: 0,
             ed_busy: false,
+            mid_abs: 0,
+            mid_busy: false,
             hold_until: None,
             in_ppdu: false,
             cca_busy: false,
@@ -380,7 +394,7 @@ impl Receiver {
                 self.hold_until = None;
             }
         }
-        let busy = self.ed_busy || self.in_ppdu || self.hold_until.is_some();
+        let busy = self.ed_busy || self.mid_busy || self.in_ppdu || self.hold_until.is_some();
         if busy != self.cca_busy {
             self.cca_busy = busy;
             if self.cfg.emit_cca {
@@ -393,6 +407,8 @@ impl Receiver {
                         Some(CcaReason::PpduHold)
                     } else if self.in_ppdu {
                         Some(CcaReason::PreambleDetect)
+                    } else if self.mid_busy {
+                        Some(CcaReason::MidPacket)
                     } else {
                         Some(CcaReason::EnergyDetect)
                     })
@@ -410,16 +426,46 @@ impl Receiver {
         while self.ed_abs + ED_WINDOW <= self.end_abs() {
             let p = self.dbm(self.power_dbfs(self.ed_abs, ED_WINDOW as usize));
             let busy = p > self.cfg.ed_threshold_dbm;
-            self.ed_abs += ED_WINDOW;
+            let at = self.ed_abs + ED_WINDOW;
+            self.ed_abs += ED_STRIDE;
             if busy != self.ed_busy {
                 self.ed_busy = busy;
-                self.update_cca(self.ed_abs, Some(CcaReason::EnergyDetect), events);
+                self.update_cca(at, Some(CcaReason::EnergyDetect), events);
             }
         }
         // Hold expiry is time-driven even when nothing else changes.
         if self.hold_until.is_some_and(|u| self.end_abs() >= u) {
             let at = self.hold_until.unwrap();
             self.update_cca(at, None, events);
+        }
+    }
+
+    /// Mid-packet detection [23.3.18.5.3.1] while no PPDU is being received:
+    /// a PPDU whose preamble was missed (receiver started late, previous
+    /// PPDU lost) is still reported BUSY from its Data-symbol structure
+    /// within aCCAMidTime, at or above the mid-packet threshold.
+    fn step_mid(&mut self, events: &mut Vec<RxEvent>) {
+        if !matches!(self.state, State::Search) {
+            self.mid_abs = self.end_abs().saturating_sub(MID_WINDOW).max(self.buf_abs);
+            if self.mid_busy {
+                self.mid_busy = false;
+                self.update_cca(self.end_abs(), None, events);
+            }
+            return;
+        }
+        self.mid_abs = self.mid_abs.max(self.buf_abs);
+        let threshold = rf::mid_packet_threshold_2mhz_dbm(self.cfg.cca_type);
+        while self.mid_abs + MID_WINDOW <= self.end_abs() {
+            let start = self.rel(self.mid_abs);
+            let win = &self.buf[start..start + MID_WINDOW as usize];
+            let level = self.dbm(self.power_dbfs(self.mid_abs, MID_WINDOW as usize));
+            let busy = level >= threshold && sync::detect_mid_packet(win).is_some();
+            let at = self.mid_abs + MID_WINDOW;
+            self.mid_abs += MID_STRIDE;
+            if busy != self.mid_busy {
+                self.mid_busy = busy;
+                self.update_cca(at, Some(CcaReason::MidPacket), events);
+            }
         }
     }
 
@@ -441,6 +487,7 @@ impl Receiver {
                 break;
             }
         }
+        self.step_mid(events);
     }
 
     /// Signal end-of-stream: emits `RxEnd(Truncated)` if a PPDU was in
@@ -480,6 +527,19 @@ impl Receiver {
         }
     }
 
+    /// Reserved SIG indication: CCA is held for the predicted duration when
+    /// the fields allow computing one [23.3.20], otherwise the detector is
+    /// re-armed at the anchor as after a CRC failure.
+    fn rearm_after_violation(&mut self, at: u64, anchor: u64, ppdu_start: u64, duration_us: Option<u32>, events: &mut Vec<RxEvent>) {
+        match duration_us {
+            Some(d) => {
+                let end = ppdu_start + d as u64 * SAMPLES_PER_US;
+                self.rearm(at, end, Some(end), events);
+            }
+            None => self.rearm(at, anchor, None, events),
+        }
+    }
+
     fn step_search(&mut self, events: &mut Vec<RxEvent>) -> bool {
         let from = self.scan_abs.max(self.buf_abs);
         let from_rel = self.rel(from.min(self.end_abs()));
@@ -496,11 +556,12 @@ impl Receiver {
             }
             None => {
                 // Remember how far we scanned (minus overlap), trim, stop.
+                // Keep an aCCAMidTime window of history for mid-packet CCA.
                 let scanned_to = self.end_abs().saturating_sub(SCAN_OVERLAP);
                 if scanned_to > self.scan_abs {
                     self.scan_abs = scanned_to;
                 }
-                self.trim(self.scan_abs);
+                self.trim(self.scan_abs.min(self.end_abs().saturating_sub(MID_WINDOW)));
                 false
             }
         }
@@ -609,12 +670,16 @@ impl Receiver {
                     // Wait out the PPDU with CCA BUSY [Fig 23-53 End-of-Wait].
                     self.rearm(sig_end, end, Some(end), events);
                 }
-                sig::SigVerdict::Reserved(_) => {
+                sig::SigVerdict::Reserved { duration_us, .. } => {
                     events.push(RxEvent::RxEnd { sample_index: anchor, status: RxEndStatus::FormatViolation });
-                    self.rearm(sig_end, anchor, None, events);
+                    self.rearm_after_violation(sig_end, anchor, ppdu_start, duration_us, events);
                 }
             },
-            Err(_) => {
+            Err(sig::SigError::Reserved { duration_us, .. }) => {
+                events.push(RxEvent::RxEnd { sample_index: anchor, status: RxEndStatus::FormatViolation });
+                self.rearm_after_violation(sig_end, anchor, ppdu_start, duration_us, events);
+            }
+            Err(sig::SigError::CrcFailed) => {
                 events.push(RxEvent::RxEnd { sample_index: anchor, status: RxEndStatus::FormatViolation });
                 // CCA stays BUSY only while energy detect says so (release
                 // when the level drops below min-sensitivity + 20 dB, which

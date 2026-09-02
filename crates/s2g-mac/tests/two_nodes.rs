@@ -151,10 +151,10 @@ fn delivered(n: &Node) -> Vec<&Vec<u8>> {
 }
 
 #[test]
-fn unicast_large_frame_with_ndp_block_ack() {
+fn unicast_large_frame_as_s_mpdu_with_ndp_ack() {
     let mut a = Node::new(Node::config(A, 5, true));
     let mut b = Node::new(Node::config(B, 5, true));
-    let frame = eth(B, A, 1400); // forces A-MPDU aggregation
+    let frame = eth(B, A, 1400); // forces an S-MPDU (aggregated PSDU)
     a.mac.enqueue_eth(&frame).unwrap();
     run(&mut a, &mut b, 200, |_| false);
 
@@ -166,9 +166,9 @@ fn unicast_large_frame_with_ndp_block_ack() {
         "A events: {:?}",
         a.events
     );
-    // The acknowledgement was an NDP BlockAck CMAC PPDU.
+    // An S-MPDU is acknowledged like a single MPDU: with an NDP Ack [10.12.8].
     assert_eq!(b.ndps_sent, 1);
-    assert!(matches!(a.ndps_received()[..], [NdpFrame::BlockAck(_)]), "{:?}", a.ndps_received());
+    assert!(matches!(a.ndps_received()[..], [NdpFrame::Ack(_)]), "{:?}", a.ndps_received());
 }
 
 #[test]

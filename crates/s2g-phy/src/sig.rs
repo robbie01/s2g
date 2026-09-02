@@ -108,8 +108,9 @@ pub enum SigError {
     /// CRC over bits 0..37 failed.
     CrcFailed,
     /// Tail bits nonzero, or a reserved bit transmitted as 0 ("Reserved SIG
-    /// Indication" [23.3.20]).
-    Reserved(&'static str),
+    /// Indication" [23.3.20]). When the remaining fields still allow it,
+    /// `duration_us` carries the PPDU duration so CCA can be held for it.
+    Reserved { reason: &'static str, duration_us: Option<u32> },
 }
 
 /// What the receiver should do with a CRC-valid SIG/SIG-A.
@@ -120,9 +121,41 @@ pub enum SigVerdict {
     /// Valid but not decodable here (PHY-RXSTART then RXEND(UnsupportedRate));
     /// the RXVECTOR still carries everything needed for CCA/RID.
     Unsupported(RxVector, &'static str),
-    /// Reserved SIG Indication → PHY-RXEND(FormatViolation); the duration
-    /// is unknown.
-    Reserved(&'static str),
+    /// Reserved SIG Indication → PHY-RXEND(FormatViolation). CCA is still
+    /// held for `duration_us` when the fields allow computing it [23.3.20].
+    Reserved { reason: &'static str, duration_us: Option<u32> },
+}
+
+/// PPDU duration for a (possibly invalid) field combination, or `None` when
+/// the symbol count cannot be derived (unknown N_DBPS without aggregation).
+#[allow(clippy::too_many_arguments)]
+fn duration_from_fields(
+    preamble: PreambleType,
+    n_sts: u8,
+    stbc: bool,
+    short_gi: bool,
+    mcs: u8,
+    ldpc: bool,
+    ldpc_extra: bool,
+    aggregation: bool,
+    length: u16,
+) -> Option<u32> {
+    let n_ss = if stbc { (n_sts / 2).max(1) } else { n_sts.max(1) };
+    let n_sym = if aggregation {
+        (length > 0).then_some(length as usize)?
+    } else {
+        let n_dbps = params::n_dbps_2mhz(mcs, n_ss)?;
+        let coding = if ldpc { Coding::Ldpc } else { Coding::Bcc };
+        data_field_geometry(length, false, coding, ldpc && ldpc_extra, stbc, n_dbps)?.0
+    };
+    let r = RxVector {
+        preamble_type: preamble,
+        num_sts: n_sts.max(1),
+        gi: if short_gi { GuardInterval::Short } else { GuardInterval::Long },
+        n_sym,
+        ..Default::default()
+    };
+    Some(r.ppdu_duration_us())
 }
 
 /// CRC-4, G(D)=D⁴+D+1, register init all-ones, output ones-complemented,
@@ -153,7 +186,7 @@ fn finish_48(mut v: Vec<u8>) -> [u8; 48] {
 /// Check tail and CRC of 48 decoded bits.
 fn check_48(bits: &[u8; 48]) -> Result<(), SigError> {
     if bits[42..48].iter().any(|&b| b != 0) {
-        return Err(SigError::Reserved("nonzero tail bits"));
+        return Err(SigError::Reserved { reason: "nonzero tail bits", duration_us: None });
     }
     if bits[38..42] != crc4(&bits[..38]) {
         return Err(SigError::CrcFailed);
@@ -251,24 +284,41 @@ impl SigFields {
         })
     }
 
+    /// PPDU duration implied by the fields even when the combination is
+    /// reserved, if it can be computed.
+    pub fn duration_if_computable(&self) -> Option<u32> {
+        duration_from_fields(
+            PreambleType::S1gShort,
+            self.nsts + 1,
+            self.stbc,
+            self.short_gi,
+            self.mcs,
+            self.ldpc,
+            self.ldpc_extra,
+            self.aggregation,
+            self.length,
+        )
+    }
+
     /// Classify and derive the RXVECTOR skeleton [23.3.20].
     pub fn verdict(&self) -> SigVerdict {
         let n_sts = self.nsts + 1;
         let n_ss = if self.stbc { n_sts / 2 } else { n_sts };
+        let reserved = |reason: &'static str| SigVerdict::Reserved { reason, duration_us: self.duration_if_computable() };
         if self.stbc && !n_sts.is_multiple_of(2) {
-            return SigVerdict::Reserved("STBC with odd N_STS");
+            return reserved("STBC with odd N_STS");
         }
         if !self.ldpc && !self.ldpc_extra {
-            return SigVerdict::Reserved("B18 must be 1 with BCC");
+            return reserved("B18 must be 1 with BCC");
         }
         let Some(n_dbps) = params::n_dbps_2mhz(self.mcs, n_ss) else {
-            return SigVerdict::Reserved("MCS/N_SS combination not in 23.5");
+            return reserved("MCS/N_SS combination not in 23.5");
         };
         let coding = if self.ldpc { Coding::Ldpc } else { Coding::Bcc };
         let Some((n_sym, psdu_length)) =
             data_field_geometry(self.length, self.aggregation, coding, self.ldpc && self.ldpc_extra, self.stbc, n_dbps)
         else {
-            return SigVerdict::Reserved("zero-length Data field");
+            return reserved("zero-length Data field");
         };
         let (color, partial_aid) = split_id(self.id, self.uplink_indication);
         let rxv = RxVector {
@@ -319,12 +369,28 @@ impl SigFields {
         match self.verdict() {
             SigVerdict::Supported(r) => Ok(r),
             SigVerdict::Unsupported(_, why) => Err(PhyError::Unsupported(why)),
-            SigVerdict::Reserved(why) => Err(PhyError::InvalidLength { len: self.length as usize, reason: why }),
+            SigVerdict::Reserved { reason, .. } => Err(PhyError::InvalidLength { len: self.length as usize, reason }),
         }
     }
 }
 
 impl SigASu {
+    /// PPDU duration implied by the fields even when the combination is
+    /// reserved, if it can be computed.
+    pub fn duration_if_computable(&self) -> Option<u32> {
+        duration_from_fields(
+            PreambleType::S1gLong,
+            self.nsts + 1,
+            self.stbc,
+            self.short_gi,
+            self.mcs,
+            self.ldpc,
+            self.ldpc_extra,
+            self.aggregation,
+            self.length,
+        )
+    }
+
     pub fn to_bits(&self) -> [u8; 48] {
         let mut v = Vec::with_capacity(48);
         // SIG-A1
@@ -354,20 +420,21 @@ impl SigASu {
     pub fn verdict(&self) -> SigVerdict {
         let n_sts = self.nsts + 1;
         let n_ss = if self.stbc { n_sts / 2 } else { n_sts };
+        let reserved = |reason: &'static str| SigVerdict::Reserved { reason, duration_us: self.duration_if_computable() };
         if self.stbc && !n_sts.is_multiple_of(2) {
-            return SigVerdict::Reserved("STBC with odd N_STS");
+            return reserved("STBC with odd N_STS");
         }
         if !self.ldpc && !self.ldpc_extra {
-            return SigVerdict::Reserved("B18 must be 1 with BCC");
+            return reserved("B18 must be 1 with BCC");
         }
         let Some(n_dbps) = params::n_dbps_2mhz(self.mcs, n_ss) else {
-            return SigVerdict::Reserved("MCS/N_SS combination not in 23.5");
+            return reserved("MCS/N_SS combination not in 23.5");
         };
         let coding = if self.ldpc { Coding::Ldpc } else { Coding::Bcc };
         let Some((n_sym, psdu_length)) =
             data_field_geometry(self.length, self.aggregation, coding, self.ldpc && self.ldpc_extra, self.stbc, n_dbps)
         else {
-            return SigVerdict::Reserved("zero-length Data field");
+            return reserved("zero-length Data field");
         };
         let (color, partial_aid) = split_id(self.id, self.uplink_indication);
         let rxv = RxVector {
@@ -423,13 +490,19 @@ impl SigAMu {
         finish_48(v)
     }
 
+    /// PPDU duration (MU PPDUs are always aggregated, so N_SYM = Length).
+    pub fn duration_if_computable(&self) -> Option<u32> {
+        let total_sts: u8 = self.nsts.iter().sum();
+        duration_from_fields(PreambleType::S1gLong, total_sts.max(1), self.stbc, self.short_gi, 0, false, false, true, self.length)
+    }
+
     pub fn verdict(&self) -> SigVerdict {
         let total_sts: u8 = self.nsts.iter().sum();
         if total_sts == 0 {
-            return SigVerdict::Reserved("MU PPDU with no space-time streams");
+            return SigVerdict::Reserved { reason: "MU PPDU with no space-time streams", duration_us: self.duration_if_computable() };
         }
         if self.length == 0 {
-            return SigVerdict::Reserved("zero-length Data field");
+            return SigVerdict::Reserved { reason: "zero-length Data field", duration_us: None };
         }
         let rxv = RxVector {
             preamble_type: PreambleType::S1gLong,
@@ -475,11 +548,7 @@ fn parse_short(bits: &[u8; 48]) -> Result<SigContent, SigError> {
         let body = bits_to_uint_lsb_first(&bits[..37]);
         return Ok(SigContent::Ndp { body });
     }
-    if bits[0] != 1 {
-        // Reserved bit is transmitted as 1 in S1G_SHORT.
-        return Err(SigError::Reserved("SIG B0 = 0"));
-    }
-    Ok(SigContent::Normal(SigFields {
+    let fields = SigFields {
         stbc: bits[1] == 1,
         uplink_indication: bits[2] == 1,
         bandwidth: bits_to_uint_lsb_first(&bits[3..5]) as u8,
@@ -494,7 +563,13 @@ fn parse_short(bits: &[u8; 48]) -> Result<SigContent, SigError> {
         length: bits_to_uint_lsb_first(&bits[25..34]) as u16,
         response_indication: ResponseIndication::from_bits(bits_to_uint_lsb_first(&bits[34..36]) as u8),
         traveling_pilots: bits[36] == 1,
-    }))
+    };
+    if bits[0] != 1 {
+        // Reserved bit is transmitted as 1 in S1G_SHORT; the other fields
+        // still tell us how long to hold CCA.
+        return Err(SigError::Reserved { reason: "SIG B0 = 0", duration_us: fields.duration_if_computable() });
+    }
+    Ok(SigContent::Normal(fields))
 }
 
 /// Parse 48 decoded S1G_LONG SIG-A bits.
@@ -502,10 +577,7 @@ fn parse_long(bits: &[u8; 48]) -> Result<SigContent, SigError> {
     check_48(bits)?;
     if bits[0] == 0 {
         // SU [Table 23-14]
-        if bits[36] != 1 {
-            return Err(SigError::Reserved("SIG-A2 B12 = 0"));
-        }
-        Ok(SigContent::LongSu(SigASu {
+        let fields = SigASu {
             stbc: bits[1] == 1,
             uplink_indication: bits[2] == 1,
             bandwidth: bits_to_uint_lsb_first(&bits[3..5]) as u8,
@@ -520,25 +592,24 @@ fn parse_long(bits: &[u8; 48]) -> Result<SigContent, SigError> {
             length: bits_to_uint_lsb_first(&bits[25..34]) as u16,
             response_indication: ResponseIndication::from_bits(bits_to_uint_lsb_first(&bits[34..36]) as u8),
             traveling_pilots: bits[37] == 1,
-        }))
+        };
+        if bits[36] != 1 {
+            return Err(SigError::Reserved { reason: "SIG-A2 B12 = 0", duration_us: fields.duration_if_computable() });
+        }
+        Ok(SigContent::LongSu(fields))
     } else {
         // MU [Table 23-15]
-        if bits[2] != 1 {
-            return Err(SigError::Reserved("SIG-A1 B2 = 0"));
-        }
-        if bits[25] != 1 {
-            return Err(SigError::Reserved("SIG-A2 B1 = 0"));
-        }
         let mut nsts = [0u8; 4];
         let mut ldpc = [false; 4];
+        let mut coding_reserved = false;
         for u in 0..4 {
             nsts[u] = bits_to_uint_lsb_first(&bits[3 + 2 * u..5 + 2 * u]) as u8;
             ldpc[u] = bits[20 + u] == 1;
             if nsts[u] == 0 && !ldpc[u] {
-                return Err(SigError::Reserved("Coding-I reserved bit = 0"));
+                coding_reserved = true;
             }
         }
-        Ok(SigContent::LongMu(SigAMu {
+        let fields = SigAMu {
             stbc: bits[1] == 1,
             nsts,
             bandwidth: bits_to_uint_lsb_first(&bits[11..13]) as u8,
@@ -549,7 +620,18 @@ fn parse_long(bits: &[u8; 48]) -> Result<SigContent, SigError> {
             length: bits_to_uint_lsb_first(&bits[26..35]) as u16,
             response_indication: ResponseIndication::from_bits(bits_to_uint_lsb_first(&bits[35..37]) as u8),
             traveling_pilots: bits[37] == 1,
-        }))
+        };
+        let reserved = |reason: &'static str| SigError::Reserved { reason, duration_us: fields.duration_if_computable() };
+        if bits[2] != 1 {
+            return Err(reserved("SIG-A1 B2 = 0"));
+        }
+        if bits[25] != 1 {
+            return Err(reserved("SIG-A2 B1 = 0"));
+        }
+        if coding_reserved {
+            return Err(reserved("Coding-I reserved bit = 0"));
+        }
+        Ok(SigContent::LongMu(fields))
     }
 }
 
@@ -880,17 +962,20 @@ mod tests {
         f2.nsts = 1;
         assert!(matches!(f2.verdict(), SigVerdict::Unsupported(_, "multiple spatial streams")));
         let mut f3 = sample_fields();
-        f3.mcs = 9; // not valid at 1 SS
-        assert!(matches!(f3.verdict(), SigVerdict::Reserved(_)));
+        f3.mcs = 9; // not valid at 1 SS: duration unknown without aggregation
+        assert!(matches!(f3.verdict(), SigVerdict::Reserved { duration_us: None, .. }));
+        f3.aggregation = true;
+        f3.length = 20; // …but N_SYM = LENGTH when aggregated
+        assert!(matches!(f3.verdict(), SigVerdict::Reserved { duration_us: Some(1040), .. }));
         let mut f4 = sample_fields();
         f4.stbc = true; // N_STS=1 with STBC is not a defined mode
-        assert!(matches!(f4.verdict(), SigVerdict::Reserved(_)));
+        assert!(matches!(f4.verdict(), SigVerdict::Reserved { .. }));
         let mut f5 = sample_fields();
-        f5.ldpc_extra = false; // BCC requires B18 = 1
-        assert!(matches!(f5.verdict(), SigVerdict::Reserved(_)));
+        f5.ldpc_extra = false; // BCC requires B18 = 1; duration still computable
+        assert!(matches!(f5.verdict(), SigVerdict::Reserved { duration_us: Some(480), .. }));
         let mut f6 = sample_fields();
         f6.length = 0;
-        assert!(matches!(f6.verdict(), SigVerdict::Reserved(_)));
+        assert!(matches!(f6.verdict(), SigVerdict::Reserved { duration_us: None, .. }));
         // Unsupported modes still get a duration.
         let mut f7 = sample_fields();
         f7.short_gi = true;
@@ -898,11 +983,11 @@ mod tests {
             SigVerdict::Unsupported(r, "short GI") => assert_eq!(r.data_duration_us(), 40 + 5 * 36),
             other => panic!("{other:?}"),
         }
-        // Reserved B0 is caught at parse time.
+        // Reserved B0 is caught at parse time, with the duration preserved.
         let mut bits = sample_fields().to_bits();
         bits[0] = 0;
         let crc = crc4(&bits[..38]);
         bits[38..42].copy_from_slice(&crc);
-        assert!(matches!(parse_short(&bits), Err(SigError::Reserved(_))));
+        assert!(matches!(parse_short(&bits), Err(SigError::Reserved { duration_us: Some(480), .. })));
     }
 }

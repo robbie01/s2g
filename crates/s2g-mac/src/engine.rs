@@ -29,11 +29,11 @@
 //! real SIFS turnaround impossible without hardware timestamping, which is
 //! also why the ACK timeout defaults to 150 ms).
 
-use crate::frame::{self, MacAddr, ParsedFrame};
+use crate::frame::{self, MacAddr, ParsedFrame, Pv1Addr};
 use crate::ndp::{self, NdpAck, NdpBlockAck, NdpCts, NdpFrame};
 use crate::{ampdu, eth};
 use s2g_phy::params::{characteristics::*, T_PREAMBLE_US};
-use s2g_phy::rx::RxEvent;
+use s2g_phy::rx::{RxEndStatus, RxEvent};
 use s2g_phy::vector::{Coding, ResponseIndication, RxVector, TxVector};
 use std::collections::{HashMap, VecDeque};
 use thiserror::Error;
@@ -126,12 +126,12 @@ pub enum MacAction {
     TransmitNdp { body: u64 },
 }
 
-/// What we are waiting for after a transmission.
+/// What we are waiting for after a transmission. (We never send
+/// multi-MPDU A-MPDUs, so an NDP BlockAck is never expected.)
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Expect {
     Ack,
     NdpAck { ack_id: u16 },
-    NdpBlockAck { block_ack_id: u8, seq: u16 },
     NdpCts { partial_aid: u16 },
 }
 
@@ -171,6 +171,10 @@ pub struct Mac {
     rid_until_us: u64,
     /// Start of the most recent PPDU (RxStart), for RID/NAV anchoring.
     last_ppdu_end_us: u64,
+    /// The last PPDU ended in PHY-RXEND(FormatViolation): the next access
+    /// waits EIFS instead of DIFS [10.3.7], until an error-free frame
+    /// resynchronises us.
+    eifs_pending: bool,
     cw_exp: u32,
     dedup: HashMap<MacAddr, VecDeque<u16>>,
     rng: u64,
@@ -201,6 +205,7 @@ impl Mac {
             nav_until_us: 0,
             rid_until_us: 0,
             last_ppdu_end_us: 0,
+            eifs_pending: false,
             cw_exp,
             dedup: HashMap::new(),
             rng,
@@ -214,6 +219,11 @@ impl Mac {
     /// True while CCA, NAV or RID forbids transmission.
     pub fn medium_busy(&self, now_us: u64) -> bool {
         self.cca_busy || now_us < self.busy_until_us || now_us < self.nav_until_us || now_us < self.rid_until_us
+    }
+
+    /// EIFS for an S1G STA [10.3.7]: aSIFSTime + NDPTxTime + DIFS.
+    pub fn eifs_us(&self) -> u64 {
+        A_SIFS_TIME_US as u64 + NDP_TX_TIME_US as u64 + self.cfg.difs_us
     }
 
     fn rand_u32(&mut self) -> u32 {
@@ -305,22 +315,52 @@ impl Mac {
                 self.on_ndp(&f, now_us, out);
                 out.push(MacEvent::NdpReceived { frame: f });
             }
+            RxEvent::RxEnd { status: RxEndStatus::FormatViolation, .. } => {
+                // An S1G STA uses EIFS only after a FormatViolation [10.3.7].
+                self.eifs_pending = true;
+            }
             RxEvent::RxEnd { .. } => {}
             RxEvent::PsduReceived { rxvector, psdu, .. } => {
-                let mpdus: Vec<Vec<u8>> = if rxvector.aggregation {
-                    ampdu::deaggregate(psdu)
+                let (mpdus, s_mpdu): (Vec<Vec<u8>>, bool) = if rxvector.aggregation {
+                    let with_eof = ampdu::deaggregate_with_eof(psdu);
+                    let s = with_eof.len() == 1 && with_eof[0].1;
+                    (with_eof.into_iter().map(|(m, _)| m).collect(), s)
                 } else {
                     // Tolerate chips that pad the PSDU after the FCS.
-                    vec![frame::locate_mpdu(psdu).unwrap_or(psdu).to_vec()]
+                    (vec![frame::locate_mpdu(psdu).unwrap_or(psdu).to_vec()], false)
                 };
+                // An S-MPDU follows non-aggregated rules [10.12.8]: it is
+                // acknowledged with an (NDP) Ack, not a BlockAck.
+                let block_ack = rxvector.aggregation && !s_mpdu;
                 for mpdu in mpdus {
-                    self.on_mpdu(&mpdu, rxvector, now_us, out);
+                    self.on_mpdu(&mpdu, rxvector, block_ack, now_us, out);
                 }
             }
         }
     }
 
+    /// RID contribution of an NDP CMAC PPDU [Table 10-2]: its RESPONSE
+    /// INDICATION is implied by the frame type (and, for an NDP Ack, by the
+    /// Idle Indication / Duration fields).
+    fn ndp_rid_length_us(&self, f: &NdpFrame) -> u64 {
+        let sifs = A_SIFS_TIME_US as u64;
+        match f {
+            NdpFrame::Ack(a) if a.idle_indication && a.duration == 0 => self.cfg.long_tx_time_us + sifs,
+            NdpFrame::Ack(_) | NdpFrame::BlockAck(_) | NdpFrame::Cts(_) => 0,
+            NdpFrame::Other { ndp_type, .. } => match *ndp_type {
+                ndp::TYPE_PS_POLL | ndp::TYPE_PROBE_REQUEST => NDP_TX_TIME_US as u64 + sifs,
+                ndp::TYPE_BF_REPORT_POLL => self.cfg.long_tx_time_us + sifs,
+                _ => 0,
+            },
+        }
+    }
+
     fn on_ndp(&mut self, f: &NdpFrame, now_us: u64, out: &mut Vec<MacEvent>) {
+        // An NDP CMAC PPDU has no Data field, so it has just ended.
+        let rid = self.ndp_rid_length_us(f);
+        if rid > 0 {
+            self.extend_rid(now_us + rid);
+        }
         match f {
             NdpFrame::Ack(a) => {
                 if let TxState::AwaitResponse { expect: Expect::NdpAck { ack_id }, .. } = &self.state {
@@ -332,13 +372,7 @@ impl Mac {
                     self.nav_until_us = self.nav_until_us.max(now_us + a.duration as u64);
                 }
             }
-            NdpFrame::BlockAck(ba) => {
-                if let TxState::AwaitResponse { expect: Expect::NdpBlockAck { block_ack_id, seq }, .. } = &self.state {
-                    if *block_ack_id == ba.block_ack_id && *seq == ba.starting_sequence && ba.bitmap & 1 == 1 {
-                        self.complete_current(true, out);
-                    }
-                }
-            }
+            NdpFrame::BlockAck(_) => {}
             NdpFrame::Cts(c) => {
                 let for_us = !c.address_indicator && c.ra_pbssid == self.cfg.partial_aid();
                 if for_us {
@@ -364,33 +398,22 @@ impl Mac {
         self.cw_exp = self.cfg.cw_min_exp;
     }
 
-    fn on_mpdu(&mut self, mpdu: &[u8], rxv: &RxVector, now_us: u64, out: &mut Vec<MacEvent>) {
-        match frame::parse(mpdu) {
+    fn on_mpdu(&mut self, mpdu: &[u8], rxv: &RxVector, block_ack: bool, now_us: u64, out: &mut Vec<MacEvent>) {
+        let parsed = frame::parse(mpdu);
+        if parsed.is_ok() {
+            // An error-free frame resynchronises us: back to DIFS [10.3.7].
+            self.eifs_pending = false;
+        }
+        match parsed {
             Ok(ParsedFrame::Data { dest, src, seq, duration_us, body, .. }) => {
-                if src == self.cfg.addr {
-                    return; // our own transmission looping back
-                }
-                let for_us = dest == self.cfg.addr;
-                if !for_us && !is_group(&dest) {
-                    if duration_us > 0 {
-                        self.nav_until_us = self.nav_until_us.max(now_us + duration_us as u64);
-                    }
-                    return; // someone else's unicast
-                }
-                if for_us {
-                    // Addressed to us: we are the responder, so the RID does
-                    // not apply to us [10.3.2.5.1].
-                    self.rid_until_us = 0;
-                    if self.cfg.ack_enabled {
-                        // ACK even duplicates — the peer may have missed our ACK.
-                        self.queue_ack(rxv, seq, mpdu, src);
-                    }
-                }
-                if self.note_duplicate(src, seq) {
-                    return;
-                }
-                if let Some(ethf) = eth::body_to_ethernet(dest, src, &body) {
-                    out.push(MacEvent::EthReceived(ethf));
+                self.on_data(dest, src, seq, duration_us, false, &body, rxv, block_ack, mpdu, now_us, out);
+            }
+            Ok(ParsedFrame::Pv1 { ptype, a1, a2, seq, no_ack, body, .. }) => {
+                // PV1 QoS Data with full MAC addresses is deliverable; frames
+                // that identify a station by AID cannot be resolved without an
+                // association and are dropped (received, counted as valid).
+                if let (frame::PV1_TYPE_QOS_DATA_MAC, Pv1Addr::Mac(dest), Pv1Addr::Mac(src), Some(seq)) = (ptype, a1, a2, seq) {
+                    self.on_data(dest, src, seq, 0, no_ack, &body, rxv, block_ack, mpdu, now_us, out);
                 }
             }
             Ok(ParsedFrame::Ack { ra }) => {
@@ -426,11 +449,56 @@ impl Mac {
         }
     }
 
-    /// Queue the acknowledgement the eliciting PPDU asked for [Table 10-7].
-    fn queue_ack(&mut self, rxv: &RxVector, seq: u16, mpdu: &[u8], src: MacAddr) {
+    /// Common handling of a data MPDU (PV0 Data or PV1 QoS Data).
+    #[allow(clippy::too_many_arguments)]
+    fn on_data(
+        &mut self,
+        dest: MacAddr,
+        src: MacAddr,
+        seq: u16,
+        duration_us: u16,
+        no_ack: bool,
+        body: &[u8],
+        rxv: &RxVector,
+        block_ack: bool,
+        mpdu: &[u8],
+        now_us: u64,
+        out: &mut Vec<MacEvent>,
+    ) {
+        if src == self.cfg.addr {
+            return; // our own transmission looping back
+        }
+        let for_us = dest == self.cfg.addr;
+        if !for_us && !is_group(&dest) {
+            if duration_us > 0 {
+                self.nav_until_us = self.nav_until_us.max(now_us + duration_us as u64);
+            }
+            return; // someone else's unicast
+        }
+        if for_us {
+            // Addressed to us: we are the responder, so the RID does not
+            // apply to us [10.3.2.5.1].
+            self.rid_until_us = 0;
+            if self.cfg.ack_enabled && !no_ack {
+                // ACK even duplicates — the peer may have missed our ACK.
+                self.queue_ack(rxv, seq, mpdu, src, block_ack);
+            }
+        }
+        if self.note_duplicate(src, seq) {
+            return;
+        }
+        if let Some(ethf) = eth::body_to_ethernet(dest, src, body) {
+            out.push(MacEvent::EthReceived(ethf));
+        }
+    }
+
+    /// Queue the acknowledgement the eliciting PPDU asked for [Table 10-7]:
+    /// an NDP BlockAck only for a genuine (multi-MPDU) A-MPDU, an NDP Ack
+    /// for single MPDUs and S-MPDUs [10.12.8].
+    fn queue_ack(&mut self, rxv: &RxVector, seq: u16, mpdu: &[u8], src: MacAddr, block_ack: bool) {
         match rxv.response_indication {
             ResponseIndication::Ndp => {
-                let f = if rxv.aggregation {
+                let f = if block_ack {
                     NdpFrame::BlockAck(NdpBlockAck {
                         block_ack_id: ndp::block_ack_id(rxv.scrambler_seed),
                         starting_sequence: seq,
@@ -456,7 +524,9 @@ impl Mac {
         let cw = (1u64 << self.cw_exp) - 1;
         let slots = (self.rand_u32() as u64) % (cw + 1);
         let idle_at = now_us.max(self.busy_until_us).max(self.nav_until_us).max(self.rid_until_us);
-        let base = idle_at + self.cfg.difs_us;
+        let ifs = if self.eifs_pending { self.eifs_us() } else { self.cfg.difs_us };
+        self.eifs_pending = false;
+        let base = idle_at + ifs;
         self.state = TxState::Backoff { until_us: base + slots * self.cfg.slot_us };
     }
 
@@ -578,12 +648,9 @@ impl Mac {
             let airtime =
                 s2g_phy::tx::txtime_us_coded(self.cfg.mcs, psdu.len(), aggregated, self.cfg.fec_coding).unwrap_or(10_000) as u64;
             if want_ack {
-                let cur = self.cur.as_ref().unwrap();
-                let expect = match (self.cfg.ndp_ack, aggregated) {
-                    (false, _) => Expect::Ack,
-                    (true, false) => Expect::NdpAck { ack_id: ndp::ack_id_for_mpdu(seed, &mpdu) },
-                    (true, true) => Expect::NdpBlockAck { block_ack_id: ndp::block_ack_id(seed), seq: cur.seq },
-                };
+                // Our aggregated PSDUs are S-MPDUs, acknowledged like single
+                // MPDUs [10.12.8]: an NDP Ack (or legacy Ack), never a BlockAck.
+                let expect = if self.cfg.ndp_ack { Expect::NdpAck { ack_id: ndp::ack_id_for_mpdu(seed, &mpdu) } } else { Expect::Ack };
                 self.state = TxState::AwaitResponse { deadline_us: now_us + airtime + self.cfg.ack_timeout_us, expect };
             } else {
                 let cur = self.cur.take().unwrap();
@@ -665,7 +732,7 @@ mod tests {
     }
 
     #[test]
-    fn large_frame_aggregates_and_expects_ndp_block_ack() {
+    fn large_frame_goes_as_s_mpdu_and_expects_ndp_ack() {
         let mut cfg = MacConfig::new(A);
         cfg.mcs = 5;
         let mut mac = Mac::new(cfg);
@@ -676,18 +743,116 @@ mod tests {
         assert!(txv.aggregation);
         assert_eq!(txv.response_indication, ResponseIndication::Ndp);
         let seed = txv.scrambler_seed.unwrap();
-        // PSDU fills the symbol capacity exactly.
+        // PSDU fills the symbol capacity exactly and is an S-MPDU.
         let cap = s2g_phy::tx::aggregated_capacity(5, psdu.len(), Coding::Bcc).unwrap();
         assert_eq!(psdu.len(), cap);
+        assert!(ampdu::is_s_mpdu(&psdu));
         // And deaggregates back to one valid data frame.
         let mpdus = ampdu::deaggregate(&psdu);
         assert_eq!(mpdus.len(), 1);
-        let ParsedFrame::Data { seq, .. } = frame::parse(&mpdus[0]).unwrap() else { panic!() };
-        // The matching NDP BlockAck completes the exchange.
-        let ba = NdpFrame::BlockAck(NdpBlockAck { block_ack_id: ndp::block_ack_id(seed), starting_sequence: seq, bitmap: 1 });
-        mac.on_phy_event(&RxEvent::NdpReceived { sample_index: 0, body: ba.to_body(), metrics: metrics() }, now, &mut out);
+        assert!(matches!(frame::parse(&mpdus[0]).unwrap(), ParsedFrame::Data { .. }));
+        // The receiving MAC answers an S-MPDU with an NDP Ack [10.12.8]...
+        let mut mac_b = Mac::new(MacConfig::new(B));
+        let mut out_b = Vec::new();
+        mac_b.on_phy_event(&psdu_event(&txv, &psdu), now, &mut out_b);
+        let Some(MacAction::TransmitNdp { body }) = mac_b.poll(now, &mut out_b) else { panic!() };
+        let NdpFrame::Ack(a) = NdpFrame::parse(body) else { panic!("expected NDP Ack, got {:?}", NdpFrame::parse(body)) };
+        assert_eq!(a.ack_id, ndp::ack_id_for_mpdu(seed, &mpdus[0]));
+        // ...which completes the exchange at the sender.
+        mac.on_phy_event(&RxEvent::NdpReceived { sample_index: 0, body, metrics: metrics() }, now, &mut out);
         mac.poll(now, &mut out);
         assert!(out.iter().any(|e| matches!(e, MacEvent::TxComplete { acked: true, .. })), "{out:?}");
+        // A genuine multi-MPDU A-MPDU (EOF = 0) would still get an NDP BlockAck.
+        let mpdu = frame::build_data(B, A, 9, false, 0, b"two");
+        let mut two = Vec::new();
+        two.extend_from_slice(&ampdu::build_delimiter(mpdu.len(), false));
+        two.extend_from_slice(&mpdu);
+        two.resize(two.len().div_ceil(4) * 4, 0);
+        two.extend_from_slice(&ampdu::build_delimiter(mpdu.len(), false));
+        two.extend_from_slice(&mpdu);
+        let txv2 = TxVector { aggregation: true, response_indication: ResponseIndication::Ndp, scrambler_seed: Some(seed), ..Default::default() };
+        let mut mac_c = Mac::new(MacConfig::new(B));
+        let mut out_c = Vec::new();
+        mac_c.on_phy_event(&psdu_event(&txv2, &two), now, &mut out_c);
+        let Some(MacAction::TransmitNdp { body }) = mac_c.poll(now, &mut out_c) else { panic!() };
+        assert!(matches!(NdpFrame::parse(body), NdpFrame::BlockAck(_)));
+    }
+
+    #[test]
+    fn pv1_data_is_received_and_acked() {
+        let mut mac_b = Mac::new(MacConfig::new(B));
+        let mut out_b = Vec::new();
+        let body = eth::to_body(0x0800, &[1, 2, 3, 4]);
+        let f = frame::build_pv1_data(B, A, 3, 0, false, &body);
+        let txv = TxVector { response_indication: ResponseIndication::Ndp, scrambler_seed: Some(21), ..Default::default() };
+        mac_b.on_phy_event(&psdu_event(&txv, &f), 0, &mut out_b);
+        assert!(out_b.iter().any(|e| matches!(e, MacEvent::EthReceived(_))), "{out_b:?}");
+        let Some(MacAction::TransmitNdp { body: ndp_body }) = mac_b.poll(0, &mut out_b) else { panic!("no ack") };
+        let NdpFrame::Ack(a) = NdpFrame::parse(ndp_body) else { panic!() };
+        assert_eq!(a.ack_id, ndp::ack_id_for_mpdu(21, &f));
+        // No Ack policy → delivered but not acknowledged.
+        let f2 = frame::build_pv1_data(B, A, 4, 0, true, &body);
+        mac_b.on_phy_event(&psdu_event(&txv, &f2), 0, &mut out_b);
+        assert!(mac_b.poll(0, &mut out_b).is_none());
+        assert_eq!(out_b.iter().filter(|e| matches!(e, MacEvent::EthReceived(_))).count(), 2);
+    }
+
+    #[test]
+    fn eifs_after_format_violation() {
+        let mut cfg = MacConfig::new(A);
+        cfg.ack_enabled = false;
+        cfg.cw_min_exp = 0; // no random backoff: measure the IFS alone
+        cfg.cw_max_exp = 0;
+        let mut mac = Mac::new(cfg.clone());
+        let mut out = Vec::new();
+        // Normal case: DIFS.
+        mac.enqueue_eth(&eth_frame(BCAST, A, 20)).unwrap();
+        assert!(mac.poll(0, &mut out).is_none());
+        assert!(mac.poll(cfg.difs_us - 1, &mut out).is_none());
+        assert!(mac.poll(cfg.difs_us, &mut out).is_some());
+        // After a FormatViolation: EIFS = SIFS + NDPTxTime + DIFS.
+        let mut mac2 = Mac::new(cfg.clone());
+        mac2.on_phy_event(&RxEvent::RxEnd { sample_index: 0, status: RxEndStatus::FormatViolation }, 0, &mut out);
+        mac2.enqueue_eth(&eth_frame(BCAST, A, 20)).unwrap();
+        assert!(mac2.poll(0, &mut out).is_none());
+        assert!(mac2.poll(mac2.eifs_us() - 1, &mut out).is_none());
+        assert!(mac2.poll(mac2.eifs_us(), &mut out).is_some());
+        assert_eq!(mac2.eifs_us(), 160 + 240 + cfg.difs_us);
+        // An error-free frame in between resynchronises to DIFS.
+        let mut mac3 = Mac::new(cfg.clone());
+        mac3.on_phy_event(&RxEvent::RxEnd { sample_index: 0, status: RxEndStatus::FormatViolation }, 0, &mut out);
+        let good = frame::build_data(B, [2, 0, 0, 0, 0, 0xC], 1, false, 0, b"ok");
+        mac3.on_phy_event(&psdu_event(&TxVector::default(), &good), 0, &mut out);
+        mac3.enqueue_eth(&eth_frame(BCAST, A, 20)).unwrap();
+        assert!(mac3.poll(0, &mut out).is_none());
+        assert!(mac3.poll(cfg.difs_us, &mut out).is_some());
+    }
+
+    #[test]
+    fn rid_from_ndp_frames_per_table_10_2() {
+        let mut cfg = MacConfig::new(A);
+        cfg.ack_enabled = false;
+        let mut mac = Mac::new(cfg);
+        let mut out = Vec::new();
+        // NDP Ack with Idle Indication = 1 and Duration = 0 → Long Response.
+        let a = NdpFrame::Ack(NdpAck { ack_id: 1, more_data: false, idle_indication: true, duration: 0, relayed_frame: false });
+        mac.on_phy_event(&RxEvent::NdpReceived { sample_index: 0, body: a.to_body(), metrics: metrics() }, 1000, &mut out);
+        assert!(mac.medium_busy(1000 + 3008 + 160 - 1));
+        assert!(!mac.medium_busy(1000 + 3008 + 160 + 1));
+        // NDP CTS → No Response.
+        let mut mac2 = Mac::new({
+            let mut c = MacConfig::new(A);
+            c.ack_enabled = false;
+            c
+        });
+        let cts = NdpFrame::Cts(NdpCts { address_indicator: true, ra_pbssid: 5, duration_us: 0, early_sector_indicator: false, bandwidth: 1 });
+        mac2.on_phy_event(&RxEvent::NdpReceived { sample_index: 0, body: cts.to_body(), metrics: metrics() }, 1000, &mut out);
+        assert!(!mac2.medium_busy(1001));
+        // NDP PS-Poll (type 1) → NDP Response: 240 + 160.
+        let ps = NdpFrame::Other { ndp_type: ndp::TYPE_PS_POLL, body: ndp::TYPE_PS_POLL as u64 };
+        mac2.on_phy_event(&RxEvent::NdpReceived { sample_index: 0, body: ps.to_body(), metrics: metrics() }, 2000, &mut out);
+        assert!(mac2.medium_busy(2000 + 399));
+        assert!(!mac2.medium_busy(2000 + 401));
     }
 
     #[test]

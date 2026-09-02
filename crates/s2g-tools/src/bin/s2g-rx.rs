@@ -235,6 +235,9 @@ impl Printer {
                                 Ok(ParsedFrame::Rts { ra, ta, duration_us }) => {
                                     format!("RTS {} -> {} dur {duration_us}", mac_str(&ta), mac_str(&ra))
                                 }
+                                Ok(ParsedFrame::Pv1 { ptype, subtype, a1, a2, seq, .. }) => {
+                                    format!("PV1 type {ptype} sub {subtype} a1 {a1:?} a2 {a2:?} seq {seq:?}")
+                                }
                                 Ok(ParsedFrame::Other { fc, duration_us }) => {
                                     let addr1 = if m.len() >= 10 { mac_str(&m[4..10]) } else { "-".into() };
                                     let addr2 = if m.len() >= 16 { mac_str(&m[10..16]) } else { "-".into() };

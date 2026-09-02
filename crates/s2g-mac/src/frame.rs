@@ -66,13 +66,139 @@ pub fn build_rts(ra: MacAddr, ta: MacAddr, duration_us: u16) -> Vec<u8> {
     f
 }
 
+/// An address field of a PV1 frame: a full MAC address or a Short ID
+/// (AID plus header-presence flags) [9.8.3.2].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pv1Addr {
+    Mac(MacAddr),
+    Sid { aid: u16, a3_present: bool, a4_present: bool, amsdu: bool },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParsedFrame {
     Data { dest: MacAddr, src: MacAddr, bssid: MacAddr, seq: u16, retry: bool, duration_us: u16, body: Vec<u8> },
     Ack { ra: MacAddr },
     Rts { ra: MacAddr, ta: MacAddr, duration_us: u16 },
+    /// A PV1 (short MAC header) frame [9.8]: reception is mandatory for an
+    /// S1G STA. QoS Data (type 0/3) and Management (type 1) frames are
+    /// parsed fully; PV1 Control frames only to their subtype.
+    Pv1 {
+        ptype: u8,
+        subtype: u8,
+        from_ds: bool,
+        a1: Pv1Addr,
+        a2: Pv1Addr,
+        a3: Option<MacAddr>,
+        a4: Option<MacAddr>,
+        seq: Option<u16>,
+        /// Ack Policy Indicator: false = Normal Ack, true = No Ack / Block Ack.
+        no_ack: bool,
+        protected: bool,
+        body: Vec<u8>,
+    },
     /// Valid FCS but a type/subtype this MAC doesn't handle.
     Other { fc: [u8; 2], duration_us: u16 },
+}
+
+/// PV1 frame types [Table 9-669].
+pub const PV1_TYPE_QOS_DATA: u8 = 0;
+pub const PV1_TYPE_MANAGEMENT: u8 = 1;
+pub const PV1_TYPE_CONTROL: u8 = 2;
+/// PV1 QoS Data with both A1 and A2 as full MAC addresses.
+pub const PV1_TYPE_QOS_DATA_MAC: u8 = 3;
+
+/// Build a PV1 QoS Data frame with full MAC addresses (type 3) [9.8.2]:
+/// FC ‖ A1 ‖ A2 ‖ Sequence Control ‖ body ‖ FCS.
+pub fn build_pv1_data(dest: MacAddr, src: MacAddr, seq: u16, tid: u8, no_ack: bool, body: &[u8]) -> Vec<u8> {
+    let mut f = Vec::with_capacity(16 + body.len() + 4);
+    let fc0 = 1 | (PV1_TYPE_QOS_DATA_MAC << 2) | ((tid & 7) << 5);
+    let fc1 = if no_ack { 0x80 } else { 0x00 };
+    f.push(fc0);
+    f.push(fc1);
+    f.extend_from_slice(&dest);
+    f.extend_from_slice(&src);
+    f.extend_from_slice(&((seq & 0x0fff) << 4).to_le_bytes());
+    f.extend_from_slice(body);
+    fcs::append(&mut f);
+    f
+}
+
+fn parse_pv1(inner: &[u8]) -> Result<ParsedFrame, FrameError> {
+    let fc0 = inner[0];
+    let fc1 = inner[1];
+    let ptype = (fc0 >> 2) & 7;
+    let subtype = fc0 >> 5;
+    let from_ds = fc1 & 1 != 0;
+    let protected = fc1 & 0x10 != 0;
+    let no_ack = fc1 & 0x80 != 0;
+    let mut pos = 2;
+    let take_mac = |pos: &mut usize| -> Result<MacAddr, FrameError> {
+        if *pos + 6 > inner.len() {
+            return Err(FrameError::TooShort);
+        }
+        let a = addr(&inner[*pos..*pos + 6]);
+        *pos += 6;
+        Ok(a)
+    };
+    let take_sid = |pos: &mut usize| -> Result<Pv1Addr, FrameError> {
+        if *pos + 2 > inner.len() {
+            return Err(FrameError::TooShort);
+        }
+        let v = u16::from_le_bytes([inner[*pos], inner[*pos + 1]]);
+        *pos += 2;
+        Ok(Pv1Addr::Sid { aid: v & 0x1fff, a3_present: v & 0x2000 != 0, a4_present: v & 0x4000 != 0, amsdu: v & 0x8000 != 0 })
+    };
+    let (a1, a2) = match ptype {
+        PV1_TYPE_QOS_DATA_MAC => (Pv1Addr::Mac(take_mac(&mut pos)?), Pv1Addr::Mac(take_mac(&mut pos)?)),
+        PV1_TYPE_QOS_DATA | PV1_TYPE_MANAGEMENT => {
+            if from_ds {
+                let a1 = take_sid(&mut pos)?;
+                (a1, Pv1Addr::Mac(take_mac(&mut pos)?))
+            } else {
+                let a1 = Pv1Addr::Mac(take_mac(&mut pos)?);
+                (a1, take_sid(&mut pos)?)
+            }
+        }
+        // Control frames: A1 is a SID; A2 depends on the subtype [9.8.4].
+        // Parse A1 only and hand the rest over as the body.
+        _ => {
+            let a1 = take_sid(&mut pos)?;
+            return Ok(ParsedFrame::Pv1 {
+                ptype,
+                subtype,
+                from_ds,
+                a1,
+                a2: Pv1Addr::Sid { aid: 0, a3_present: false, a4_present: false, amsdu: false },
+                a3: None,
+                a4: None,
+                seq: None,
+                no_ack,
+                protected,
+                body: inner[pos..].to_vec(),
+            });
+        }
+    };
+    // Sequence Control: all Data frames and Management frames except the
+    // PV1 Probe Response (management subtype 2).
+    let seq = if ptype != PV1_TYPE_MANAGEMENT || subtype != 2 {
+        if pos + 2 > inner.len() {
+            return Err(FrameError::TooShort);
+        }
+        let sc = u16::from_le_bytes([inner[pos], inner[pos + 1]]);
+        pos += 2;
+        Some(sc >> 4)
+    } else {
+        None
+    };
+    let (a3p, a4p) = match (a1, a2) {
+        (Pv1Addr::Sid { a3_present, a4_present, .. }, _) | (_, Pv1Addr::Sid { a3_present, a4_present, .. }) => {
+            (a3_present, a4_present)
+        }
+        _ => (false, false),
+    };
+    let a3 = if a3p { Some(take_mac(&mut pos)?) } else { None };
+    let a4 = if a4p { Some(take_mac(&mut pos)?) } else { None };
+    Ok(ParsedFrame::Pv1 { ptype, subtype, from_ds, a1, a2, a3, a4, seq, no_ack, protected, body: inner[pos..].to_vec() })
 }
 
 /// Locate the MPDU inside a non-aggregated PSDU. Some S1G chips (seen on a
@@ -97,6 +223,9 @@ pub fn parse(mpdu: &[u8]) -> Result<ParsedFrame, FrameError> {
     }
     let fc0 = inner[0];
     let fc1 = inner[1];
+    if fc0 & 3 == 1 {
+        return parse_pv1(inner);
+    }
     let ftype = (fc0 >> 2) & 0x3;
     let subtype = fc0 >> 4;
     let duration_us = u16::from_le_bytes([inner[2], inner[3]]) & 0x7fff;
@@ -170,6 +299,54 @@ mod tests {
         let f = build_rts(B, A, 1234);
         assert_eq!(f.len(), RTS_LEN);
         assert_eq!(parse(&f).unwrap(), ParsedFrame::Rts { ra: B, ta: A, duration_us: 1234 });
+    }
+
+    #[test]
+    fn pv1_data_roundtrip() {
+        let f = build_pv1_data(B, A, 77, 3, false, b"pv1!");
+        match parse(&f).unwrap() {
+            ParsedFrame::Pv1 { ptype, subtype, a1, a2, seq, no_ack, body, a3, a4, .. } => {
+                assert_eq!(ptype, PV1_TYPE_QOS_DATA_MAC);
+                assert_eq!(subtype, 3); // TID
+                assert_eq!(a1, Pv1Addr::Mac(B));
+                assert_eq!(a2, Pv1Addr::Mac(A));
+                assert_eq!(seq, Some(77));
+                assert!(!no_ack);
+                assert_eq!(a3, None);
+                assert_eq!(a4, None);
+                assert_eq!(body, b"pv1!");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn pv1_sid_addressing_and_optional_addresses() {
+        // Type 0, From DS = 1: A1 = SID (AID 0x123, A3 present), A2 = MAC.
+        let mut f = vec![1 | (PV1_TYPE_QOS_DATA << 2), 0x01];
+        f.extend_from_slice(&(0x0123u16 | 0x2000).to_le_bytes());
+        f.extend_from_slice(&A);
+        f.extend_from_slice(&(5u16 << 4).to_le_bytes());
+        f.extend_from_slice(&B); // A3
+        f.extend_from_slice(b"xyz");
+        fcs::append(&mut f);
+        match parse(&f).unwrap() {
+            ParsedFrame::Pv1 { from_ds, a1, a2, a3, seq, body, .. } => {
+                assert!(from_ds);
+                assert_eq!(a1, Pv1Addr::Sid { aid: 0x123, a3_present: true, a4_present: false, amsdu: false });
+                assert_eq!(a2, Pv1Addr::Mac(A));
+                assert_eq!(a3, Some(B));
+                assert_eq!(seq, Some(5));
+                assert_eq!(body, b"xyz");
+            }
+            other => panic!("{other:?}"),
+        }
+        // A PV1 control frame (type 2) is recognised and not misread as PV0.
+        let mut c = vec![1 | (PV1_TYPE_CONTROL << 2), 0x00];
+        c.extend_from_slice(&0x0042u16.to_le_bytes());
+        c.extend_from_slice(&[0xaa; 6]);
+        fcs::append(&mut c);
+        assert!(matches!(parse(&c).unwrap(), ParsedFrame::Pv1 { ptype: PV1_TYPE_CONTROL, .. }));
     }
 
     #[test]
