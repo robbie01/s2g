@@ -92,6 +92,37 @@ pub fn aggregate(mpdu: &[u8], capacity: usize) -> Vec<u8> {
     out
 }
 
+/// Pre-EOF length of an A-MPDU carrying MPDUs of the given lengths: every
+/// subframe but the last is padded to a 4-octet boundary.
+pub fn pre_eof_len_many(lens: &[usize]) -> usize {
+    let n = lens.len();
+    lens.iter().enumerate().map(|(i, &l)| if i + 1 < n { pad4(DELIM_LEN + l) } else { DELIM_LEN + l }).sum()
+}
+
+/// Build a multi-MPDU A-MPDU (EOF = 0 on every MPDU delimiter, EOF
+/// padding to exactly `capacity` octets) [9.7.3]. For a single MPDU use
+/// [`aggregate`] (an S-MPDU).
+pub fn aggregate_many(mpdus: &[&[u8]], capacity: usize) -> Vec<u8> {
+    assert!(mpdus.len() >= 2, "use aggregate() for an S-MPDU");
+    let lens: Vec<usize> = mpdus.iter().map(|m| m.len()).collect();
+    assert!(lens.iter().all(|&l| l <= MAX_MPDU_LEN));
+    assert!(capacity >= pre_eof_len_many(&lens));
+    let mut out = Vec::with_capacity(capacity);
+    for m in mpdus {
+        out.resize(pad4(out.len()), 0);
+        out.extend_from_slice(&build_delimiter(m.len(), false));
+        out.extend_from_slice(m);
+    }
+    let aligned = pad4(out.len()).min(capacity);
+    out.resize(aligned, 0);
+    let eof = build_delimiter(0, true);
+    while out.len() + DELIM_LEN <= capacity {
+        out.extend_from_slice(&eof);
+    }
+    out.resize(capacity, 0);
+    out
+}
+
 /// Extract MPDUs from an A-MPDU (deaggregation per Annex O.2: scan 4-octet
 /// aligned positions, resync on delimiter errors). Each MPDU comes with its
 /// delimiter's EOF flag: a lone MPDU with EOF = 1 is an S-MPDU.
@@ -157,6 +188,24 @@ mod tests {
         two.extend_from_slice(&mpdu);
         assert!(!is_s_mpdu(&two));
         assert_eq!(deaggregate(&two).len(), 2);
+    }
+
+    #[test]
+    fn aggregate_many_roundtrip() {
+        let m1: Vec<u8> = (0..101u32).map(|i| i as u8).collect();
+        let m2 = vec![7u8; 30];
+        let m3 = vec![9u8; 1000];
+        let lens = [m1.len(), m2.len(), m3.len()];
+        assert_eq!(pre_eof_len_many(&lens), 108 + 36 + 1004);
+        let cap = pre_eof_len_many(&lens) + 23;
+        let a = aggregate_many(&[&m1, &m2, &m3], cap);
+        assert_eq!(a.len(), cap);
+        let got = deaggregate_with_eof(&a);
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[0], (m1, false));
+        assert_eq!(got[1], (m2, false));
+        assert_eq!(got[2], (m3, false));
+        assert!(!is_s_mpdu(&a));
     }
 
     #[test]

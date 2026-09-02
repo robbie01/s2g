@@ -7,7 +7,7 @@
 
 use anyhow::{bail, Result};
 use clap::Parser;
-use s2g_mac::{Mac, MacAction, MacConfig, MacEvent, RateConfig};
+use s2g_mac::{IdentConfig, Mac, MacAction, MacConfig, MacEvent, RateConfig};
 use s2g_phy::vector::Coding;
 use s2g_tools::nic::Nic;
 use s2g_tools::DEFAULT_CENTER_FREQ_HZ;
@@ -60,6 +60,19 @@ struct Args {
     /// Highest MCS rate control probes
     #[arg(long, default_value_t = 8)]
     max_mcs: u8,
+    /// Most Ethernet frames packed into one A-MPDU (1 = no aggregation)
+    #[arg(long, default_value_t = 8)]
+    ampdu: usize,
+    /// Amateur call sign: transmitted in the clear before the first frame, every
+    /// --id-interval-min while sending, and at the end of a communication
+    #[arg(long)]
+    callsign: Option<String>,
+    /// Free text appended to the identification (grid square, node name)
+    #[arg(long, default_value = "")]
+    id_info: String,
+    /// Minutes between identifications while transmitting
+    #[arg(long, default_value_t = 10)]
+    id_interval_min: u64,
 
     /// Pluto iiod address
     #[arg(long, default_value = "192.168.2.1")]
@@ -151,6 +164,17 @@ fn main() -> Result<()> {
         max_mcs: args.max_mcs,
         ..Default::default()
     };
+    cfg.ampdu_max_mpdus = args.ampdu;
+    cfg.ident = IdentConfig {
+        callsign: args.callsign.clone(),
+        info: args.id_info.clone(),
+        interval_us: args.id_interval_min.max(1) * 60_000_000,
+        ..Default::default()
+    };
+    match &args.callsign {
+        Some(c) => eprintln!("station identification: DE {} every {} min and at the end of each communication", c.to_ascii_uppercase(), args.id_interval_min.max(1)),
+        None => eprintln!("WARNING: no --callsign: no station identification will be transmitted (required under Part 97)"),
+    }
     let nic = make_nic(&args)?;
     eprintln!(
         "s2g-node: mac {} | mcs {} {:?}{} | rate control {} | ack {} ({}) | rts {:?} | nic {}",
@@ -318,6 +342,8 @@ fn run_radio(args: &Args, mut mac: Mac, nic: Box<dyn Nic>) -> Result<()> {
                         eprintln!("ndp: {frame:?}");
                     }
                 }
+                MacEvent::IdentSent { text } => eprintln!("id sent: {text}"),
+                MacEvent::IdentReceived { src, text } => eprintln!("id heard from {}: {text}", fmt_mac(&src)),
             }
         }
         let now_us = t0.elapsed().as_micros() as u64;

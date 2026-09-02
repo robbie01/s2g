@@ -27,6 +27,15 @@ pub fn to_body(ethertype: u16, payload: &[u8]) -> Vec<u8> {
     b
 }
 
+/// Split a received 802.11 Data body into its EtherType and payload, if it
+/// carries the RFC 1042 LLC/SNAP header.
+pub fn split_body(body: &[u8]) -> Option<(u16, &[u8])> {
+    if body.len() < 8 || body[..6] != LLC_SNAP {
+        return None;
+    }
+    Some((u16::from_be_bytes([body[6], body[7]]), &body[8..]))
+}
+
 /// Rebuild an Ethernet frame from a received 802.11 Data body.
 pub fn body_to_ethernet(dest: MacAddr, src: MacAddr, body: &[u8]) -> Option<Vec<u8>> {
     if body.len() < 8 || body[..6] != LLC_SNAP {

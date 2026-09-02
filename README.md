@@ -131,8 +131,10 @@ power) for any decode.
 
 `s2g-mac` implements a nonstandard-where-it-matters OCB (non-BSS) MAC: 802.11 Data
 frames with the wildcard BSSID, FCS, sequence numbers + dedup, RFC 1042 LLC/SNAP for
-Ethernet payloads, S-MPDU aggregation for frames over 511 octets, PV1 (short header)
-frame reception, CSMA with DIFS/EIFS + exponential backoff gated by PHY CCA, NAV and
+Ethernet payloads, **A-MPDU packing** (queued frames for one peer travel as QoS Data
+MPDUs in one PPDU, up to `--ampdu` of them, acknowledged by one NDP BlockAck whose
+bitmap retransmits only what was lost), S-MPDU aggregation for lone frames over 511
+octets, PV1 (short header) frame reception, CSMA with DIFS/EIFS + exponential backoff gated by PHY CCA, NAV and
 **RID** (response indication deferral), and acknowledgement via **NDP Ack** CMAC PPDUs
 (Ack ID from the scrambler seed + FCS exactly as 23.3.12 specifies; NDP BlockAck for
 received multi-MPDU A-MPDUs; legacy Ack frames selectable).
@@ -152,6 +154,24 @@ retries, and caps probing with the SNR the PHY measures on whatever it hears fro
 peer (frames, NDP Acks, NDP CTS). Broadcasts stay at `--mcs`. 802.11 leaves rate
 adaptation to the implementation, so nothing here is spec-constrained; it is tuned for a
 link where a lost frame costs a long timeout rather than a SIFS.
+
+### Amateur-radio operation: identification and no encryption
+
+With `--callsign` set, the MAC transmits a station identification frame in the clear
+before the first data frame, at least every `--id-interval-min` (default 10) minutes while
+traffic flows, and once more 30 s after the last data frame, which is how 47 CFR 97.119
+reads for a packet link. The frame is a broadcast 802.11 Data frame at MCS 0 whose
+LLC/SNAP EtherType is 0x88B5 (IEEE 802a local experimental 1) and whose payload is plain
+ASCII, `DE <CALLSIGN> [free text]` (`--id-info` supplies the text, e.g. a grid square).
+Any monitor-mode capture shows the call sign in the packet bytes without a dissector.
+Heard identifications are reported as `id heard from …` and never forwarded to the TAP.
+Without `--callsign` the node prints a warning and identifies nothing, which is only
+appropriate for unlicensed-band testing.
+
+s2g never encrypts or scrambles the meaning of a frame (the PHY scrambler is a
+standard, self-synchronising whitening sequence, not encryption). Under Part 97 the
+upper layers you run over the link must not either; that is the operator's call, not
+something the software can enforce.
 
 ### A-MPDUs, S-MPDUs and the partial AID (background for non-RF readers)
 
@@ -212,8 +232,9 @@ to compile). Two nodes need distinct `--mac` addresses (default is randomized).
       mask, DC leakage
 - [x] NDP CMAC PPDU TX/RX; NDP CTS / Ack / BlockAck frame bodies (bitmap protection)
 - [x] PlutoSDR TX/RX backend (pure-Rust iiod client) at arbitrary carrier
-- [x] OCB MAC: data/RTS/ACK frames, S-MPDU, PV1 reception, CSMA with PHY CCA + NAV + RID +
-      EIFS, NDP responses, retries, dedup, per-peer adaptive MCS (probing + SNR-bounded)
+- [x] OCB MAC: data/RTS/ACK frames, A-MPDU packing with NDP BlockAck selective retry,
+      S-MPDU, PV1 reception, CSMA with PHY CCA + NAV + RID + EIFS, NDP responses, retries,
+      dedup, per-peer adaptive MCS (probing + SNR-bounded), amateur station identification
 - [x] `s2g-node`: TAP (Unix) / UDP (Windows) network interface over the radio
 - [ ] Windows L2 TAP backend (tap-windows6); hardware-timestamped SIFS/ACK timing
 - [x] S1G_LONG SU Data-field reception and short-GI reception (both optional for a ≤ 2 MHz

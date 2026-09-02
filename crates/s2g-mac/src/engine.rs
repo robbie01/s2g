@@ -18,18 +18,28 @@
 //!   CW doubles per retry between cw_min and cw_max; the backoff is redrawn
 //!   (not frozen) if the medium turns busy — a documented simplification.
 //!
-//! Acknowledgement: unicast data solicits an **NDP Ack** (or an **NDP
-//! BlockAck** when the PSDU is an A-MPDU), signalled with
-//! RESPONSE_INDICATION = NDP Response [10.3.2.17, Table 10-7]; the Ack ID /
-//! BlockAck ID are derived from the scrambler seed the MAC chose for the
-//! PPDU [23.3.12.2.4/6]. Legacy Ack frames (Normal Response) remain
-//! available for interop testing. Frames above `rts_threshold` are
-//! protected by RTS → **NDP CTS** [10.3.2.9]. Response frames go out at the
-//! next poll (our stand-in for SIFS timing; buffered SDR streaming makes
-//! real SIFS turnaround impossible without hardware timestamping, which is
-//! also why the ACK timeout defaults to 150 ms).
+//! Transmission: queued Ethernet frames for the same destination are
+//! packed into one PPDU — an **A-MPDU** of QoS Data MPDUs (up to
+//! `ampdu_max_mpdus`, at most the 16 bits of an NDP BlockAck bitmap),
+//! acknowledged with an **NDP BlockAck** whose bitmap drives selective
+//! retransmission; a lone frame goes as a plain MPDU or an **S-MPDU** and
+//! solicits an **NDP Ack** (or a legacy Ack) [10.3.2.17, Table 10-7]. The
+//! Ack ID / BlockAck ID derive from the scrambler seed the MAC chose for
+//! the PPDU [23.3.12.2.4/6]. Frames above `rts_threshold` are protected by
+//! RTS → **NDP CTS** [10.3.2.9]. Response frames go out at the next poll
+//! (our stand-in for SIFS timing; buffered SDR streaming makes real SIFS
+//! turnaround impossible without hardware timestamping, which is also why
+//! the ACK timeout defaults to 150 ms). A-MPDUs are sent without a block
+//! ack agreement — there is no ADDBA in OCB — which s2g peers accept and a
+//! standard STA would not.
+//!
+//! Station identification for amateur use is built in: with a call sign
+//! configured, a broadcast identification frame [`crate::ident`] precedes
+//! the first data frame, repeats every `interval_us` while transmitting,
+//! and closes a communication after `end_idle_us` of silence.
 
 use crate::frame::{self, MacAddr, ParsedFrame, Pv1Addr};
+use crate::ident::{self, IdentConfig};
 use crate::ndp::{self, NdpAck, NdpBlockAck, NdpCts, NdpFrame};
 use crate::rate::{RateConfig, RateControl};
 use crate::{ampdu, eth};
@@ -51,10 +61,14 @@ pub enum MacError {
     Phy(#[from] s2g_phy::PhyError),
 }
 
+/// Most MPDUs one NDP BlockAck bitmap can acknowledge [Figure 23-33].
+pub const AMPDU_MAX_MPDUS: usize = 16;
+
 #[derive(Debug, Clone)]
 pub struct MacConfig {
     pub addr: MacAddr,
-    /// MCS for data frames (control responses always go at MCS 0).
+    /// MCS for broadcast data frames, and for unicast when rate control is
+    /// off (control responses and identification frames always go at MCS 0).
     pub mcs: u8,
     /// FEC for data frames (BCC or LDPC).
     pub fec_coding: Coding,
@@ -64,7 +78,7 @@ pub struct MacConfig {
     pub ack_enabled: bool,
     /// Solicit NDP Ack / NDP BlockAck (true) or legacy Ack frames (false).
     pub ndp_ack: bool,
-    /// Protect unicast MPDUs longer than this with RTS / NDP CTS.
+    /// Protect unicast PSDUs longer than this with RTS / NDP CTS.
     pub rts_threshold: Option<usize>,
     /// Response wait beyond the eliciting PPDU airtime, µs.
     pub ack_timeout_us: u64,
@@ -82,6 +96,11 @@ pub struct MacConfig {
     /// Per-peer adaptive MCS selection for unicast data; when enabled
     /// `mcs` is only the broadcast rate.
     pub rate: RateConfig,
+    /// Most MPDUs packed into one A-MPDU (1 = never aggregate frames; the
+    /// cap is [`AMPDU_MAX_MPDUS`]). Needs NDP acknowledgements.
+    pub ampdu_max_mpdus: usize,
+    /// Amateur-radio station identification.
+    pub ident: IdentConfig,
 }
 
 impl MacConfig {
@@ -103,6 +122,8 @@ impl MacConfig {
             long_tx_time_us: 3008,
             queue_limit: 64,
             rate: RateConfig::default(),
+            ampdu_max_mpdus: 8,
+            ident: IdentConfig::default(),
         }
     }
 
@@ -121,6 +142,10 @@ pub enum MacEvent {
     TxDropped { dest: MacAddr, reason: &'static str },
     /// An NDP CMAC PPDU arrived.
     NdpReceived { frame: NdpFrame },
+    /// A station identification frame went out.
+    IdentSent { text: String },
+    /// A station identification frame was heard.
+    IdentReceived { src: MacAddr, text: String },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -131,12 +156,12 @@ pub enum MacAction {
     TransmitNdp { body: u64 },
 }
 
-/// What we are waiting for after a transmission. (We never send
-/// multi-MPDU A-MPDUs, so an NDP BlockAck is never expected.)
+/// What we are waiting for after a transmission.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Expect {
     Ack,
     NdpAck { ack_id: u16 },
+    NdpBlockAck { block_ack_id: u8 },
     NdpCts { partial_aid: u16 },
 }
 
@@ -147,21 +172,45 @@ enum TxState {
     AwaitResponse { deadline_us: u64, expect: Expect },
 }
 
+/// One MSDU awaiting delivery.
+struct PendingMpdu {
+    seq: u16,
+    body: Vec<u8>,
+    retries: u32,
+}
+
+/// The batch of MPDUs for one destination being worked on.
 struct CurrentTx {
     dest: MacAddr,
     src: MacAddr,
-    body: Vec<u8>,
-    seq: u16,
-    retries: u32,
+    /// Outstanding (not yet acknowledged or dropped) MPDUs, in sequence order.
+    mpdus: Vec<PendingMpdu>,
+    /// Indices into `mpdus` of the attempt on the air.
+    in_flight: Vec<usize>,
+    /// Failed attempts so far (drives CW doubling and rate step-down).
+    attempts: u32,
     /// RTS/CTS handshake completed for this attempt.
     cts_ok: bool,
     /// MCS of the attempt in flight (rate-control bookkeeping).
     mcs: u8,
+    /// The batch started with several MPDUs: they travel as QoS Data.
+    qos: bool,
+    /// A station identification frame (broadcast, MCS 0, never acked).
+    ident: bool,
 }
 
 enum Response {
     Ndp(u64),
     Frame(Vec<u8>),
+}
+
+/// An attempt planned for the current batch.
+struct Attempt {
+    in_flight: Vec<usize>,
+    psdu: Vec<u8>,
+    aggregated: bool,
+    /// The single MPDU when the attempt carries one (for the Ack ID).
+    single: Option<Vec<u8>>,
 }
 
 pub struct Mac {
@@ -186,6 +235,11 @@ pub struct Mac {
     dedup: HashMap<MacAddr, VecDeque<u16>>,
     rng: u64,
     rate: RateControl,
+    // ---- station identification ----
+    last_ident_us: Option<u64>,
+    /// Data went out since the last identification.
+    sent_since_ident: bool,
+    last_data_tx_us: u64,
 }
 
 fn is_group(addr: &MacAddr) -> bool {
@@ -219,6 +273,9 @@ impl Mac {
             dedup: HashMap::new(),
             rng,
             rate,
+            last_ident_us: None,
+            sent_since_ident: false,
+            last_data_tx_us: 0,
         }
     }
 
@@ -247,6 +304,12 @@ impl Mac {
         &self.rate
     }
 
+    /// Frames waiting in the transmit queue (not counting the batch in
+    /// progress).
+    pub fn queued(&self) -> usize {
+        self.queue.len()
+    }
+
     fn rand_u32(&mut self) -> u32 {
         let mut x = self.rng;
         x ^= x << 13;
@@ -260,18 +323,25 @@ impl Mac {
         (self.rand_u32() % 127) as u8 + 1
     }
 
+    fn next_seq(&mut self) -> u16 {
+        let s = self.seq;
+        self.seq = (self.seq + 1) & 0x0fff;
+        s
+    }
+
     /// Queue an outgoing Ethernet frame (from the TAP).
     pub fn enqueue_eth(&mut self, eth_frame: &[u8]) -> Result<(), MacError> {
         let (dest, src, ethertype, payload) = eth::parse_ethernet(eth_frame).ok_or(MacError::BadEthernet)?;
         if self.queue.len() >= self.cfg.queue_limit {
             return Err(MacError::QueueFull);
         }
-        // Pre-flight size check at the configured MCS.
+        // Pre-flight size check at the lowest rate the frame may go out at.
         let body = eth::to_body(ethertype, payload);
-        let mpdu_len = frame::DATA_HDR_LEN + body.len() + 4;
+        let mpdu_len = frame::QOS_DATA_HDR_LEN + body.len() + 4;
+        let floor_mcs = if self.cfg.rate.enabled { self.cfg.rate.min_mcs.min(self.cfg.mcs) } else { self.cfg.mcs };
         if mpdu_len > 511 {
             let pre = ampdu::pre_eof_len(mpdu_len);
-            if mpdu_len > ampdu::MAX_MPDU_LEN || s2g_phy::tx::aggregated_capacity(self.cfg.mcs, pre, self.cfg.fec_coding).is_err() {
+            if mpdu_len > ampdu::MAX_MPDU_LEN || s2g_phy::tx::aggregated_capacity(floor_mcs, pre, self.cfg.fec_coding).is_err() {
                 return Err(MacError::FrameTooBig);
             }
         }
@@ -285,7 +355,7 @@ impl Mac {
             return true;
         }
         seqs.push_back(seq);
-        if seqs.len() > 16 {
+        if seqs.len() > 64 {
             seqs.pop_front();
         }
         false
@@ -351,10 +421,19 @@ impl Mac {
                     (vec![frame::locate_mpdu(psdu).unwrap_or(psdu).to_vec()], false)
                 };
                 // An S-MPDU follows non-aggregated rules [10.12.8]: it is
-                // acknowledged with an (NDP) Ack, not a BlockAck.
+                // acknowledged with an (NDP) Ack, not a BlockAck. A genuine
+                // A-MPDU gets one NDP BlockAck covering every MPDU we got.
                 let block_ack = rxvector.aggregation && !s_mpdu;
+                let mut ba_src = None;
+                let mut ba_seqs = Vec::new();
                 for mpdu in mpdus {
-                    self.on_mpdu(&mpdu, rxvector, block_ack, now_us, out);
+                    if let Some((src, seq)) = self.on_mpdu(&mpdu, rxvector, block_ack, now_us, out) {
+                        ba_src = Some(src);
+                        ba_seqs.push(seq);
+                    }
+                }
+                if let Some(src) = ba_src {
+                    self.queue_block_ack(rxvector, src, &ba_seqs);
                 }
             }
         }
@@ -384,24 +463,40 @@ impl Mac {
         }
         match f {
             NdpFrame::Ack(a) => {
-                if let TxState::AwaitResponse { expect: Expect::NdpAck { ack_id }, .. } = &self.state {
-                    if *ack_id == a.ack_id {
-                        if let Some(c) = &self.cur {
-                            self.rate.observe_snr(&c.dest, snr_db);
-                        }
-                        self.complete_current(true, out);
+                let expected = matches!(&self.state, TxState::AwaitResponse { expect: Expect::NdpAck { ack_id }, .. } if *ack_id == a.ack_id);
+                if expected {
+                    if let Some(c) = &self.cur {
+                        self.rate.observe_snr(&c.dest, snr_db);
                     }
+                    self.resolve_attempt(|_| true, now_us, out);
                 }
                 if !a.idle_indication && a.duration > 0 {
                     self.nav_until_us = self.nav_until_us.max(now_us + a.duration as u64);
                 }
             }
-            NdpFrame::BlockAck(_) => {}
+            NdpFrame::BlockAck(ba) => {
+                let expected = matches!(&self.state, TxState::AwaitResponse { expect: Expect::NdpBlockAck { block_ack_id }, .. } if *block_ack_id == ba.block_ack_id);
+                if expected {
+                    if let Some(c) = &self.cur {
+                        self.rate.observe_snr(&c.dest, snr_db);
+                    }
+                    let ssn = ba.starting_sequence;
+                    let bitmap = ba.bitmap;
+                    self.resolve_attempt(
+                        move |seq| {
+                            let d = (seq.wrapping_sub(ssn)) & 0x0fff;
+                            d < 16 && bitmap & (1 << d) != 0
+                        },
+                        now_us,
+                        out,
+                    );
+                }
+            }
             NdpFrame::Cts(c) => {
                 let for_us = !c.address_indicator && c.ra_pbssid == self.cfg.partial_aid();
                 if for_us {
-                    if let Some(c) = &self.cur {
-                        self.rate.observe_snr(&c.dest, snr_db);
+                    if let Some(cur) = &self.cur {
+                        self.rate.observe_snr(&cur.dest, snr_db);
                     }
                     if let TxState::AwaitResponse { expect: Expect::NdpCts { .. }, .. } = &self.state {
                         if let Some(cur) = self.cur.as_mut() {
@@ -417,18 +512,63 @@ impl Mac {
         }
     }
 
-    fn complete_current(&mut self, acked: bool, out: &mut Vec<MacEvent>) {
-        if let Some(cur) = self.cur.take() {
-            if acked {
-                self.rate.report(&cur.dest, cur.mcs, true);
+    /// The response (or timeout) for the attempt on the air has arrived:
+    /// `acked(seq)` says which in-flight MPDUs were acknowledged. Completes
+    /// those, retries or drops the rest, and reports to rate control.
+    fn resolve_attempt(&mut self, acked: impl Fn(u16) -> bool, now_us: u64, out: &mut Vec<MacEvent>) {
+        let max_retries = self.cfg.max_retries;
+        let Some(cur) = self.cur.as_mut() else { return };
+        let (dest, mcs) = (cur.dest, cur.mcs);
+        let in_flight = std::mem::take(&mut cur.in_flight);
+        let mut n_acked = 0usize;
+        let mut kept = Vec::with_capacity(cur.mpdus.len());
+        for (i, mut m) in cur.mpdus.drain(..).enumerate() {
+            let flown = in_flight.contains(&i);
+            if flown && acked(m.seq) {
+                n_acked += 1;
+                out.push(MacEvent::TxComplete { dest, acked: true, retries: m.retries, mcs });
+                continue;
             }
-            out.push(MacEvent::TxComplete { dest: cur.dest, acked, retries: cur.retries, mcs: cur.mcs });
+            if flown {
+                // Only MPDUs that were on the air and went unacknowledged
+                // burn a retry.
+                m.retries += 1;
+                if m.retries > max_retries {
+                    out.push(MacEvent::TxDropped { dest, reason: "retry limit" });
+                    continue;
+                }
+            }
+            kept.push(m);
         }
-        self.state = TxState::Idle;
-        self.cw_exp = self.cfg.cw_min_exp;
+        cur.mpdus = kept;
+        let failed = n_acked < in_flight.len();
+        // A batch whose MPDUs mostly got through counts as a success for
+        // the rate in use; losing most of them counts against it.
+        let success = n_acked * 2 >= in_flight.len().max(1);
+        self.rate.report(&dest, mcs, success);
+        let all_done = self.cur.as_ref().is_some_and(|c| c.mpdus.is_empty());
+        if all_done {
+            self.cur = None;
+            self.state = TxState::Idle;
+            self.cw_exp = self.cfg.cw_min_exp;
+            return;
+        }
+        let cur = self.cur.as_mut().expect("batch continues");
+        cur.cts_ok = false;
+        if failed {
+            cur.attempts += 1;
+            self.cw_exp = (self.cw_exp + 1).min(self.cfg.cw_max_exp);
+        } else {
+            // Everything on the air was acknowledged; the rest of the
+            // batch did not fit and starts a fresh access.
+            self.cw_exp = self.cfg.cw_min_exp;
+        }
+        self.start_backoff(now_us);
     }
 
-    fn on_mpdu(&mut self, mpdu: &[u8], rxv: &RxVector, block_ack: bool, now_us: u64, out: &mut Vec<MacEvent>) {
+    /// Handle one received MPDU. Returns `Some((src, seq))` for a data
+    /// MPDU addressed to us inside an A-MPDU that a BlockAck must cover.
+    fn on_mpdu(&mut self, mpdu: &[u8], rxv: &RxVector, block_ack: bool, now_us: u64, out: &mut Vec<MacEvent>) -> Option<(MacAddr, u16)> {
         let parsed = frame::parse(mpdu);
         if parsed.is_ok() {
             // An error-free frame resynchronises us: back to DIFS [10.3.7].
@@ -436,21 +576,19 @@ impl Mac {
         }
         match parsed {
             Ok(ParsedFrame::Data { dest, src, seq, duration_us, body, .. }) => {
-                self.on_data(dest, src, seq, duration_us, false, &body, rxv, block_ack, mpdu, now_us, out);
+                return self.on_data(dest, src, seq, duration_us, false, &body, rxv, block_ack, mpdu, now_us, out);
             }
             Ok(ParsedFrame::Pv1 { ptype, a1, a2, seq, no_ack, body, .. }) => {
                 // PV1 QoS Data with full MAC addresses is deliverable; frames
                 // that identify a station by AID cannot be resolved without an
                 // association and are dropped (received, counted as valid).
                 if let (frame::PV1_TYPE_QOS_DATA_MAC, Pv1Addr::Mac(dest), Pv1Addr::Mac(src), Some(seq)) = (ptype, a1, a2, seq) {
-                    self.on_data(dest, src, seq, 0, no_ack, &body, rxv, block_ack, mpdu, now_us, out);
+                    return self.on_data(dest, src, seq, 0, no_ack, &body, rxv, block_ack, mpdu, now_us, out);
                 }
             }
             Ok(ParsedFrame::Ack { ra }) => {
-                if ra == self.cfg.addr {
-                    if let TxState::AwaitResponse { expect: Expect::Ack, .. } = &self.state {
-                        self.complete_current(true, out);
-                    }
+                if ra == self.cfg.addr && matches!(&self.state, TxState::AwaitResponse { expect: Expect::Ack, .. }) {
+                    self.resolve_attempt(|_| true, now_us, out);
                 }
             }
             Ok(ParsedFrame::Rts { ra, ta, duration_us }) => {
@@ -478,9 +616,10 @@ impl Mac {
             }
             Err(_) => {}
         }
+        None
     }
 
-    /// Common handling of a data MPDU (PV0 Data or PV1 QoS Data).
+    /// Common handling of a data MPDU (PV0 Data / QoS Data or PV1 QoS Data).
     #[allow(clippy::too_many_arguments)]
     fn on_data(
         &mut self,
@@ -495,9 +634,9 @@ impl Mac {
         mpdu: &[u8],
         now_us: u64,
         out: &mut Vec<MacEvent>,
-    ) {
+    ) -> Option<(MacAddr, u16)> {
         if src == self.cfg.addr {
-            return; // our own transmission looping back
+            return None; // our own transmission looping back
         }
         self.rate.observe_snr(&src, rxv.snr_db);
         let for_us = dest == self.cfg.addr;
@@ -505,48 +644,75 @@ impl Mac {
             if duration_us > 0 {
                 self.nav_until_us = self.nav_until_us.max(now_us + duration_us as u64);
             }
-            return; // someone else's unicast
+            return None; // someone else's unicast
         }
+        let mut needs_block_ack = None;
         if for_us {
             // Addressed to us: we are the responder, so the RID does not
             // apply to us [10.3.2.5.1].
             self.rid_until_us = 0;
             if self.cfg.ack_enabled && !no_ack {
-                // ACK even duplicates — the peer may have missed our ACK.
-                self.queue_ack(rxv, seq, mpdu, src, block_ack);
+                if block_ack {
+                    needs_block_ack = Some((src, seq));
+                } else {
+                    // ACK even duplicates — the peer may have missed our ACK.
+                    self.queue_ack(rxv, mpdu, src);
+                }
             }
         }
         if self.note_duplicate(src, seq) {
-            return;
+            return needs_block_ack;
         }
-        if let Some(ethf) = eth::body_to_ethernet(dest, src, body) {
+        if let Some(text) = ident::parse_body(body) {
+            out.push(MacEvent::IdentReceived { src, text });
+        } else if let Some(ethf) = eth::body_to_ethernet(dest, src, body) {
             out.push(MacEvent::EthReceived(ethf));
+        }
+        needs_block_ack
+    }
+
+    /// Queue the acknowledgement a single MPDU / S-MPDU asked for
+    /// [Table 10-7, 10.12.8].
+    fn queue_ack(&mut self, rxv: &RxVector, mpdu: &[u8], src: MacAddr) {
+        match rxv.response_indication {
+            ResponseIndication::Ndp => {
+                let f = NdpFrame::Ack(NdpAck {
+                    ack_id: ndp::ack_id_for_mpdu(rxv.scrambler_seed, mpdu),
+                    more_data: false,
+                    idle_indication: false,
+                    duration: 0,
+                    relayed_frame: false,
+                });
+                self.responses.push_back(Response::Ndp(f.to_body()));
+            }
+            ResponseIndication::Normal => self.responses.push_back(Response::Frame(frame::build_ack(src))),
+            ResponseIndication::None | ResponseIndication::Long => {}
         }
     }
 
-    /// Queue the acknowledgement the eliciting PPDU asked for [Table 10-7]:
-    /// an NDP BlockAck only for a genuine (multi-MPDU) A-MPDU, an NDP Ack
-    /// for single MPDUs and S-MPDUs [10.12.8].
-    fn queue_ack(&mut self, rxv: &RxVector, seq: u16, mpdu: &[u8], src: MacAddr, block_ack: bool) {
+    /// Queue the NDP BlockAck for a received A-MPDU: bit i of the bitmap
+    /// acknowledges sequence number `ssn + i`, with `ssn` the first MPDU we
+    /// received [23.3.12.2.6.2].
+    fn queue_block_ack(&mut self, rxv: &RxVector, src: MacAddr, seqs: &[u16]) {
+        if seqs.is_empty() {
+            return;
+        }
         match rxv.response_indication {
             ResponseIndication::Ndp => {
-                let f = if block_ack {
-                    NdpFrame::BlockAck(NdpBlockAck {
-                        block_ack_id: ndp::block_ack_id(rxv.scrambler_seed),
-                        starting_sequence: seq,
-                        bitmap: 1,
-                    })
-                } else {
-                    NdpFrame::Ack(NdpAck {
-                        ack_id: ndp::ack_id_for_mpdu(rxv.scrambler_seed, mpdu),
-                        more_data: false,
-                        idle_indication: false,
-                        duration: 0,
-                        relayed_frame: false,
-                    })
-                };
+                let ssn = seqs[0];
+                let mut bitmap = 0u16;
+                for &s in seqs {
+                    let d = s.wrapping_sub(ssn) & 0x0fff;
+                    if d < 16 {
+                        bitmap |= 1 << d;
+                    }
+                }
+                let f = NdpFrame::BlockAck(NdpBlockAck { block_ack_id: ndp::block_ack_id(rxv.scrambler_seed), starting_sequence: ssn, bitmap });
                 self.responses.push_back(Response::Ndp(f.to_body()));
             }
+            // A legacy BlockAck frame is not implemented; a Normal Response
+            // A-MPDU gets a plain Ack for its first MPDU, which is at least
+            // something a legacy sender can act on.
             ResponseIndication::Normal => self.responses.push_back(Response::Frame(frame::build_ack(src))),
             ResponseIndication::None | ResponseIndication::Long => {}
         }
@@ -562,35 +728,102 @@ impl Mac {
         self.state = TxState::Backoff { until_us: base + slots * self.cfg.slot_us };
     }
 
-    fn make_psdu(&self, mpdu: Vec<u8>, mcs: u8) -> Result<(Vec<u8>, bool), MacError> {
-        if mpdu.len() <= 511 {
-            return Ok((mpdu, false));
+    /// Serialize one MPDU of the current batch.
+    fn build_mpdu(cur: &CurrentTx, i: usize, duration_us: u16) -> Vec<u8> {
+        let m = &cur.mpdus[i];
+        if cur.qos {
+            frame::build_qos_data(cur.dest, cur.src, m.seq, m.retries > 0, duration_us, 0, &m.body)
+        } else {
+            frame::build_data(cur.dest, cur.src, m.seq, m.retries > 0, duration_us, &m.body)
         }
-        let pre = ampdu::pre_eof_len(mpdu.len());
-        let cap = s2g_phy::tx::aggregated_capacity(mcs, pre, self.cfg.fec_coding)?;
-        Ok((ampdu::aggregate(&mpdu, cap), true))
+    }
+
+    /// Choose which outstanding MPDUs go into the next attempt at `mcs`
+    /// and build the PSDU: a plain MPDU, an S-MPDU, or an A-MPDU of as many
+    /// MPDUs as the PPDU can carry.
+    fn plan_attempt(&self, cur: &CurrentTx, mcs: u8, duration_us: u16) -> Result<Attempt, MacError> {
+        let coding = self.cfg.fec_coding;
+        let mut chosen: Vec<usize> = Vec::new();
+        let mut built: Vec<Vec<u8>> = Vec::new();
+        for i in 0..cur.mpdus.len().min(AMPDU_MAX_MPDUS) {
+            let m = Self::build_mpdu(cur, i, duration_us);
+            let mut lens: Vec<usize> = built.iter().map(|b| b.len()).collect();
+            lens.push(m.len());
+            let fits = if lens.len() == 1 {
+                m.len() <= 511 || s2g_phy::tx::aggregated_capacity(mcs, ampdu::pre_eof_len(m.len()), coding).is_ok()
+            } else {
+                s2g_phy::tx::aggregated_capacity(mcs, ampdu::pre_eof_len_many(&lens), coding).is_ok()
+            };
+            if !fits {
+                break;
+            }
+            chosen.push(i);
+            built.push(m);
+        }
+        if built.is_empty() {
+            return Err(MacError::FrameTooBig);
+        }
+        if built.len() == 1 {
+            let m = built.pop().unwrap();
+            if m.len() <= 511 {
+                return Ok(Attempt { in_flight: chosen, psdu: m.clone(), aggregated: false, single: Some(m) });
+            }
+            let cap = s2g_phy::tx::aggregated_capacity(mcs, ampdu::pre_eof_len(m.len()), coding)?;
+            return Ok(Attempt { in_flight: chosen, psdu: ampdu::aggregate(&m, cap), aggregated: true, single: Some(m) });
+        }
+        let lens: Vec<usize> = built.iter().map(|b| b.len()).collect();
+        let cap = s2g_phy::tx::aggregated_capacity(mcs, ampdu::pre_eof_len_many(&lens), coding)?;
+        let refs: Vec<&[u8]> = built.iter().map(|b| b.as_slice()).collect();
+        Ok(Attempt { in_flight: chosen, psdu: ampdu::aggregate_many(&refs, cap), aggregated: true, single: None })
     }
 
     fn fail_attempt(&mut self, now_us: u64, out: &mut Vec<MacEvent>) {
-        // Only an unanswered data attempt counts against its MCS (an
-        // unanswered RTS went out at MCS 0).
-        if matches!(self.state, TxState::AwaitResponse { expect: Expect::Ack | Expect::NdpAck { .. }, .. }) {
-            if let Some(c) = &self.cur {
-                self.rate.report(&c.dest, c.mcs, false);
+        let waiting_for_cts = matches!(self.state, TxState::AwaitResponse { expect: Expect::NdpCts { .. }, .. });
+        if waiting_for_cts {
+            // An unanswered RTS went out at MCS 0: it says nothing about the
+            // data rate, but it does burn a retry so a dead peer is given up.
+            let Some(cur) = self.cur.as_mut() else { return };
+            let dest = cur.dest;
+            let mut still = Vec::new();
+            for mut m in cur.mpdus.drain(..) {
+                m.retries += 1;
+                if m.retries > self.cfg.max_retries {
+                    out.push(MacEvent::TxDropped { dest, reason: "retry limit" });
+                } else {
+                    still.push(m);
+                }
             }
+            cur.mpdus = still;
+            cur.in_flight.clear();
+            cur.cts_ok = false;
+            if cur.mpdus.is_empty() {
+                self.cur = None;
+                self.state = TxState::Idle;
+                self.cw_exp = self.cfg.cw_min_exp;
+            } else {
+                cur.attempts += 1;
+                self.cw_exp = (self.cw_exp + 1).min(self.cfg.cw_max_exp);
+                self.start_backoff(now_us);
+            }
+            return;
         }
-        let cur = self.cur.as_mut().expect("attempt implies cur");
-        cur.retries += 1;
-        cur.cts_ok = false;
-        if cur.retries > self.cfg.max_retries {
-            let cur = self.cur.take().unwrap();
-            out.push(MacEvent::TxDropped { dest: cur.dest, reason: "retry limit" });
-            self.state = TxState::Idle;
-            self.cw_exp = self.cfg.cw_min_exp;
-        } else {
-            self.cw_exp = (self.cw_exp + 1).min(self.cfg.cw_max_exp);
-            self.start_backoff(now_us);
+        self.resolve_attempt(|_| false, now_us, out);
+    }
+
+    /// Identification is due when a communication starts or resumes after
+    /// `interval_us`, or when one ends (`end_idle_us` of silence after data
+    /// went out).
+    fn ident_due(&self, now_us: u64) -> bool {
+        if self.cfg.ident.callsign.is_none() {
+            return false;
         }
+        let since_ident = self.last_ident_us.map(|t| now_us.saturating_sub(t));
+        let start_due = !self.queue.is_empty() && since_ident.is_none_or(|d| d >= self.cfg.ident.interval_us);
+        let end_due = self.queue.is_empty()
+            && self.sent_since_ident
+            && now_us.saturating_sub(self.last_data_tx_us) >= self.cfg.ident.end_idle_us
+            && since_ident.is_none_or(|d| d >= 60_000_000);
+        start_due || end_due
     }
 
     /// Advance the state machine; may return one PPDU to transmit.
@@ -610,12 +843,37 @@ impl Mac {
             }
         }
 
-        // 3. Pull new work.
+        // 3. Pull new work: an identification frame when due, else a batch
+        //    of queued frames for one destination.
         if matches!(self.state, TxState::Idle) && self.cur.is_none() {
-            if let Some((dest, src, body)) = self.queue.pop_front() {
-                let seq = self.seq;
-                self.seq = (self.seq + 1) & 0x0fff;
-                self.cur = Some(CurrentTx { dest, src, body, seq, retries: 0, cts_ok: false, mcs: self.cfg.mcs });
+            if self.ident_due(now_us) {
+                let call = self.cfg.ident.callsign.clone().unwrap_or_default();
+                let body = ident::body(&call, &self.cfg.ident.info);
+                let seq = self.next_seq();
+                self.cur = Some(CurrentTx {
+                    dest: frame::BROADCAST,
+                    src: self.cfg.addr,
+                    mpdus: vec![PendingMpdu { seq, body, retries: 0 }],
+                    in_flight: Vec::new(),
+                    attempts: 0,
+                    cts_ok: false,
+                    mcs: 0,
+                    qos: false,
+                    ident: true,
+                });
+                self.start_backoff(now_us);
+            } else if let Some((dest, src, body)) = self.queue.pop_front() {
+                let can_aggregate = self.cfg.ack_enabled && self.cfg.ndp_ack && !is_group(&dest);
+                let max = if can_aggregate { self.cfg.ampdu_max_mpdus.clamp(1, AMPDU_MAX_MPDUS) } else { 1 };
+                let seq = self.next_seq();
+                let mut mpdus = vec![PendingMpdu { seq, body, retries: 0 }];
+                while mpdus.len() < max && self.queue.front().is_some_and(|(d, s, _)| *d == dest && *s == src) {
+                    let (_, _, body) = self.queue.pop_front().unwrap();
+                    let seq = self.next_seq();
+                    mpdus.push(PendingMpdu { seq, body, retries: 0 });
+                }
+                let qos = mpdus.len() > 1;
+                self.cur = Some(CurrentTx { dest, src, mpdus, in_flight: Vec::new(), attempts: 0, cts_ok: false, mcs: self.cfg.mcs, qos, ident: false });
                 self.start_backoff(now_us);
             }
         }
@@ -632,46 +890,46 @@ impl Mac {
                 return None;
             }
             let cur = self.cur.as_ref().expect("Backoff implies cur");
-            let want_ack = self.cfg.ack_enabled && !is_group(&cur.dest);
+            let want_ack = self.cfg.ack_enabled && !is_group(&cur.dest) && !cur.ident;
             let sifs = A_SIFS_TIME_US as u64;
             let resp_time = if self.cfg.ndp_ack { NDP_TX_TIME_US as u64 } else { normal_tx_time_us(14) };
-            let mpdu_len = frame::DATA_HDR_LEN + cur.body.len() + 4;
-            let need_rts = want_ack && !cur.cts_ok && self.cfg.rts_threshold.is_some_and(|t| mpdu_len > t);
+            let hdr = if cur.qos { frame::QOS_DATA_HDR_LEN } else { frame::DATA_HDR_LEN };
+            let total_len: usize = cur.mpdus.iter().map(|m| hdr + m.body.len() + 4).sum();
+            let need_rts = want_ack && !cur.cts_ok && self.cfg.rts_threshold.is_some_and(|t| total_len > t);
             if need_rts {
                 // Duration covers CTS + data + response [9.2.5.2], at the
                 // rate the data is expected to go out with.
                 let est_mcs = if self.cfg.rate.enabled { self.rate.current(&cur.dest).unwrap_or(self.cfg.mcs) } else { self.cfg.mcs };
-                let data_time = s2g_phy::tx::txtime_us_coded(est_mcs, mpdu_len.min(511), mpdu_len > 511, self.cfg.fec_coding)
-                    .unwrap_or(10_000) as u64;
+                let data_time = s2g_phy::tx::txtime_us_coded(est_mcs, total_len.min(511), total_len > 511, self.cfg.fec_coding).unwrap_or(10_000) as u64;
                 let duration = sifs + NDP_TX_TIME_US as u64 + sifs + data_time + sifs + resp_time;
                 let psdu = frame::build_rts(cur.dest, cur.src, duration.min(0x7fff) as u16);
                 let seed = self.pick_seed();
-                let txv = TxVector {
-                    mcs: 0,
-                    response_indication: ResponseIndication::Ndp,
-                    scrambler_seed: Some(seed),
-                    ..Default::default()
-                };
+                let txv = TxVector { mcs: 0, response_indication: ResponseIndication::Ndp, scrambler_seed: Some(seed), ..Default::default() };
                 let airtime = s2g_phy::tx::txtime_us(0, psdu.len(), false).unwrap_or(1000) as u64;
                 let partial_aid = self.cfg.partial_aid();
-                self.state = TxState::AwaitResponse {
-                    deadline_us: now_us + airtime + self.cfg.ack_timeout_us,
-                    expect: Expect::NdpCts { partial_aid },
-                };
+                self.state = TxState::AwaitResponse { deadline_us: now_us + airtime + self.cfg.ack_timeout_us, expect: Expect::NdpCts { partial_aid } };
                 return Some(MacAction::Transmit { txv, psdu });
             }
-            // Rate control picks the MCS of this attempt (retries step
-            // down); broadcast and unacknowledged frames use the fixed rate.
-            let mcs = if want_ack && self.cfg.rate.enabled { self.rate.select(&cur.dest, cur.retries) } else { self.cfg.mcs };
+            // Rate control picks the MCS of this attempt (failed attempts
+            // step down); broadcast, identification and unacknowledged
+            // frames use the fixed rates.
+            let mcs = if cur.ident {
+                0
+            } else if want_ack && self.cfg.rate.enabled {
+                self.rate.select(&cur.dest, cur.attempts)
+            } else {
+                self.cfg.mcs
+            };
             self.cur.as_mut().expect("Backoff implies cur").mcs = mcs;
             let cur = self.cur.as_ref().expect("Backoff implies cur");
             let duration = if want_ack { (sifs + resp_time).min(0x7fff) as u16 } else { 0 };
-            let mpdu = frame::build_data(cur.dest, cur.src, cur.seq, cur.retries > 0, duration, &cur.body);
-            let (psdu, aggregated) = match self.make_psdu(mpdu.clone(), mcs) {
-                Ok(x) => x,
+            let attempt = match self.plan_attempt(cur, mcs, duration) {
+                Ok(a) => a,
                 Err(_) => {
                     let cur = self.cur.take().unwrap();
-                    out.push(MacEvent::TxDropped { dest: cur.dest, reason: "PSDU build failed" });
+                    for _ in &cur.mpdus {
+                        out.push(MacEvent::TxDropped { dest: cur.dest, reason: "PSDU build failed" });
+                    }
                     self.state = TxState::Idle;
                     return None;
                 }
@@ -686,23 +944,42 @@ impl Mac {
                 mcs,
                 fec_coding: self.cfg.fec_coding,
                 traveling_pilots: self.cfg.traveling_pilots,
-                aggregation: aggregated,
+                aggregation: attempt.aggregated,
                 response_indication,
                 scrambler_seed: Some(seed),
                 ..Default::default()
             };
-            let airtime = s2g_phy::tx::txtime_us_coded(mcs, psdu.len(), aggregated, self.cfg.fec_coding).unwrap_or(10_000) as u64;
+            let airtime = s2g_phy::tx::txtime_us_coded(mcs, attempt.psdu.len(), attempt.aggregated, self.cfg.fec_coding).unwrap_or(10_000) as u64;
+            let cur = self.cur.as_mut().expect("Backoff implies cur");
+            cur.in_flight = attempt.in_flight.clone();
             if want_ack {
-                // Our aggregated PSDUs are S-MPDUs, acknowledged like single
-                // MPDUs [10.12.8]: an NDP Ack (or legacy Ack), never a BlockAck.
-                let expect = if self.cfg.ndp_ack { Expect::NdpAck { ack_id: ndp::ack_id_for_mpdu(seed, &mpdu) } } else { Expect::Ack };
+                // A single MPDU or S-MPDU is acknowledged like a single MPDU
+                // [10.12.8]; a multi-MPDU A-MPDU gets an NDP BlockAck.
+                let expect = match (&attempt.single, self.cfg.ndp_ack) {
+                    (Some(m), true) => Expect::NdpAck { ack_id: ndp::ack_id_for_mpdu(seed, m) },
+                    (None, true) => Expect::NdpBlockAck { block_ack_id: ndp::block_ack_id(seed) },
+                    (_, false) => Expect::Ack,
+                };
                 self.state = TxState::AwaitResponse { deadline_us: now_us + airtime + self.cfg.ack_timeout_us, expect };
+                self.sent_since_ident = true;
+                self.last_data_tx_us = now_us;
             } else {
                 let cur = self.cur.take().unwrap();
-                out.push(MacEvent::TxComplete { dest: cur.dest, acked: false, retries: cur.retries, mcs });
+                if cur.ident {
+                    let text = String::from_utf8_lossy(&cur.mpdus[0].body[8..]).into_owned();
+                    out.push(MacEvent::IdentSent { text });
+                    self.last_ident_us = Some(now_us);
+                    self.sent_since_ident = false;
+                } else {
+                    for m in &cur.mpdus {
+                        out.push(MacEvent::TxComplete { dest: cur.dest, acked: false, retries: m.retries, mcs });
+                    }
+                    self.sent_since_ident = true;
+                    self.last_data_tx_us = now_us;
+                }
                 self.state = TxState::Idle;
             }
-            return Some(MacAction::Transmit { txv, psdu });
+            return Some(MacAction::Transmit { txv, psdu: attempt.psdu });
         }
         None
     }
@@ -1098,5 +1375,290 @@ mod tests {
         mac.on_phy_event(&RxEvent::Cca { sample_index: 0, busy: false, reason: None, hold_us: 0 }, 500_000, &mut out);
         let mut now = 500_000;
         assert!(drain_tx(&mut mac, &mut now, &mut out).is_some());
+    }
+
+    /// Deliver an A-MPDU to B, dropping the MPDUs whose index is in `lose`
+    /// (their FCS is corrupted), and return B's response body.
+    fn deliver_ampdu(mac_b: &mut Mac, txv: &TxVector, psdu: &[u8], lose: &[usize], now: u64, out_b: &mut Vec<MacEvent>) -> Option<u64> {
+        let mut psdu = psdu.to_vec();
+        // Corrupt the last byte of each lost MPDU in place.
+        let mut pos = 0usize;
+        let mut idx = 0usize;
+        while pos + 4 <= psdu.len() {
+            match ampdu::parse_delimiter(&psdu[pos..pos + 4]) {
+                Some((0, _)) => pos += 4,
+                Some((len, _)) => {
+                    if lose.contains(&idx) {
+                        psdu[pos + 4 + len - 1] ^= 0xff;
+                    }
+                    idx += 1;
+                    pos = (pos + 4 + len).div_ceil(4) * 4;
+                }
+                None => pos += 4,
+            }
+        }
+        mac_b.on_phy_event(&psdu_event(txv, &psdu), now, out_b);
+        match mac_b.poll(now, out_b) {
+            Some(MacAction::TransmitNdp { body }) => Some(body),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn frames_for_one_peer_are_aggregated_and_block_acked() {
+        let mut cfg = MacConfig::new(A);
+        cfg.mcs = 4;
+        cfg.ampdu_max_mpdus = 8;
+        let mut mac = Mac::new(cfg);
+        let mut out = Vec::new();
+        for i in 0..5 {
+            mac.enqueue_eth(&eth_frame(B, A, 100 + i)).unwrap();
+        }
+        mac.enqueue_eth(&eth_frame([2, 0, 0, 0, 0, 0xC], A, 50)).unwrap(); // another peer: not packed
+        let mut now = 0;
+        let Some(MacAction::Transmit { txv, psdu }) = drain_tx(&mut mac, &mut now, &mut out) else { panic!() };
+        assert!(txv.aggregation);
+        assert_eq!(txv.response_indication, ResponseIndication::Ndp);
+        let seed = txv.scrambler_seed.unwrap();
+        let mpdus = ampdu::deaggregate_with_eof(&psdu);
+        assert_eq!(mpdus.len(), 5, "all five frames in one A-MPDU");
+        assert!(mpdus.iter().all(|(_, eof)| !eof), "EOF = 0 on real MPDUs");
+        for (i, (m, _)) in mpdus.iter().enumerate() {
+            match frame::parse(m).unwrap() {
+                ParsedFrame::Data { seq, tid, retry, .. } => {
+                    assert_eq!(seq, i as u16);
+                    assert_eq!(tid, Some(0), "QoS Data inside an A-MPDU");
+                    assert!(!retry);
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        assert_eq!(psdu.len(), s2g_phy::tx::aggregated_capacity(4, psdu.len(), Coding::Bcc).unwrap());
+        assert_eq!(mac.queued(), 1);
+
+        // B receives all five, delivers them once, and answers with ONE NDP
+        // BlockAck whose bitmap covers sequence numbers 0..5.
+        let mut mac_b = Mac::new(MacConfig::new(B));
+        let mut out_b = Vec::new();
+        let body = deliver_ampdu(&mut mac_b, &txv, &psdu, &[], now, &mut out_b).expect("block ack");
+        let NdpFrame::BlockAck(ba) = NdpFrame::parse(body) else { panic!("{:?}", NdpFrame::parse(body)) };
+        assert_eq!(ba.block_ack_id, ndp::block_ack_id(seed));
+        assert_eq!(ba.starting_sequence, 0);
+        assert_eq!(ba.bitmap, 0b11111);
+        assert!(mac_b.poll(now, &mut out_b).is_none(), "exactly one response");
+        assert_eq!(out_b.iter().filter(|e| matches!(e, MacEvent::EthReceived(_))).count(), 5);
+
+        // The BlockAck completes all five at A.
+        mac.on_phy_event(&RxEvent::NdpReceived { sample_index: 0, body, metrics: metrics() }, now, &mut out);
+        mac.poll(now, &mut out);
+        assert_eq!(out.iter().filter(|e| matches!(e, MacEvent::TxComplete { acked: true, .. })).count(), 5);
+        // …and the frame for the other peer follows on its own.
+        let Some(MacAction::Transmit { txv, .. }) = drain_tx(&mut mac, &mut now, &mut out) else { panic!() };
+        assert!(!txv.aggregation);
+    }
+
+    #[test]
+    fn block_ack_bitmap_drives_selective_retransmission() {
+        let mut cfg = MacConfig::new(A);
+        cfg.mcs = 2;
+        cfg.max_retries = 2;
+        cfg.ack_timeout_us = 1000;
+        let mut mac = Mac::new(cfg);
+        let mut out = Vec::new();
+        for i in 0..4 {
+            mac.enqueue_eth(&eth_frame(B, A, 60 + i)).unwrap();
+        }
+        let mut now = 0;
+        let Some(MacAction::Transmit { txv, psdu }) = drain_tx(&mut mac, &mut now, &mut out) else { panic!() };
+        assert_eq!(ampdu::deaggregate(&psdu).len(), 4);
+        // B loses MPDUs 1 and 3 (sequence numbers 1 and 3).
+        let mut mac_b = Mac::new(MacConfig::new(B));
+        let mut out_b = Vec::new();
+        let body = deliver_ampdu(&mut mac_b, &txv, &psdu, &[1, 3], now, &mut out_b).expect("block ack");
+        let NdpFrame::BlockAck(ba) = NdpFrame::parse(body) else { panic!() };
+        assert_eq!((ba.starting_sequence, ba.bitmap), (0, 0b0101));
+        mac.on_phy_event(&RxEvent::NdpReceived { sample_index: 0, body, metrics: metrics() }, now, &mut out);
+        mac.poll(now, &mut out);
+        assert_eq!(out.iter().filter(|e| matches!(e, MacEvent::TxComplete { acked: true, .. })).count(), 2);
+        // The retry carries exactly the two lost MPDUs, Retry bit set.
+        let Some(MacAction::Transmit { txv: txv2, psdu: psdu2 }) = drain_tx(&mut mac, &mut now, &mut out) else { panic!() };
+        let again = ampdu::deaggregate(&psdu2);
+        assert_eq!(again.len(), 2);
+        let seqs: Vec<u16> = again
+            .iter()
+            .map(|m| match frame::parse(m).unwrap() {
+                ParsedFrame::Data { seq, retry, .. } => {
+                    assert!(retry);
+                    seq
+                }
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(seqs, vec![1, 3]);
+        // B gets both this time; its bitmap starts at the first received
+        // sequence number (1) and marks 1 and 3.
+        let body = deliver_ampdu(&mut mac_b, &txv2, &psdu2, &[], now, &mut out_b).expect("block ack");
+        let NdpFrame::BlockAck(ba) = NdpFrame::parse(body) else { panic!() };
+        assert_eq!((ba.starting_sequence, ba.bitmap), (1, 0b0101));
+        mac.on_phy_event(&RxEvent::NdpReceived { sample_index: 0, body, metrics: metrics() }, now, &mut out);
+        mac.poll(now, &mut out);
+        assert_eq!(out.iter().filter(|e| matches!(e, MacEvent::TxComplete { acked: true, .. })).count(), 4);
+        assert!(!out.iter().any(|e| matches!(e, MacEvent::TxDropped { .. })));
+        // B delivered each frame exactly once, in order.
+        let delivered: Vec<&Vec<u8>> = out_b
+            .iter()
+            .filter_map(|e| match e {
+                MacEvent::EthReceived(f) => Some(f),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(delivered.len(), 4);
+    }
+
+    #[test]
+    fn unacknowledged_ampdu_retries_then_drops_every_mpdu() {
+        let mut cfg = MacConfig::new(A);
+        cfg.max_retries = 1;
+        cfg.ack_timeout_us = 1000;
+        let mut mac = Mac::new(cfg);
+        let mut out = Vec::new();
+        for i in 0..3 {
+            mac.enqueue_eth(&eth_frame(B, A, 40 + i)).unwrap();
+        }
+        let mut now = 0;
+        let mut transmissions = 0;
+        for _ in 0..100_000 {
+            if let Some(MacAction::Transmit { .. }) = mac.poll(now, &mut out) {
+                transmissions += 1;
+            }
+            if out.iter().filter(|e| matches!(e, MacEvent::TxDropped { .. })).count() == 3 {
+                break;
+            }
+            now += 500;
+        }
+        assert_eq!(transmissions, 2, "initial + 1 retry, each carrying the whole batch");
+        assert_eq!(out.iter().filter(|e| matches!(e, MacEvent::TxDropped { reason: "retry limit", .. })).count(), 3);
+        assert!(mac.poll(now + 1_000_000, &mut out).is_none());
+    }
+
+    #[test]
+    fn aggregation_is_off_for_broadcast_legacy_ack_and_ampdu_1() {
+        // Broadcast: one frame per PPDU.
+        let mut mac = Mac::new(MacConfig::new(A));
+        let mut out = Vec::new();
+        mac.enqueue_eth(&eth_frame(BCAST, A, 30)).unwrap();
+        mac.enqueue_eth(&eth_frame(BCAST, A, 31)).unwrap();
+        let mut now = 0;
+        let Some(MacAction::Transmit { txv, .. }) = drain_tx(&mut mac, &mut now, &mut out) else { panic!() };
+        assert!(!txv.aggregation);
+        assert_eq!(mac.queued(), 1);
+        // Legacy Ack cannot cover an A-MPDU.
+        let mut cfg = MacConfig::new(A);
+        cfg.ndp_ack = false;
+        let mut mac = Mac::new(cfg);
+        mac.enqueue_eth(&eth_frame(B, A, 30)).unwrap();
+        mac.enqueue_eth(&eth_frame(B, A, 31)).unwrap();
+        let Some(MacAction::Transmit { txv, .. }) = drain_tx(&mut mac, &mut now, &mut out) else { panic!() };
+        assert!(!txv.aggregation);
+        assert_eq!(mac.queued(), 1);
+        // ampdu_max_mpdus = 1 disables packing.
+        let mut cfg = MacConfig::new(A);
+        cfg.ampdu_max_mpdus = 1;
+        let mut mac = Mac::new(cfg);
+        mac.enqueue_eth(&eth_frame(B, A, 30)).unwrap();
+        mac.enqueue_eth(&eth_frame(B, A, 31)).unwrap();
+        let Some(MacAction::Transmit { txv, psdu }) = drain_tx(&mut mac, &mut now, &mut out) else { panic!() };
+        assert!(!txv.aggregation);
+        assert!(matches!(frame::parse(&psdu).unwrap(), ParsedFrame::Data { tid: None, .. }));
+        assert_eq!(mac.queued(), 1);
+    }
+
+    #[test]
+    fn a_batch_that_does_not_fit_one_ppdu_is_sent_in_pieces() {
+        // MCS 0: a 511-symbol PPDU carries ~1660 octets; eight 300-octet
+        // frames need two PPDUs. All are delivered without any retry.
+        let mut cfg = MacConfig::new(A);
+        cfg.mcs = 0;
+        let mut mac = Mac::new(cfg);
+        let mut mac_b = Mac::new(MacConfig::new(B));
+        let (mut out, mut out_b) = (Vec::new(), Vec::new());
+        for i in 0..8 {
+            mac.enqueue_eth(&eth_frame(B, A, 300 + i)).unwrap();
+        }
+        let mut now = 0;
+        let mut ppdus = 0;
+        while let Some(MacAction::Transmit { txv, psdu }) = drain_tx(&mut mac, &mut now, &mut out) {
+            ppdus += 1;
+            assert!(ppdus < 10);
+            let body = deliver_ampdu(&mut mac_b, &txv, &psdu, &[], now, &mut out_b).expect("response");
+            mac.on_phy_event(&RxEvent::NdpReceived { sample_index: 0, body, metrics: metrics() }, now, &mut out);
+        }
+        assert!(ppdus >= 2, "{ppdus} PPDUs");
+        assert_eq!(out.iter().filter(|e| matches!(e, MacEvent::TxComplete { acked: true, retries: 0, .. })).count(), 8);
+        assert_eq!(out_b.iter().filter(|e| matches!(e, MacEvent::EthReceived(_))).count(), 8);
+    }
+
+    #[test]
+    fn identification_precedes_data_repeats_and_closes() {
+        let mut cfg = MacConfig::new(A);
+        cfg.ident = IdentConfig { callsign: Some("w1aw".into()), info: "FN31".into(), interval_us: 600_000_000, end_idle_us: 30_000_000 };
+        cfg.ack_enabled = false;
+        let mut mac = Mac::new(cfg);
+        let mut out = Vec::new();
+        mac.enqueue_eth(&eth_frame(B, A, 40)).unwrap();
+        let mut now = 0u64;
+        // 1. The very first transmission is the identification, broadcast at MCS 0.
+        let Some(MacAction::Transmit { txv, psdu }) = drain_tx(&mut mac, &mut now, &mut out) else { panic!() };
+        assert_eq!(txv.mcs, 0);
+        assert_eq!(txv.response_indication, ResponseIndication::None);
+        let ParsedFrame::Data { dest, body, tid, .. } = frame::parse(&psdu).unwrap() else { panic!() };
+        assert_eq!(dest, BCAST);
+        assert_eq!(tid, None);
+        assert_eq!(ident::parse_body(&body).as_deref(), Some("DE W1AW FN31"));
+        assert!(out.iter().any(|e| matches!(e, MacEvent::IdentSent { text } if text == "DE W1AW FN31")));
+        // 2. Then the data.
+        let Some(MacAction::Transmit { psdu, .. }) = drain_tx(&mut mac, &mut now, &mut out) else { panic!() };
+        assert!(matches!(frame::parse(&psdu).unwrap(), ParsedFrame::Data { dest, .. } if dest == B));
+        // 3. Continuous traffic: no identification for 10 minutes, then one.
+        let mut idents = 0;
+        let t0 = now;
+        while now < t0 + 11 * 60_000_000 {
+            mac.enqueue_eth(&eth_frame(B, A, 40)).unwrap();
+            let Some(MacAction::Transmit { psdu, .. }) = drain_tx(&mut mac, &mut now, &mut out) else { panic!() };
+            if let ParsedFrame::Data { body, .. } = frame::parse(&psdu).unwrap() {
+                if ident::parse_body(&body).is_some() {
+                    idents += 1;
+                    assert!(now - t0 >= 600_000_000 - 1_000_000, "identified early at {}", now - t0);
+                }
+            }
+            now += 5_000_000;
+        }
+        assert_eq!(idents, 1, "one repeat in 11 minutes of traffic");
+        // 4. Traffic stops: 30 s later the closing identification goes out
+        //    on its own, and nothing after that.
+        let Some(MacAction::Transmit { psdu, .. }) = drain_tx(&mut mac, &mut now, &mut out) else {
+            // data frame from the loop above may still be pending; consume
+            panic!()
+        };
+        let _ = psdu;
+        now += 31_000_000;
+        let Some(MacAction::Transmit { psdu, .. }) = drain_tx(&mut mac, &mut now, &mut out) else { panic!("no closing identification") };
+        let ParsedFrame::Data { body, .. } = frame::parse(&psdu).unwrap() else { panic!() };
+        assert!(ident::parse_body(&body).is_some());
+        now += 120_000_000;
+        assert!(mac.poll(now, &mut out).is_none());
+        // 5. A station without a call sign never identifies.
+        let mut quiet = Mac::new(MacConfig::new(A));
+        quiet.enqueue_eth(&eth_frame(BCAST, A, 40)).unwrap();
+        let Some(MacAction::Transmit { psdu, .. }) = drain_tx(&mut quiet, &mut now, &mut out) else { panic!() };
+        let ParsedFrame::Data { body, .. } = frame::parse(&psdu).unwrap() else { panic!() };
+        assert!(ident::parse_body(&body).is_none());
+        // 6. A receiver reports a heard identification instead of forwarding it.
+        let mut mac_b = Mac::new(MacConfig::new(B));
+        let mut out_b = Vec::new();
+        let id = frame::build_data(BCAST, A, 77, false, 0, &ident::body("W1AW", ""));
+        mac_b.on_phy_event(&psdu_event(&TxVector::default(), &id), now, &mut out_b);
+        assert!(out_b.iter().any(|e| matches!(e, MacEvent::IdentReceived { src, text } if *src == A && text == "DE W1AW")));
+        assert!(!out_b.iter().any(|e| matches!(e, MacEvent::EthReceived(_))));
     }
 }

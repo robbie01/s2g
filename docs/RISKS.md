@@ -49,6 +49,7 @@ for a while even with a dev kit in hand.
 | PV1 reception | Self-consistent | Layout from 9.8; no PV1 frame seen in any capture |
 | Padded-PSDU tolerance (`locate_mpdu`) | External | Baby monitor pads non-aggregated PSDUs to 4-octet multiples |
 | Scrambler seed 0 tolerance | External | imec dataset device uses the all-zero seed ~1/128 of the time |
+| A-MPDU packing, NDP BlockAck bitmap, selective retry | Self-consistent | Unit tests with corrupted MPDUs and a two-node PHY simulation; the 16-bit bitmap and SSN semantics follow 23.3.12.2.6.2 |
 | Per-peer rate control | Self-consistent | Unit tests with synthetic success ceilings and a two-node PHY simulation at 30 dB / 11 dB SNR; the SNR hint assumes a roughly symmetric link and the probe/back-off constants are untuned against real fading |
 
 ## Deliberate deviations from the standard
@@ -58,6 +59,8 @@ for a while even with a dev kit in hand.
 | OCB (no BSS): no association, beacons, TIM, BSS max idle, RAW, power save | Project goal | A standard S1G STA would not talk to this MAC without an AP; two s2g nodes talk to each other |
 | Partial AID for NDP CTS derived from the MAC address | No AID without association | Only matters for the RA field of our own NDP CTS |
 | PV1 frames addressed by AID (SID) are dropped | No association ⇒ no AID table | PV1 QoS Data with full MAC addresses (type 3) is delivered; SID-addressed frames are received, FCS-checked and discarded |
+| A-MPDUs without a block ack agreement | No ADDBA exchange in OCB | s2g peers acknowledge them with NDP BlockAck; a standard STA would not. Set `--ampdu 1` (S-MPDUs only) when talking to other vendors |
+| Station identification as a broadcast Data frame with EtherType 0x88B5 | Part 97 needs an in-the-clear call sign; 802.11 has no field for it | Plain ASCII, readable in any capture; adds one MCS 0 frame per 10 minutes of traffic |
 | DIFS-based DCF access, backoff redrawn instead of frozen | Simplicity | Slightly unfair against standard EDCA stations |
 | Response timeouts of ~150 ms instead of SIFS-scale | Buffered SDR streaming | Throughput bound; interop with a real SIFS-timed peer is not possible without hardware timestamping |
 | 1 MHz / S1G_1M not implemented | User decision | Mandatory for a compliant S1G STA; 1 MHz devices are invisible to this receiver |

@@ -288,3 +288,25 @@ fn rate_control_climbs_on_a_clean_link_and_settles_on_a_noisy_one() {
         assert!(used.iter().all(|&m| m <= hi), "snr {snr}: used {used:?}");
     }
 }
+
+#[test]
+fn queued_frames_are_packed_into_ampdus_over_the_air() {
+    let mut cfg_a = Node::config(A, 3, true);
+    cfg_a.ampdu_max_mpdus = 8;
+    let mut a = Node::new(cfg_a);
+    let mut b = Node::new(Node::config(B, 3, true));
+    let frames: Vec<Vec<u8>> = (0..12).map(|i| eth(B, A, 200 + i)).collect();
+    for f in &frames {
+        a.mac.enqueue_eth(f).unwrap();
+    }
+    run(&mut a, &mut b, 600, |_| false);
+    let got = delivered(&b);
+    assert_eq!(got.len(), 12, "B events: {:?}", b.events.len());
+    for (g, f) in got.iter().zip(&frames) {
+        assert_eq!(*g, f);
+    }
+    // Twelve frames, eight per A-MPDU: two PPDUs, two NDP BlockAcks.
+    assert_eq!(b.ndps_sent, 2, "{:?}", a.ndps_received());
+    assert!(a.ndps_received().iter().all(|f| matches!(f, NdpFrame::BlockAck(_))), "{:?}", a.ndps_received());
+    assert_eq!(a.events.iter().filter(|e| matches!(e, MacEvent::TxComplete { acked: true, retries: 0, .. })).count(), 12);
+}

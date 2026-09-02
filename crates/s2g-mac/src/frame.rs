@@ -13,6 +13,8 @@ pub const BROADCAST: MacAddr = [0xff; 6];
 
 /// Data frame MAC header length (3-address, no QoS).
 pub const DATA_HDR_LEN: usize = 24;
+/// QoS Data frame MAC header length (3-address + QoS Control).
+pub const QOS_DATA_HDR_LEN: usize = 26;
 /// Ack frame length incl. FCS.
 pub const ACK_LEN: usize = 14;
 /// RTS frame length incl. FCS.
@@ -38,6 +40,24 @@ pub fn build_data(dest: MacAddr, src: MacAddr, seq: u16, retry: bool, duration_u
     f.extend_from_slice(&src);
     f.extend_from_slice(&WILDCARD_BSSID);
     f.extend_from_slice(&((seq & 0x0fff) << 4).to_le_bytes()); // frag 0
+    f.extend_from_slice(body);
+    fcs::append(&mut f);
+    f
+}
+
+/// Build a QoS Data frame (subtype 8) with Normal Ack policy and the given
+/// TID: the MPDU type an A-MPDU carries [9.7.3, Table 9-664].
+pub fn build_qos_data(dest: MacAddr, src: MacAddr, seq: u16, retry: bool, duration_us: u16, tid: u8, body: &[u8]) -> Vec<u8> {
+    let mut f = Vec::with_capacity(QOS_DATA_HDR_LEN + body.len() + 4);
+    f.push(0x88); // version 0, type 2 (Data), subtype 8 (QoS Data)
+    f.push(if retry { 0x08 } else { 0x00 });
+    f.extend_from_slice(&(duration_us & 0x7fff).to_le_bytes());
+    f.extend_from_slice(&dest);
+    f.extend_from_slice(&src);
+    f.extend_from_slice(&WILDCARD_BSSID);
+    f.extend_from_slice(&((seq & 0x0fff) << 4).to_le_bytes());
+    // QoS Control: TID, EOSP 0, Ack Policy 00 (Normal Ack), A-MSDU 0.
+    f.extend_from_slice(&((tid & 0x0f) as u16).to_le_bytes());
     f.extend_from_slice(body);
     fcs::append(&mut f);
     f
@@ -76,7 +96,8 @@ pub enum Pv1Addr {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParsedFrame {
-    Data { dest: MacAddr, src: MacAddr, bssid: MacAddr, seq: u16, retry: bool, duration_us: u16, body: Vec<u8> },
+    /// PV0 Data (subtype 0) or QoS Data (subtype 8, `tid` set).
+    Data { dest: MacAddr, src: MacAddr, bssid: MacAddr, seq: u16, retry: bool, duration_us: u16, tid: Option<u8>, body: Vec<u8> },
     Ack { ra: MacAddr },
     Rts { ra: MacAddr, ta: MacAddr, duration_us: u16 },
     /// A PV1 (short MAC header) frame [9.8]: reception is mandatory for an
@@ -230,12 +251,15 @@ pub fn parse(mpdu: &[u8]) -> Result<ParsedFrame, FrameError> {
     let subtype = fc0 >> 4;
     let duration_us = u16::from_le_bytes([inner[2], inner[3]]) & 0x7fff;
     match (ftype, subtype) {
-        // Data (plain or QoS-less null etc. — accept subtype 0 only)
-        (2, 0) => {
-            if inner.len() < DATA_HDR_LEN {
+        // Data (subtype 0) and QoS Data (subtype 8); ToDS/FromDS = 0 only.
+        (2, 0) | (2, 8) => {
+            let qos = subtype == 8;
+            let hdr = if qos { QOS_DATA_HDR_LEN } else { DATA_HDR_LEN };
+            if inner.len() < hdr || fc1 & 0x03 != 0 {
                 return Err(FrameError::TooShort);
             }
             let seq_ctrl = u16::from_le_bytes([inner[22], inner[23]]);
+            let tid = qos.then(|| inner[24] & 0x0f);
             Ok(ParsedFrame::Data {
                 dest: addr(&inner[4..10]),
                 src: addr(&inner[10..16]),
@@ -243,7 +267,8 @@ pub fn parse(mpdu: &[u8]) -> Result<ParsedFrame, FrameError> {
                 seq: seq_ctrl >> 4,
                 retry: fc1 & 0x08 != 0,
                 duration_us,
-                body: inner[DATA_HDR_LEN..].to_vec(),
+                tid,
+                body: inner[hdr..].to_vec(),
             })
         }
         (1, 13) => Ok(ParsedFrame::Ack { ra: addr(&inner[4..10]) }),
@@ -268,7 +293,7 @@ mod tests {
     fn data_roundtrip() {
         let f = build_data(B, A, 1234, false, 400, b"payload!");
         match parse(&f).unwrap() {
-            ParsedFrame::Data { dest, src, bssid, seq, retry, duration_us, body } => {
+            ParsedFrame::Data { dest, src, bssid, seq, retry, duration_us, body, .. } => {
                 assert_eq!(dest, B);
                 assert_eq!(src, A);
                 assert_eq!(bssid, WILDCARD_BSSID);
