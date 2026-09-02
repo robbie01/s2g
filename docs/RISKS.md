@@ -32,7 +32,8 @@ for a while even with a dev kit in hand.
 | Short-GI reception | External | All 11 FCS-valid short-GI PPDUs in the baby-monitor capture (radiotap flag 0x80) decode byte-exact; 3-sample window backoff on short-GI symbols |
 | Short-GI / S1G_LONG transmission | Self-consistent | Loopback with CFO, echo and ±30 ppm SFO; TX defaults stay S1G_SHORT + 8 µs GI |
 | Sampling-clock tracking | External (weak) | Real captures show 9 ppm tracked and RTL-SDR sample-drop jumps snapped; ±40 ppm only in simulation |
-| CCA energy / preamble / mid-packet detect | Self-consistent | Thresholds are in dBm and depend on `cal_offset_db`; nothing checks the calibration. The mid-packet (guard-interval correlation) detector is tested on our own waveform only; its false-alarm rate on real interference is unmeasured |
+| CCA energy / preamble / mid-packet detect | Self-consistent | Thresholds are dBm; without a calibration offset the receiver now derives one from its measured noise floor (assumed −104 dBm), tested in loopback. The mid-packet (guard-interval correlation) detector is tested on our own waveform only; its false-alarm rate on real interference is unmeasured |
+| Carrier-offset capture range | Self-consistent | LTF alias search decodes ±120 kHz offsets in loopback (±96 ppm at 1250 MHz); untrimmed Plutos are expected inside that |
 | RSSI / RCPI / SNR | Unmeasurable here | Monotonic and encoded per Table 9-215; absolute dBm accuracy (±5 dB) needs a calibrated source |
 | Carrier-lost, FormatViolation, UnsupportedRate, RXTIME wait-out | Self-consistent | Loopback tests; real captures exercised FormatViolation and UnsupportedRate |
 | Spectral mask / flatness / EVM | Unmeasurable here | Measured on the baseband stream only (passes); the Pluto's RF chain is not included |

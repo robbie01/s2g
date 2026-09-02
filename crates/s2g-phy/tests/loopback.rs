@@ -901,3 +901,77 @@ fn s1g_long_su_data_decoded_with_impairments() {
         assert!(ends(&ev).contains(&&RxEndStatus::NoError));
     }
 }
+
+#[test]
+fn carrier_offsets_beyond_the_stf_alias_are_resolved() {
+    // Two ±25 ppm oscillators at 1250 MHz can differ by 62 kHz, right at
+    // the ±62.5 kHz the STF autocorrelation resolves; the LTF alias search
+    // extends the capture range to ±187 kHz.
+    let tx = Transmitter::new();
+    let mut rng = Rng(41);
+    for cfo in [90_000.0f32, -120_000.0, 61_000.0, -64_000.0] {
+        let psdu = rng.bytes(120);
+        let wave = tx.generate(&TxVector { mcs: 1, ..Default::default() }, &psdu).unwrap();
+        let mut stream = lead_noise(400, 1e-4, &mut rng);
+        stream.extend(&wave);
+        stream.extend(lead_noise(300, 1e-4, &mut rng));
+        let ev = run_rx(&awgn(&apply_cfo(&stream, cfo), 25.0, &mut rng), 900);
+        assert_eq!(psdus(&ev), vec![&psdu], "cfo {cfo}: {:?}", ends(&ev));
+        let measured = ev
+            .iter()
+            .find_map(|e| match e {
+                RxEvent::PsduReceived { metrics, .. } => Some(metrics.cfo_hz),
+                _ => None,
+            })
+            .unwrap();
+        assert!((measured - cfo).abs() < 400.0, "cfo {cfo}: measured {measured}");
+    }
+}
+
+#[test]
+fn noise_floor_calibration_keeps_energy_detect_above_the_floor() {
+    // A front end whose noise floor sits at -55 dBFS: with the default
+    // (uncalibrated) offset the -72 "dBm" threshold acts on dBFS and CCA
+    // is BUSY forever; auto-calibration puts the floor at -104 dBm, so the
+    // threshold lands 32 dB above it and only the PPDU trips it.
+    let tx = Transmitter::new();
+    let mut rng = Rng(42);
+    let psdu = rng.bytes(80);
+    let wave = tx.generate(&TxVector { mcs: 0, ..Default::default() }, &psdu).unwrap();
+    let floor_dbfs = -55.0f32;
+    let amp = 10f32.powf(floor_dbfs / 20.0);
+    let mut stream = lead_noise(2_200_000, amp, &mut rng); // 1.1 s
+    let ppdu_at = stream.len() as u64;
+    stream.extend(wave.iter().map(|v| v + Complex32::new(rng.gauss(), rng.gauss()) * amp * std::f32::consts::FRAC_1_SQRT_2));
+    stream.extend(lead_noise(200_000, amp, &mut rng));
+    for auto in [false, true] {
+        let mut rx = Receiver::new(RxConfig { auto_cal: auto, ..Default::default() });
+        let mut ev = Vec::new();
+        for c in stream.chunks(65536) {
+            rx.process(c, &mut ev);
+        }
+        rx.finish(&mut ev);
+        assert_eq!(psdus(&ev), vec![&psdu], "auto {auto}");
+        let cca: Vec<(u64, bool, Option<CcaReason>)> = ev
+            .iter()
+            .filter_map(|e| match e {
+                RxEvent::Cca { sample_index, busy, reason, .. } => Some((*sample_index, *busy, *reason)),
+                _ => None,
+            })
+            .collect();
+        if auto {
+            let floor = rx.noise_floor_dbfs().expect("floor measured");
+            assert!((floor - floor_dbfs).abs() < 3.0, "floor {floor}");
+            assert!((rx.cal_offset_db() - (-104.0 - floor)).abs() < 0.01);
+            // Energy detect fires once, at the PPDU, and CCA is released after it.
+            let rises: Vec<u64> = cca.iter().filter(|(_, b, r)| *b && *r == Some(CcaReason::EnergyDetect)).map(|(t, _, _)| *t).collect();
+            assert_eq!(rises.len(), 1, "energy-detect rises: {cca:?}");
+            assert!((rises[0] as i64 - ppdu_at as i64).abs() < 200, "rise at {} vs PPDU at {ppdu_at}", rises[0]);
+            assert!(cca.iter().any(|(t, b, _)| !*b && *t > ppdu_at + wave.len() as u64), "no release after the PPDU: {cca:?}");
+        } else {
+            // Uncalibrated: BUSY from the first window and never released.
+            assert!(matches!(cca.first(), Some((_, true, Some(CcaReason::EnergyDetect)))), "{cca:?}");
+            assert!(!cca.iter().any(|(_, b, _)| !*b), "{cca:?}");
+        }
+    }
+}

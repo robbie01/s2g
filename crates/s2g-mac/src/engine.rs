@@ -240,6 +240,8 @@ pub struct Mac {
     /// Data went out since the last identification.
     sent_since_ident: bool,
     last_data_tx_us: u64,
+    /// CFO the PHY measured on the PSDU being processed, Hz.
+    rx_cfo_hz: f32,
 }
 
 fn is_group(addr: &MacAddr) -> bool {
@@ -276,6 +278,7 @@ impl Mac {
             last_ident_us: None,
             sent_since_ident: false,
             last_data_tx_us: 0,
+            rx_cfo_hz: 0.0,
         }
     }
 
@@ -403,6 +406,7 @@ impl Mac {
             }
             RxEvent::NdpReceived { body, metrics, .. } => {
                 let f = NdpFrame::parse(*body);
+                self.rx_cfo_hz = metrics.cfo_hz;
                 self.on_ndp(&f, metrics.snr_db, now_us, out);
                 out.push(MacEvent::NdpReceived { frame: f });
             }
@@ -411,7 +415,8 @@ impl Mac {
                 self.eifs_pending = true;
             }
             RxEvent::RxEnd { .. } => {}
-            RxEvent::PsduReceived { rxvector, psdu, .. } => {
+            RxEvent::PsduReceived { rxvector, psdu, metrics, .. } => {
+                self.rx_cfo_hz = metrics.cfo_hz;
                 let (mpdus, s_mpdu): (Vec<Vec<u8>>, bool) = if rxvector.aggregation {
                     let with_eof = ampdu::deaggregate_with_eof(psdu);
                     let s = with_eof.len() == 1 && with_eof[0].1;
@@ -467,6 +472,7 @@ impl Mac {
                 if expected {
                     if let Some(c) = &self.cur {
                         self.rate.observe_snr(&c.dest, snr_db);
+                        self.rate.observe_cfo(&c.dest, self.rx_cfo_hz);
                     }
                     self.resolve_attempt(|_| true, now_us, out);
                 }
@@ -639,6 +645,7 @@ impl Mac {
             return None; // our own transmission looping back
         }
         self.rate.observe_snr(&src, rxv.snr_db);
+        self.rate.observe_cfo(&src, self.rx_cfo_hz);
         let for_us = dest == self.cfg.addr;
         if !for_us && !is_group(&dest) {
             if duration_us > 0 {

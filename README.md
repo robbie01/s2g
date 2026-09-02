@@ -115,6 +115,21 @@ power) for any decode.
 
 ## Hardware notes
 
+**Carrier offset at 1250 MHz.** Two ±25 ppm Pluto crystals can put the peer 62 kHz
+away, right at the ±62.5 kHz the STF autocorrelation can resolve. The receiver therefore
+tries the coarse estimate and its ±125 kHz aliases at LTF sync and keeps the one whose
+LTF correlation peaks, which gives a capture range of about ±187 kHz (±150 ppm). Still,
+trim the crystals: `s2g-node` prints every peer's offset in Hz and ppm whenever its rate
+changes; multiply the Pluto's `xo_correction` (nominally 40000000) by (1 + ppm/1e6) on
+one node and pass it with `--xo-correction`.
+
+**CCA calibration.** The CCA thresholds are dBm values from the standard, and an SDR
+knows only dBFS. Without `--cal-offset-db` the receiver measures its own noise floor
+(quietest 20 ms of the last second) and assumes it sits at −104 dBm, which places energy
+detect 32 dB above the floor and gives RCPI a plausible scale. Both tools print the
+measured floor and the derived offset. Pass `--cal-offset-db` when you have a calibrated
+source; energy detect reports IDLE until the floor has been measured.
+
 - The AD9363 can't stream at 2 MS/s, so the radio runs at **4 MS/s** and `s2g-dsp`
   halfband-resamples ×2 in software (TX interpolate / RX decimate).
 - 1250 MHz is inside the AD9363 tuning range but **outside every S1G regulatory band —

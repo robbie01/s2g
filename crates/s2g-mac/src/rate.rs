@@ -90,6 +90,9 @@ struct Peer {
     probing: Option<usize>,
     /// Smoothed SNR of what we hear from this peer, dB.
     snr_db: Option<f32>,
+    /// Smoothed carrier frequency offset of what we hear from this peer, Hz
+    /// (their oscillator relative to ours, as seen by the PHY).
+    cfo_hz: Option<f32>,
 }
 
 /// Per-peer statistics snapshot.
@@ -97,6 +100,7 @@ struct Peer {
 pub struct PeerRateInfo {
     pub mcs: u8,
     pub snr_db: Option<f32>,
+    pub cfo_hz: Option<f32>,
     /// (MCS, attempts, successes, smoothed success probability).
     pub per_mcs: Vec<(u8, u32, u32, Option<f32>)>,
 }
@@ -153,7 +157,7 @@ impl RateControl {
             let cur = self.start_index(None);
             self.peers.insert(
                 *addr,
-                Peer { stats: [McsStat::default(); LADDER.len()], cur, since_probe: 0, probe_backoff: 0, probing: None, snr_db: None },
+                Peer { stats: [McsStat::default(); LADDER.len()], cur, since_probe: 0, probe_backoff: 0, probing: None, snr_db: None, cfo_hz: None },
             );
         }
         self.peers.get_mut(addr).expect("inserted")
@@ -175,6 +179,23 @@ impl RateControl {
             let cur = self.start_index(snr);
             self.peer_mut(addr).cur = cur;
         }
+    }
+
+    /// The PHY measured `cfo_hz` on something received from `addr`.
+    pub fn observe_cfo(&mut self, addr: &MacAddr, cfo_hz: f32) {
+        if !cfo_hz.is_finite() {
+            return;
+        }
+        let p = self.peer_mut(addr);
+        p.cfo_hz = Some(match p.cfo_hz {
+            Some(c) => c + 0.3 * (cfo_hz - c),
+            None => cfo_hz,
+        });
+    }
+
+    /// Smoothed carrier offset of `addr`, Hz, if anything was heard.
+    pub fn peer_cfo_hz(&self, addr: &MacAddr) -> Option<f32> {
+        self.peers.get(addr).and_then(|p| p.cfo_hz)
     }
 
     /// MCS for the next transmission attempt to `addr` (`retry` = 0 for a
@@ -245,6 +266,7 @@ impl RateControl {
         self.peers.get(addr).map(|p| PeerRateInfo {
             mcs: LADDER[p.cur],
             snr_db: p.snr_db,
+            cfo_hz: p.cfo_hz,
             per_mcs: LADDER.iter().zip(&p.stats).map(|(&m, s)| (m, s.attempts, s.successes, s.p)).collect(),
         })
     }

@@ -60,9 +60,10 @@ struct Args {
     /// Detection threshold (0..1)
     #[arg(long, default_value_t = 0.55)]
     threshold: f32,
-    /// Calibration: dBm = dBFS + this offset (drives RCPI and the CCA thresholds)
-    #[arg(long, default_value_t = 0.0)]
-    cal_offset_db: f32,
+    /// Calibration: dBm = dBFS + this offset (drives RCPI and the CCA thresholds).
+    /// Default: derived from the measured noise floor, assumed to be -104 dBm
+    #[arg(long)]
+    cal_offset_db: Option<f32>,
     /// CCA channel classification: 1 or 2
     #[arg(long, default_value_t = 1)]
     cca_type: u8,
@@ -290,13 +291,21 @@ impl Printer {
     }
 }
 
+fn print_calibration(rx: &Receiver) {
+    match rx.noise_floor_dbfs() {
+        Some(f) => eprintln!("noise floor {f:.1} dBFS | cal offset {:+.1} dB | energy detect at {:.1} dBFS", rx.cal_offset_db(), -72.0 - rx.cal_offset_db()),
+        None => eprintln!("noise floor: not measured (needs 20 ms of samples)"),
+    }
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
     let mut rx = Receiver::new(RxConfig {
         detect_threshold: args.threshold,
         emit_ppdu_start: !args.quiet,
         emit_cca: !args.quiet,
-        cal_offset_db: args.cal_offset_db,
+        cal_offset_db: args.cal_offset_db.unwrap_or(0.0),
+        auto_cal: args.cal_offset_db.is_none(),
         cca_type: if args.cca_type == 2 { s2g_phy::params::rf::CcaType::Type2 } else { s2g_phy::params::rf::CcaType::Type1 },
         timing_tracking: !args.no_timing_tracking,
         ..Default::default()
@@ -335,6 +344,7 @@ fn main() -> Result<()> {
             }
             if args.count > 0 && printer.psdus >= args.count {
                 printer.summary();
+                print_calibration(&rx);
                 return Ok(());
             }
         }
@@ -343,6 +353,7 @@ fn main() -> Result<()> {
             printer.handle(&e);
         }
         printer.summary();
+        print_calibration(&rx);
         return Ok(());
     }
 

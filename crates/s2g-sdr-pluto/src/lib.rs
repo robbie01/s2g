@@ -380,3 +380,20 @@ mod tests {
         assert_eq!(split_host("pluto.local:1234"), ("pluto.local".into(), 1234));
     }
 }
+
+impl Pluto {
+    /// Trim the AD936x reference oscillator: `xo_correction` is the crystal
+    /// frequency the firmware assumes, in Hz (nominally 40 000 000). A peer
+    /// seen at +f Hz carrier offset at centre frequency F is pulled onto
+    /// frequency by scaling this value by (1 + f/F) on one side or the
+    /// other; the node reports every peer offset in ppm for that.
+    pub fn set_xo_correction(&mut self, xo_hz: u64) -> Result<(), SdrError> {
+        self.ctl.attr_write(&self.phy_id, None, "xo_correction", &xo_hz.to_string())
+    }
+
+    /// The oscillator trim currently in effect, Hz.
+    pub fn xo_correction(&mut self) -> Result<u64, SdrError> {
+        let v = self.ctl.attr_read(&self.phy_id, None, "xo_correction")?;
+        v.trim().parse().map_err(|_| SdrError::Backend(format!("xo_correction = {v:?}")))
+    }
+}

@@ -80,6 +80,10 @@ struct Args {
     /// RF center frequency, Hz
     #[arg(long, default_value_t = DEFAULT_CENTER_FREQ_HZ)]
     freq: f64,
+    /// Pluto oscillator trim (ad9361-phy xo_correction, Hz, nominal 40000000):
+    /// scale it by (1 + ppm/1e6) to pull the peer offset the node reports to zero
+    #[arg(long)]
+    xo_correction: Option<u64>,
     /// RX gain: "auto" or dB
     #[arg(long, default_value = "auto")]
     gain: String,
@@ -89,8 +93,8 @@ struct Args {
     #[arg(long, default_value_t = 2_200_000.0)]
     rf_bandwidth: f64,
     /// Receiver calibration: dBm = dBFS + this offset (RCPI, CCA thresholds)
-    #[arg(long, default_value_t = 0.0)]
-    cal_offset_db: f32,
+    #[arg(long)]
+    cal_offset_db: Option<f32>,
     /// CCA channel classification: 1 or 2
     #[arg(long, default_value_t = 1)]
     cca_type: u8,
@@ -222,8 +226,16 @@ fn run_radio(args: &Args, mut mac: Mac, nic: Box<dyn Nic>) -> Result<()> {
     let mut sdr_rx = pluto.open_rx(&scfg, gain).map_err(|e| anyhow::anyhow!("pluto rx: {e}"))?;
     let mut sdr_tx = pluto.open_tx(&scfg, args.tx_gain).map_err(|e| anyhow::anyhow!("pluto tx: {e}"))?;
     eprintln!("radio: {} @ {} Hz, {} S/s device rate", args.uri, args.freq, DEFAULT_DEVICE_RATE_HZ);
+    if let Some(xo) = args.xo_correction {
+        pluto.set_xo_correction(xo).map_err(|e| anyhow::anyhow!("pluto xo_correction: {e}"))?;
+    }
+    match pluto.xo_correction() {
+        Ok(xo) => eprintln!("oscillator trim (xo_correction): {xo} Hz"),
+        Err(e) => eprintln!("oscillator trim not readable: {e}"),
+    }
     let rx_cfg = RxConfig {
-        cal_offset_db: args.cal_offset_db,
+        cal_offset_db: args.cal_offset_db.unwrap_or(0.0),
+        auto_cal: args.cal_offset_db.is_none(),
         cca_type: if args.cca_type == 2 { s2g_phy::params::rf::CcaType::Type2 } else { s2g_phy::params::rf::CcaType::Type1 },
         ..Default::default()
     };
@@ -237,6 +249,7 @@ fn run_radio(args: &Args, mut mac: Mac, nic: Box<dyn Nic>) -> Result<()> {
         std::thread::spawn(move || {
             let mut dec = s2g_dsp::HalfbandDecim2::new();
             let mut rx = Receiver::new(rx_cfg);
+            let mut cal_announced = false;
             let mut dev = vec![C32::new(0.0, 0.0); 16384];
             let mut native = Vec::with_capacity(8192);
             let mut events = Vec::new();
@@ -246,6 +259,12 @@ fn run_radio(args: &Args, mut mac: Mac, nic: Box<dyn Nic>) -> Result<()> {
                         native.clear();
                         dec.process(&dev[..n], &mut native);
                         rx.process(&native, &mut events);
+                        if !cal_announced {
+                            if let Some(f) = rx.noise_floor_dbfs() {
+                                cal_announced = true;
+                                eprintln!("noise floor {f:.1} dBFS | cal offset {:+.1} dB | energy detect at {:.1} dBFS", rx.cal_offset_db(), -72.0 - rx.cal_offset_db());
+                            }
+                        }
                         for e in events.drain(..) {
                             if msg_tx.send(Msg::Phy(e)).is_err() {
                                 return;
@@ -330,7 +349,12 @@ fn run_radio(args: &Args, mut mac: Mac, nic: Box<dyn Nic>) -> Result<()> {
                     }
                     if let Some(now_mcs) = mac.peer_mcs(&dest) {
                         if rate_seen.insert(dest, now_mcs) != Some(now_mcs) {
-                            eprintln!("rate → {}: MCS {now_mcs}", fmt_mac(&dest));
+                            let cfo = mac
+                                .rate_control()
+                                .peer_cfo_hz(&dest)
+                                .map(|c| format!(" | peer carrier offset {c:+.0} Hz ({:+.1} ppm)", c as f64 / args.freq * 1e6))
+                                .unwrap_or_default();
+                            eprintln!("rate → {}: MCS {now_mcs}{cfo}", fmt_mac(&dest));
                         }
                     }
                 }

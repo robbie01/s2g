@@ -47,6 +47,14 @@ pub struct RxConfig {
     /// dBm thresholds below act directly on dBFS values, which is the only
     /// sane behaviour for an uncalibrated SDR front end.
     pub cal_offset_db: f32,
+    /// Derive the calibration offset from the measured noise floor instead
+    /// of `cal_offset_db`: the quietest 20 ms block of the last second is
+    /// taken to sit at `assumed_noise_floor_dbm`. Puts the CCA thresholds
+    /// and RCPI at sensible levels on an uncalibrated front end.
+    pub auto_cal: bool,
+    /// Noise floor a 2 MHz receiver is assumed to have when `auto_cal` is
+    /// on: kTB (−111 dBm) plus a 7 dB noise figure.
+    pub assumed_noise_floor_dbm: f32,
     /// Energy-detect threshold, dBm [Table 23-37/38: −72 dBm at 2 MHz].
     pub ed_threshold_dbm: f32,
     /// Consecutive Data symbols without signal before declaring
@@ -66,6 +74,8 @@ impl Default for RxConfig {
             emit_cca: true,
             cca_type: rf::CcaType::Type1,
             cal_offset_db: 0.0,
+            auto_cal: false,
+            assumed_noise_floor_dbm: -104.0,
             ed_threshold_dbm: rf::ED_THRESHOLD_2MHZ_DBM,
             carrier_lost_symbols: 4,
             max_ldpc_iterations: 30,
@@ -168,6 +178,14 @@ const MID_WINDOW: u64 = 424;
 const MID_STRIDE: u64 = 80;
 /// Samples per microsecond at the native rate.
 const SAMPLES_PER_US: u64 = 2;
+/// Noise-floor tracking: the minimum energy-detect power per 20 ms block,
+/// the floor being the lowest block of the last second.
+const FLOOR_BLOCK: u64 = 40_000;
+const FLOOR_BLOCKS: usize = 50;
+/// Coarse-CFO alias spacing at LTF sync: the STF autocorrelation (lag 16)
+/// is unambiguous only to ±62.5 kHz, while two ±25 ppm oscillators at
+/// 1250 MHz can sit 62 kHz apart.
+const CFO_ALIAS_HZ: f32 = SAMPLE_RATE_HZ as f32 / 16.0;
 
 enum State {
     Search,
@@ -330,10 +348,22 @@ pub struct Receiver {
     /// A preamble has been detected and the PPDU is being received.
     in_ppdu: bool,
     cca_busy: bool,
+    // ---- noise-floor tracking (auto-calibration) ----
+    /// Quietest energy-detect window of the current 20 ms block, dBFS.
+    floor_block_min: f32,
+    /// Absolute sample at which the current block ends.
+    floor_block_end: u64,
+    /// Per-block minima of the last second (ring buffer).
+    floor_ring: [f32; FLOOR_BLOCKS],
+    floor_ring_len: usize,
+    floor_ring_pos: usize,
+    /// Effective dBFS to dBm offset (configured, or derived from the floor).
+    cal_offset: f32,
 }
 
 impl Receiver {
     pub fn new(cfg: RxConfig) -> Self {
+        let cal_offset_init = cfg.cal_offset_db;
         Self {
             cfg,
             buf: Vec::new(),
@@ -348,7 +378,25 @@ impl Receiver {
             hold_until: None,
             in_ppdu: false,
             cca_busy: false,
+            floor_block_min: f32::INFINITY,
+            floor_block_end: FLOOR_BLOCK,
+            floor_ring: [0.0; FLOOR_BLOCKS],
+            floor_ring_len: 0,
+            floor_ring_pos: 0,
+            cal_offset: cal_offset_init,
         }
+    }
+
+    /// Noise floor measured by the energy detector (quietest 20 ms block of
+    /// the last second), dBFS. `None` until the first block has passed.
+    pub fn noise_floor_dbfs(&self) -> Option<f32> {
+        (self.floor_ring_len > 0).then(|| self.floor_ring[..self.floor_ring_len].iter().cloned().fold(f32::INFINITY, f32::min))
+    }
+
+    /// The dBFS to dBm offset in use (configured, or derived from the noise
+    /// floor when auto-calibration is on).
+    pub fn cal_offset_db(&self) -> f32 {
+        self.cal_offset
     }
 
     /// Drop any in-progress PPDU state and re-arm detection.
@@ -422,7 +470,25 @@ impl Receiver {
     }
 
     fn dbm(&self, dbfs: f32) -> f32 {
-        dbfs + self.cfg.cal_offset_db
+        dbfs + self.cal_offset
+    }
+
+    /// Feed one energy-detect window into the noise-floor tracker.
+    fn track_floor(&mut self, at: u64, p_dbfs: f32) {
+        self.floor_block_min = self.floor_block_min.min(p_dbfs);
+        if at < self.floor_block_end {
+            return;
+        }
+        self.floor_ring[self.floor_ring_pos] = self.floor_block_min;
+        self.floor_ring_pos = (self.floor_ring_pos + 1) % FLOOR_BLOCKS;
+        self.floor_ring_len = (self.floor_ring_len + 1).min(FLOOR_BLOCKS);
+        self.floor_block_min = f32::INFINITY;
+        self.floor_block_end = at + FLOOR_BLOCK;
+        if self.cfg.auto_cal {
+            if let Some(floor) = self.noise_floor_dbfs() {
+                self.cal_offset = self.cfg.assumed_noise_floor_dbm - floor;
+            }
+        }
     }
 
     // ---------------------------------------------------------------- CCA
@@ -464,9 +530,13 @@ impl Receiver {
     fn step_ed(&mut self, events: &mut Vec<RxEvent>) {
         self.ed_abs = self.ed_abs.max(self.buf_abs);
         while self.ed_abs + ED_WINDOW <= self.end_abs() {
-            let p = self.dbm(self.power_dbfs(self.ed_abs, ED_WINDOW as usize));
-            let busy = p > self.cfg.ed_threshold_dbm;
+            let p_dbfs = self.power_dbfs(self.ed_abs, ED_WINDOW as usize);
             let at = self.ed_abs + ED_WINDOW;
+            self.track_floor(at, p_dbfs);
+            let p = self.dbm(p_dbfs);
+            // Until the floor is known an auto-calibrated threshold is
+            // meaningless: report IDLE rather than a spurious 20 ms BUSY.
+            let busy = p > self.cfg.ed_threshold_dbm && !(self.cfg.auto_cal && self.floor_ring_len == 0);
             self.ed_abs += ED_STRIDE;
             if busy != self.ed_busy {
                 self.ed_busy = busy;
@@ -616,10 +686,22 @@ impl Receiver {
         // Need the rest of STF + GI2 + 2×LTS + margin. The search span
         // tolerates a trigger up to ~160 samples before the true STF start.
         const SPAN: usize = 480;
-        let Some(slice) = self.extract(trig, SPAN, coarse, trig) else {
+        if self.extract(trig, SPAN, coarse, trig).is_none() {
             return false;
-        };
-        let Some(r) = sync::ltf_sync(&slice, 0, SPAN - 128, coarse) else {
+        }
+        // The coarse estimate is modulo 125 kHz; the LTF cross-correlation
+        // only peaks for the right alias, so try the neighbours as well.
+        let mut best: Option<sync::SyncResult> = None;
+        for k in [0.0f32, 1.0, -1.0] {
+            let cand = coarse + k * CFO_ALIAS_HZ;
+            let slice = self.extract(trig, SPAN, cand, trig).expect("buffered");
+            if let Some(r) = sync::ltf_sync(&slice, 0, SPAN - 128, cand) {
+                if best.as_ref().is_none_or(|b| r.quality > b.quality) {
+                    best = Some(r);
+                }
+            }
+        }
+        let Some(r) = best else {
             // False alarm: resume scanning shortly after the trigger.
             self.rearm(trig + 64, trig + 64, None, events);
             return true;
