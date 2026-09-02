@@ -101,6 +101,12 @@ struct Args {
     /// Let mDNS/LLMNR/SSDP/WS-Discovery/NetBIOS/SMB through
     #[arg(long)]
     allow_discovery: bool,
+    /// Let every ESP packet through, not only those recognised as ESP-NULL
+    #[arg(long)]
+    allow_esp: bool,
+    /// Let IPv6 destinations outside link-local/multicast/ULA through (tunnels always may)
+    #[arg(long)]
+    allow_global: bool,
 
     /// Pluto iiod address
     #[arg(long, default_value = "192.168.2.1")]
@@ -216,6 +222,8 @@ fn main() -> Result<()> {
         f.allow_dhcpv6 = args.allow_dhcpv6;
         f.allow_mld = args.allow_mld;
         f.allow_discovery = args.allow_discovery;
+        f.allow_esp = args.allow_esp;
+        f.allow_global_dst = args.allow_global;
         for p in &args.block_port {
             if !f.blocked_ports.contains(p) {
                 f.blocked_ports.push(*p);

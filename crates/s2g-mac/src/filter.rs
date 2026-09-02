@@ -6,14 +6,21 @@
 //! IPv6-only, router discovery and DHCPv6 when addressing is static and
 //! routing comes from Babel, and the whole zoo of LAN discovery protocols
 //! (mDNS, LLMNR, SSDP, WS-Discovery). Part 97 also forbids obscuring the
-//! meaning of a transmission, which rules out SSH and TLS.
+//! meaning of a transmission, which rules out SSH, TLS and encrypted ESP.
 //!
 //! The filter is a pure function of one Ethernet frame — no connection
-//! tracking, no state — and is applied to frames leaving for the air and,
-//! by default, to frames arriving from it. Everything not explicitly
-//! blocked passes: neighbour discovery (NS/NA, needed to resolve link-local
+//! tracking, no state — applied to frames leaving for the air and, by
+//! default, to frames arriving from it. Everything not explicitly blocked
+//! passes: neighbour discovery (NS/NA, needed to resolve link-local
 //! addresses on the link), ICMPv6 echo and errors, Babel (UDP 6696 on
-//! ff02::1:6), DNS, NTP, HTTP, OSPFv3, anything unlisted.
+//! ff02::1:6), DNS, NTP, HTTP, OSPFv3, AH, anything unlisted.
+//!
+//! Tunnels are looked into rather than trusted: IPv6-in-IPv6, GRE, VXLAN
+//! and ESP-NULL payloads are checked with the same rules (the inner
+//! destination may be global, the rest still applies). ESP is recognised as
+//! ESP-NULL by the RFC 5879 heuristic — RFC 4303 default padding plus a
+//! plausible inner header for one of the usual ICV lengths — and dropped
+//! as encrypted otherwise.
 //!
 //! Defaults, and the reasoning behind them, are in the README section
 //! "Good-neighbour filter".
@@ -36,18 +43,22 @@ pub struct FilterConfig {
     /// Apply the filter to frames arriving from the air before they reach
     /// the host.
     pub ingress: bool,
-    /// Allow IPv4 and ARP (default: IPv6 only).
+    /// Allow IPv4 and ARP (default: IPv6 only, tunnels included).
     pub allow_ipv4: bool,
+    /// Allow IPv6 destinations outside link-local, multicast and ULA
+    /// scope (the inner packet of a tunnel is always allowed to be global).
+    pub allow_global_dst: bool,
     /// Allow ICMPv6 Router Solicitation / Advertisement / Redirect.
     pub allow_router_discovery: bool,
     /// Allow DHCPv6 (UDP 546/547).
     pub allow_dhcpv6: bool,
-    /// Allow MLD (ICMPv6 130–132, 143).
+    /// Allow MLD (ICMPv6 130–132, 143) and Multicast Router Discovery
+    /// (151–153).
     pub allow_mld: bool,
     /// Allow LAN discovery chatter: mDNS, LLMNR, SSDP, WS-Discovery,
     /// NetBIOS/SMB, NAT-PMP/PCP.
     pub allow_discovery: bool,
-    /// Allow IPsec ESP (next header 50), i.e. encrypted payloads.
+    /// Allow every ESP packet, not only those recognised as ESP-NULL.
     pub allow_esp: bool,
     /// Allow non-IPv6 EtherTypes other than the identification frame:
     /// VLAN tags, LLDP, PPPoE, EAPOL, 802.3/LLC (STP) and the rest.
@@ -56,16 +67,10 @@ pub struct FilterConfig {
     pub blocked_ports: Vec<u16>,
 }
 
-/// Encrypted-transport ports Part 97 operation cannot carry: SSH and
-/// HTTPS/QUIC by default.
-pub const DEFAULT_BLOCKED_PORTS: [u16; 2] = [22, 443];
-
-/// Further ports worth blocking on an amateur link (all encrypted
-/// transports): DNS over TLS, SMTPS, IMAPS, POP3S, RDP, IKE and IPsec
-/// NAT-T, WireGuard, HTTPS alternate. Listed here so `--block-port` has a
-/// documented menu; not on by default because the operator asked for 22
-/// and 443.
-pub const RECOMMENDED_EXTRA_PORTS: [u16; 9] = [853, 465, 993, 995, 3389, 500, 4500, 51820, 8443];
+/// Encrypted-transport ports a Part 97 link cannot carry: SSH, HTTPS/QUIC,
+/// DNS over TLS, SMTPS, IMAPS, POP3S, RDP, IKE and IPsec NAT-T, WireGuard,
+/// HTTPS alternate.
+pub const DEFAULT_BLOCKED_PORTS: [u16; 11] = [22, 443, 853, 465, 993, 995, 3389, 500, 4500, 51820, 8443];
 
 impl FilterConfig {
     /// The default policy described in the module documentation.
@@ -74,6 +79,7 @@ impl FilterConfig {
             egress: true,
             ingress: true,
             allow_ipv4: false,
+            allow_global_dst: false,
             allow_router_discovery: false,
             allow_dhcpv6: false,
             allow_mld: false,
@@ -90,6 +96,7 @@ impl FilterConfig {
             egress: false,
             ingress: false,
             allow_ipv4: true,
+            allow_global_dst: true,
             allow_router_discovery: true,
             allow_dhcpv6: true,
             allow_mld: true,
@@ -114,6 +121,9 @@ impl FilterConfig {
         if !self.allow_ipv4 {
             parts.push("IPv6 only".into());
         }
+        if !self.allow_global_dst {
+            parts.push("destinations link-local/multicast/ULA (tunnels exempt)".into());
+        }
         if !self.allow_router_discovery {
             parts.push("no RA/RS/redirect".into());
         }
@@ -121,13 +131,13 @@ impl FilterConfig {
             parts.push("no DHCPv6".into());
         }
         if !self.allow_mld {
-            parts.push("no MLD".into());
+            parts.push("no MLD/MRD".into());
         }
         if !self.allow_discovery {
             parts.push("no mDNS/LLMNR/SSDP/WSD/NetBIOS".into());
         }
         if !self.allow_esp {
-            parts.push("no ESP".into());
+            parts.push("ESP-NULL only".into());
         }
         if !self.blocked_ports.is_empty() {
             let p: Vec<String> = self.blocked_ports.iter().map(|p| p.to_string()).collect();
@@ -143,8 +153,11 @@ impl Default for FilterConfig {
     }
 }
 
+const ETHERTYPE_IPV4: u16 = 0x0800;
 const ETHERTYPE_IPV6: u16 = 0x86DD;
 const ETHERTYPE_IDENT: u16 = crate::ident::ETHERTYPE_IDENT;
+/// Tunnel nesting the filter follows before giving up.
+const MAX_DEPTH: u8 = 3;
 
 /// IPv6 extension headers the walk steps over.
 fn is_extension(nh: u8) -> bool {
@@ -183,36 +196,60 @@ fn port_reason(port: u16) -> &'static str {
     }
 }
 
+/// Link-local (fe80::/10), multicast (ff00::/8) or ULA (fc00::/7).
+fn scope_ok(dst: &[u8]) -> bool {
+    dst[0] == 0xff || (dst[0] == 0xfe && dst[1] & 0xc0 == 0x80) || dst[0] & 0xfe == 0xfc
+}
+
 /// Classify one Ethernet frame (destination, source, EtherType, payload).
 pub fn check(cfg: &FilterConfig, frame: &[u8]) -> Verdict {
+    check_frame(cfg, frame, 0, cfg.allow_global_dst)
+}
+
+fn check_frame(cfg: &FilterConfig, frame: &[u8], depth: u8, global_ok: bool) -> Verdict {
     if frame.len() < 14 {
         return Verdict::Drop("runt frame");
     }
     let ethertype = u16::from_be_bytes([frame[12], frame[13]]);
+    check_ethertype(cfg, ethertype, &frame[14..], depth, global_ok)
+}
+
+fn check_ethertype(cfg: &FilterConfig, ethertype: u16, payload: &[u8], depth: u8, global_ok: bool) -> Verdict {
     match ethertype {
-        ETHERTYPE_IDENT => return Verdict::Pass,
-        ETHERTYPE_IPV6 => {}
-        0x0800 | 0x0806 | 0x8035 => {
+        ETHERTYPE_IDENT => Verdict::Pass,
+        ETHERTYPE_IPV6 => check_ipv6(cfg, payload, depth, global_ok),
+        ETHERTYPE_IPV4 | 0x0806 | 0x8035 => {
             if !cfg.allow_ipv4 {
-                return Verdict::Drop(ethertype_name(ethertype));
+                return Verdict::Drop(if depth > 0 { "IPv4 tunnelled in IPv6" } else { ethertype_name(ethertype) });
             }
-            if ethertype == 0x0800 {
-                return check_ipv4(cfg, &frame[14..]);
+            if ethertype == ETHERTYPE_IPV4 {
+                check_ipv4(cfg, payload, depth)
+            } else {
+                Verdict::Pass
             }
-            return Verdict::Pass;
         }
         _ => {
-            return if cfg.allow_other_ethertypes { Verdict::Pass } else { Verdict::Drop(ethertype_name(ethertype)) };
+            if cfg.allow_other_ethertypes {
+                Verdict::Pass
+            } else {
+                Verdict::Drop(ethertype_name(ethertype))
+            }
         }
     }
-    let ip = &frame[14..];
+}
+
+/// One IPv6 packet: scope rule, extension-header walk, transport rules,
+/// tunnels followed.
+fn check_ipv6(cfg: &FilterConfig, ip: &[u8], depth: u8, global_ok: bool) -> Verdict {
     if ip.len() < 40 || ip[0] >> 4 != 6 {
         return Verdict::Drop("malformed IPv6 header");
+    }
+    if !global_ok && !scope_ok(&ip[24..40]) {
+        return Verdict::Drop("destination not link-local, multicast or ULA");
     }
     // Walk extension headers to the transport header.
     let mut nh = ip[6];
     let mut pos = 40usize;
-    let mut fragment_tail = false;
     while is_extension(nh) {
         if pos + 8 > ip.len() {
             return Verdict::Drop("truncated IPv6 extension header");
@@ -223,23 +260,43 @@ pub fn check(cfg: &FilterConfig, frame: &[u8]) -> Verdict {
                 // Fragment header: a nonzero offset means the transport
                 // header is in another packet; nothing more to see here.
                 let off = u16::from_be_bytes([ip[pos + 2], ip[pos + 3]]) >> 3;
-                fragment_tail = off != 0;
+                if off != 0 {
+                    return Verdict::Pass;
+                }
                 8
             }
-            51 => (ip[pos + 1] as usize + 2) * 4, // AH
+            51 => (ip[pos + 1] as usize + 2) * 4, // AH: authentication only, fine
             _ => (ip[pos + 1] as usize + 1) * 8,
         };
         nh = next;
         pos += len;
-        if fragment_tail {
-            return Verdict::Pass;
-        }
     }
+    let rest = ip.get(pos..).unwrap_or(&[]);
+    check_transport(cfg, nh, rest, depth)
+}
+
+/// Transport-level rules shared by IPv6, tunnels and ESP-NULL payloads.
+fn check_transport(cfg: &FilterConfig, nh: u8, data: &[u8], depth: u8) -> Verdict {
     match nh {
-        4 => Verdict::Drop("IPv4 tunnelled in IPv6"),
-        50 if !cfg.allow_esp => Verdict::Drop("IPsec ESP (encrypted)"),
-        58 => check_icmpv6(cfg, ip.get(pos..).unwrap_or(&[])),
-        6 | 17 => check_ports(cfg, nh, ip.get(pos..).unwrap_or(&[])),
+        4 => {
+            if cfg.allow_ipv4 {
+                check_ipv4(cfg, data, depth + 1)
+            } else {
+                Verdict::Drop("IPv4 tunnelled in IPv6")
+            }
+        }
+        41 => {
+            // IPv6-in-IPv6: the inner packet may be for anywhere, the
+            // other rules still apply to it.
+            if depth >= MAX_DEPTH {
+                return Verdict::Drop("tunnel nested too deep");
+            }
+            check_ipv6(cfg, data, depth + 1, true)
+        }
+        47 => check_gre(cfg, data, depth),
+        50 => check_esp(cfg, data, depth),
+        58 => check_icmpv6(cfg, data),
+        6 | 17 => check_ports(cfg, nh, data, depth),
         _ => Verdict::Pass,
     }
 }
@@ -251,11 +308,12 @@ fn check_icmpv6(cfg: &FilterConfig, icmp: &[u8]) -> Verdict {
         134 if !cfg.allow_router_discovery => Verdict::Drop("ICMPv6 Router Advertisement"),
         137 if !cfg.allow_router_discovery => Verdict::Drop("ICMPv6 Redirect"),
         130 | 131 | 132 | 143 if !cfg.allow_mld => Verdict::Drop("MLD"),
+        151 | 152 | 153 if !cfg.allow_mld => Verdict::Drop("Multicast Router Discovery"),
         _ => Verdict::Pass,
     }
 }
 
-fn check_ports(cfg: &FilterConfig, proto: u8, transport: &[u8]) -> Verdict {
+fn check_ports(cfg: &FilterConfig, proto: u8, transport: &[u8], depth: u8) -> Verdict {
     if transport.len() < 4 {
         return Verdict::Drop("truncated transport header");
     }
@@ -288,11 +346,98 @@ fn check_ports(cfg: &FilterConfig, proto: u8, transport: &[u8]) -> Verdict {
             }
         }
     }
+    // VXLAN carries a whole Ethernet frame after an 8-octet header.
+    if udp && dst == 4789 && transport.len() >= 16 + 14 {
+        if depth >= MAX_DEPTH {
+            return Verdict::Drop("tunnel nested too deep");
+        }
+        return check_frame(cfg, &transport[16..], depth + 1, true);
+    }
     Verdict::Pass
 }
 
+/// GRE (RFC 2784/2890): flags, version, protocol type, optional checksum,
+/// key and sequence fields, then the payload named by the protocol type.
+fn check_gre(cfg: &FilterConfig, gre: &[u8], depth: u8) -> Verdict {
+    if gre.len() < 4 {
+        return Verdict::Drop("truncated GRE header");
+    }
+    if depth >= MAX_DEPTH {
+        return Verdict::Drop("tunnel nested too deep");
+    }
+    let flags = gre[0];
+    let proto = u16::from_be_bytes([gre[2], gre[3]]);
+    let mut hdr = 4;
+    if flags & 0x80 != 0 {
+        hdr += 4; // checksum + reserved
+    }
+    if flags & 0x20 != 0 {
+        hdr += 4; // key
+    }
+    if flags & 0x10 != 0 {
+        hdr += 4; // sequence number
+    }
+    let inner = gre.get(hdr..).unwrap_or(&[]);
+    match proto {
+        // Transparent Ethernet bridging: a whole frame.
+        0x6558 => check_frame(cfg, inner, depth + 1, true),
+        _ => check_ethertype(cfg, proto, inner, depth + 1, true),
+    }
+}
+
+/// ESP (RFC 4303): SPI, sequence number, payload, padding, pad length,
+/// next header, ICV. Without the SA we cannot know the cipher, so we
+/// apply the RFC 5879 heuristic: for each usual ICV length the trailer
+/// must show RFC 4303 default padding (1, 2, 3, …) and a next-header value
+/// whose payload parses. Then the payload is checked like any other
+/// packet. Anything else is treated as encrypted.
+fn check_esp(cfg: &FilterConfig, esp: &[u8], depth: u8) -> Verdict {
+    if cfg.allow_esp {
+        return Verdict::Pass;
+    }
+    if esp.len() < 8 + 2 {
+        return Verdict::Drop("truncated ESP");
+    }
+    if depth >= MAX_DEPTH {
+        return Verdict::Drop("tunnel nested too deep");
+    }
+    for icv in [12usize, 16, 24, 32, 0] {
+        if esp.len() < 8 + 2 + icv {
+            continue;
+        }
+        let trailer_end = esp.len() - icv;
+        let nh = esp[trailer_end - 1];
+        let pad_len = esp[trailer_end - 2] as usize;
+        if 8 + pad_len + 2 > trailer_end {
+            continue;
+        }
+        let padding = &esp[trailer_end - 2 - pad_len..trailer_end - 2];
+        if padding.iter().enumerate().any(|(i, &b)| b as usize != i + 1) {
+            continue;
+        }
+        let inner = &esp[8..trailer_end - 2 - pad_len];
+        let plausible = match nh {
+            41 => inner.len() >= 40 && inner[0] >> 4 == 6 && u16::from_be_bytes([inner[4], inner[5]]) as usize <= inner.len() - 40,
+            4 => inner.len() >= 20 && inner[0] >> 4 == 4,
+            6 => inner.len() >= 20 && (inner[12] >> 4) >= 5,
+            17 => inner.len() >= 8 && u16::from_be_bytes([inner[4], inner[5]]) as usize == inner.len(),
+            58 => inner.len() >= 4,
+            59 => true, // dummy packet (RFC 4303 2.6): nothing inside
+            _ => false,
+        };
+        if !plausible {
+            continue;
+        }
+        return match nh {
+            59 => Verdict::Pass,
+            _ => check_transport(cfg, nh, inner, depth + 1),
+        };
+    }
+    Verdict::Drop("IPsec ESP (encrypted, or ESP-NULL without RFC 4303 default padding)")
+}
+
 /// Only reached when IPv4 is allowed: still apply the port rules.
-fn check_ipv4(cfg: &FilterConfig, ip: &[u8]) -> Verdict {
+fn check_ipv4(cfg: &FilterConfig, ip: &[u8], depth: u8) -> Verdict {
     if ip.len() < 20 || ip[0] >> 4 != 4 {
         return Verdict::Drop("malformed IPv4 header");
     }
@@ -302,9 +447,11 @@ fn check_ipv4(cfg: &FilterConfig, ip: &[u8]) -> Verdict {
     if frag_off != 0 {
         return Verdict::Pass;
     }
+    let rest = ip.get(ihl..).unwrap_or(&[]);
     match proto {
-        6 | 17 => check_ports(cfg, proto, ip.get(ihl..).unwrap_or(&[])),
-        50 if !cfg.allow_esp => Verdict::Drop("IPsec ESP (encrypted)"),
+        6 | 17 => check_ports(cfg, proto, rest, depth),
+        47 => check_gre(cfg, rest, depth),
+        50 => check_esp(cfg, rest, depth),
         _ => Verdict::Pass,
     }
 }
@@ -313,6 +460,11 @@ fn check_ipv4(cfg: &FilterConfig, ip: &[u8]) -> Verdict {
 mod tests {
     use super::*;
 
+    const LL_DST: [u8; 16] = [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+    const MC_DST: [u8; 16] = [0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+    const ULA_DST: [u8; 16] = [0xfd, 0x12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+    const GLOBAL_DST: [u8; 16] = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+
     fn eth(ethertype: u16, payload: &[u8]) -> Vec<u8> {
         let mut f = vec![0x33, 0x33, 0, 0, 0, 1, 2, 0, 0, 0, 0, 9];
         f.extend_from_slice(&ethertype.to_be_bytes());
@@ -320,15 +472,19 @@ mod tests {
         f
     }
 
-    fn ipv6(next: u8, payload: &[u8]) -> Vec<u8> {
+    fn ipv6_to(dst: [u8; 16], next: u8, payload: &[u8]) -> Vec<u8> {
         let mut p = vec![0x60, 0, 0, 0];
         p.extend_from_slice(&(payload.len() as u16).to_be_bytes());
         p.push(next);
         p.push(64);
         p.extend_from_slice(&[0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
-        p.extend_from_slice(&[0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        p.extend_from_slice(&dst);
         p.extend_from_slice(payload);
         p
+    }
+
+    fn ipv6(next: u8, payload: &[u8]) -> Vec<u8> {
+        ipv6_to(MC_DST, next, payload)
     }
 
     fn udp(src: u16, dst: u16) -> Vec<u8> {
@@ -342,11 +498,27 @@ mod tests {
     fn tcp(src: u16, dst: u16) -> Vec<u8> {
         let mut t = udp(src, dst);
         t.resize(20, 0);
+        t[12] = 0x50;
         t
     }
 
     fn icmpv6(ty: u8) -> Vec<u8> {
         vec![ty, 0, 0, 0, 0, 0, 0, 0]
+    }
+
+    /// ESP-NULL packet: SPI, seq, inner, RFC 4303 padding, pad len, next
+    /// header, ICV of `icv` octets.
+    fn esp_null(next: u8, inner: &[u8], icv: usize) -> Vec<u8> {
+        let mut p = vec![0, 0, 0, 7, 0, 0, 0, 1];
+        p.extend_from_slice(inner);
+        let pad = (4 - (inner.len() + 2) % 4) % 4;
+        for i in 0..pad {
+            p.push(i as u8 + 1);
+        }
+        p.push(pad as u8);
+        p.push(next);
+        p.extend(std::iter::repeat_n(0xAB, icv));
+        p
     }
 
     fn v(frame: &[u8]) -> Verdict {
@@ -369,12 +541,12 @@ mod tests {
         assert_eq!(v(&eth(0x86DD, &ipv6(6, &tcp(51000, 443)))), Verdict::Drop("HTTPS/QUIC (port 443)"));
         assert_eq!(v(&eth(0x86DD, &ipv6(6, &tcp(22, 51000)))), Verdict::Drop("SSH (port 22)"));
         assert_eq!(v(&eth(0x86DD, &ipv6(17, &udp(51000, 443)))), Verdict::Drop("HTTPS/QUIC (port 443)"));
+        assert_eq!(v(&eth(0x86DD, &ipv6(17, &udp(51820, 51820)))), Verdict::Drop("WireGuard (port 51820)"));
+        assert_eq!(v(&eth(0x86DD, &ipv6(6, &tcp(51000, 853)))), Verdict::Drop("DNS over TLS (port 853)"));
         assert_eq!(v(&eth(0x86DD, &ipv6(6, &tcp(51000, 80)))), Verdict::Pass);
-        // Extra ports opt in.
         let mut cfg = FilterConfig::good_neighbor();
-        cfg.blocked_ports.push(51820);
-        assert_eq!(check(&cfg, &eth(0x86DD, &ipv6(17, &udp(51820, 51820)))), Verdict::Drop("WireGuard (port 51820)"));
-        assert_eq!(v(&eth(0x86DD, &ipv6(17, &udp(51820, 51820)))), Verdict::Pass);
+        cfg.blocked_ports.retain(|&p| p != 443);
+        assert_eq!(check(&cfg, &eth(0x86DD, &ipv6(6, &tcp(51000, 443)))), Verdict::Pass);
     }
 
     #[test]
@@ -383,19 +555,93 @@ mod tests {
         assert_eq!(v(&eth(0x86DD, &ipv6(58, &icmpv6(134)))), Verdict::Drop("ICMPv6 Router Advertisement"));
         assert_eq!(v(&eth(0x86DD, &ipv6(58, &icmpv6(137)))), Verdict::Drop("ICMPv6 Redirect"));
         assert_eq!(v(&eth(0x86DD, &ipv6(58, &icmpv6(143)))), Verdict::Drop("MLD"));
+        assert_eq!(v(&eth(0x86DD, &ipv6(58, &icmpv6(151)))), Verdict::Drop("Multicast Router Discovery"));
         assert_eq!(v(&eth(0x86DD, &ipv6(17, &udp(546, 547)))), Verdict::Drop("DHCPv6"));
         assert_eq!(v(&eth(0x86DD, &ipv6(17, &udp(5353, 5353)))), Verdict::Drop("mDNS"));
         assert_eq!(v(&eth(0x86DD, &ipv6(17, &udp(50000, 5355)))), Verdict::Drop("LLMNR"));
         assert_eq!(v(&eth(0x86DD, &ipv6(17, &udp(50000, 1900)))), Verdict::Drop("SSDP/UPnP"));
         assert_eq!(v(&eth(0x86DD, &ipv6(17, &udp(50000, 3702)))), Verdict::Drop("WS-Discovery"));
         assert_eq!(v(&eth(0x86DD, &ipv6(6, &tcp(50000, 445)))), Verdict::Drop("SMB"));
-        assert_eq!(v(&eth(0x86DD, &ipv6(50, &[0; 16]))), Verdict::Drop("IPsec ESP (encrypted)"));
         assert_eq!(v(&eth(0x86DD, &ipv6(4, &[0x45; 20]))), Verdict::Drop("IPv4 tunnelled in IPv6"));
     }
 
     #[test]
+    fn destination_scope() {
+        let babel = udp(6696, 6696);
+        assert_eq!(v(&eth(0x86DD, &ipv6_to(LL_DST, 17, &babel))), Verdict::Pass);
+        assert_eq!(v(&eth(0x86DD, &ipv6_to(MC_DST, 17, &babel))), Verdict::Pass);
+        assert_eq!(v(&eth(0x86DD, &ipv6_to(ULA_DST, 17, &babel))), Verdict::Pass);
+        assert_eq!(v(&eth(0x86DD, &ipv6_to(GLOBAL_DST, 17, &babel))), Verdict::Drop("destination not link-local, multicast or ULA"));
+        let mut cfg = FilterConfig::good_neighbor();
+        cfg.allow_global_dst = true;
+        assert_eq!(check(&cfg, &eth(0x86DD, &ipv6_to(GLOBAL_DST, 17, &babel))), Verdict::Pass);
+        // A global destination inside an IPv6-in-IPv6 tunnel to a ULA peer
+        // is fine; a blocked port inside the tunnel is still blocked.
+        let inner_ok = ipv6_to(GLOBAL_DST, 17, &udp(40000, 53));
+        assert_eq!(v(&eth(0x86DD, &ipv6_to(ULA_DST, 41, &inner_ok))), Verdict::Pass);
+        let inner_bad = ipv6_to(GLOBAL_DST, 6, &tcp(40000, 443));
+        assert_eq!(v(&eth(0x86DD, &ipv6_to(ULA_DST, 41, &inner_bad))), Verdict::Drop("HTTPS/QUIC (port 443)"));
+        // But a tunnel to a global outer destination is not.
+        assert_eq!(v(&eth(0x86DD, &ipv6_to(GLOBAL_DST, 41, &inner_ok))), Verdict::Drop("destination not link-local, multicast or ULA"));
+    }
+
+    #[test]
+    fn tunnels_are_looked_into() {
+        // GRE carrying IPv4: dropped. GRE carrying IPv6 to a global host: fine.
+        let mut gre4 = vec![0, 0, 0x08, 0x00];
+        gre4.extend_from_slice(&[0x45; 24]);
+        assert_eq!(v(&eth(0x86DD, &ipv6_to(ULA_DST, 47, &gre4))), Verdict::Drop("IPv4 tunnelled in IPv6"));
+        let mut gre6 = vec![0x20, 0, 0x86, 0xDD, 0, 0, 0, 5]; // key present
+        gre6.extend_from_slice(&ipv6_to(GLOBAL_DST, 17, &udp(1, 80)));
+        assert_eq!(v(&eth(0x86DD, &ipv6_to(ULA_DST, 47, &gre6))), Verdict::Pass);
+        // GRE bridging a whole Ethernet frame that carries ARP: dropped.
+        let mut greb = vec![0, 0, 0x65, 0x58];
+        greb.extend_from_slice(&eth(0x0806, &[0; 28]));
+        assert_eq!(v(&eth(0x86DD, &ipv6_to(ULA_DST, 47, &greb))), Verdict::Drop("IPv4 tunnelled in IPv6"));
+        // VXLAN with an inner IPv6 frame to a global address: fine; inner IPv4: dropped.
+        let mut vx6 = udp(40000, 4789);
+        vx6.truncate(8);
+        vx6.extend_from_slice(&[0x08, 0, 0, 0, 0, 0, 1, 0]);
+        let mut vx4 = vx6.clone();
+        vx6.extend_from_slice(&eth(0x86DD, &ipv6_to(GLOBAL_DST, 17, &udp(1, 80))));
+        vx4.extend_from_slice(&eth(0x0800, &[0x45; 40]));
+        assert_eq!(v(&eth(0x86DD, &ipv6_to(ULA_DST, 17, &vx6))), Verdict::Pass);
+        assert_eq!(v(&eth(0x86DD, &ipv6_to(ULA_DST, 17, &vx4))), Verdict::Drop("IPv4 tunnelled in IPv6"));
+    }
+
+    #[test]
+    fn esp_null_passes_and_is_inspected_encrypted_esp_is_dropped() {
+        // ESP-NULL tunnel mode: inner IPv6 to a global host, HMAC-SHA1-96 ICV.
+        let inner = ipv6_to(GLOBAL_DST, 17, &udp(40000, 53));
+        for icv in [12usize, 16, 32] {
+            assert_eq!(v(&eth(0x86DD, &ipv6_to(ULA_DST, 50, &esp_null(41, &inner, icv)))), Verdict::Pass, "icv {icv}");
+        }
+        // ESP-NULL transport mode carrying TCP 443: the port rule still bites.
+        assert_eq!(v(&eth(0x86DD, &ipv6_to(ULA_DST, 50, &esp_null(6, &tcp(1, 443), 12)))), Verdict::Drop("HTTPS/QUIC (port 443)"));
+        // ESP-NULL carrying IPv4: dropped like any tunnelled IPv4.
+        assert_eq!(v(&eth(0x86DD, &ipv6_to(ULA_DST, 50, &esp_null(4, &[0x45; 24], 12)))), Verdict::Drop("IPv4 tunnelled in IPv6"));
+        // A dummy packet (next header 59) passes.
+        assert_eq!(v(&eth(0x86DD, &ipv6_to(ULA_DST, 50, &esp_null(59, &[], 12)))), Verdict::Pass);
+        // Ciphertext: no default padding, no plausible next header.
+        let mut enc = vec![0, 0, 0, 7, 0, 0, 0, 1];
+        enc.extend((0..60u32).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8));
+        assert_eq!(
+            v(&eth(0x86DD, &ipv6_to(ULA_DST, 50, &enc))),
+            Verdict::Drop("IPsec ESP (encrypted, or ESP-NULL without RFC 4303 default padding)")
+        );
+        // Explicitly allowed: anything.
+        let mut cfg = FilterConfig::good_neighbor();
+        cfg.allow_esp = true;
+        assert_eq!(check(&cfg, &eth(0x86DD, &ipv6_to(ULA_DST, 50, &enc))), Verdict::Pass);
+        // AH transport mode in front of Babel is an extension header: fine.
+        let mut ah = vec![17u8, 4, 0, 0, 0, 0, 0, 9, 0, 0, 0, 1];
+        ah.extend_from_slice(&[0xCC; 12]);
+        ah.extend_from_slice(&udp(6696, 6696));
+        assert_eq!(v(&eth(0x86DD, &ipv6_to(LL_DST, 51, &ah))), Verdict::Pass);
+    }
+
+    #[test]
     fn what_a_babel_mesh_needs_passes() {
-        // Neighbour discovery, echo, errors, Babel, DNS, NTP, OSPFv3.
         for ty in [135u8, 136, 128, 129, 1, 2, 3, 4] {
             assert_eq!(v(&eth(0x86DD, &ipv6(58, &icmpv6(ty)))), Verdict::Pass, "ICMPv6 type {ty}");
         }
@@ -404,7 +650,7 @@ mod tests {
         assert_eq!(v(&eth(0x86DD, &ipv6(17, &udp(123, 123)))), Verdict::Pass);
         assert_eq!(v(&eth(0x86DD, &ipv6(89, &[0; 16]))), Verdict::Pass);
         // Hop-by-hop options in front of Babel are walked, not dropped.
-        let mut hbh = vec![17u8, 0, 5, 2, 0, 0, 1, 0]; // next = UDP, len 0 (8 octets), router alert
+        let mut hbh = vec![17u8, 0, 5, 2, 0, 0, 1, 0];
         hbh.extend_from_slice(&udp(6696, 6696));
         assert_eq!(v(&eth(0x86DD, &ipv6(0, &hbh))), Verdict::Pass);
         // Hop-by-hop in front of an RA is still an RA.
@@ -432,6 +678,7 @@ mod tests {
         cfg.allow_router_discovery = true;
         assert_eq!(check(&cfg, &eth(0x86DD, &ipv6(58, &icmpv6(134)))), Verdict::Pass);
         assert!(FilterConfig::good_neighbor().describe().contains("IPv6 only"));
+        assert!(FilterConfig::good_neighbor().describe().contains("ESP-NULL only"));
         assert_eq!(FilterConfig::off().describe(), "off");
     }
 }

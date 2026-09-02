@@ -220,35 +220,82 @@ something the software can enforce.
 
 `s2g-node` runs a stateless frame filter (`s2g_mac::filter`) on every frame headed for
 the air and, by default, on every frame received from it. No connection tracking: each
-Ethernet frame is judged on its own. The default policy drops
+Ethernet frame is judged on its own, tunnels included. The default policy drops
 
 | Dropped | Why |
 |---|---|
-| TCP or UDP with source or destination port 22 or 443 | SSH and HTTPS/QUIC obscure meaning, which Part 97 forbids |
-| Anything that is not IPv6 (IPv4, ARP, RARP, VLAN tags, LLDP, PPPoE, EAPOL, 802.3/LLC such as STP), plus IPv4 tunnelled in IPv6 | The link is IPv6-only; this also silences DHCP, IGMP, NetBIOS over IPv4 and the rest of the IPv4 background noise in one rule |
+| TCP or UDP with source or destination port 22, 443, 853, 465, 993, 995, 3389, 500, 4500, 51820 or 8443 | SSH, HTTPS/QUIC, DNS over TLS, SMTPS, IMAPS, POP3S, RDP, IKE/IPsec NAT-T, WireGuard, HTTPS alternate: encrypted transports, which Part 97 forbids |
+| Anything that is not IPv6 (IPv4, ARP, RARP, VLAN tags, LLDP, PPPoE, EAPOL, 802.3/LLC such as STP) | The link is IPv6-only; this also silences DHCP, IGMP, NetBIOS over IPv4 and the rest of the IPv4 background noise in one rule |
+| IPv4 inside a tunnel: next header 4 (4in6), GRE with protocol 0x0800 or a bridged frame carrying IPv4/ARP, VXLAN with an inner IPv4 frame, IPv4 inside ESP-NULL | Same rule, seen through the encapsulation |
+| IPv6 whose destination is not link-local (fe80::/10), multicast (ff00::/8) or ULA (fc00::/7) | The mesh is a private IPv6 island; nothing on it should be addressed to the global Internet. The inner packet of a tunnel may go anywhere, only the outer destination must be a mesh scope |
 | ICMPv6 Router Solicitation, Router Advertisement, Redirect | SLAAC is off; addresses are static and routes come from Babel |
 | DHCPv6 (UDP 546/547) | Same reason |
-| MLD (ICMPv6 130–132, 143) | A radio link has no snooping switch, multicast is flooded anyway, and hosts otherwise report every group join |
-| mDNS, LLMNR, SSDP/UPnP, WS-Discovery, NetBIOS, SMB, NAT-PMP/PCP | LAN discovery chatter with nothing to discover over a mesh link |
-| IPsec ESP | Encrypted payloads |
+| MLD (ICMPv6 130 to 132, 143) and Multicast Router Discovery (151 to 153) | A radio link has no snooping switch, multicast is flooded anyway, and hosts otherwise report every group join; MRD exists only to let such switches find multicast routers |
+| mDNS, LLMNR, SSDP/UPnP, WS-Discovery, NetBIOS, SMB, NAT-PMP/PCP | LAN discovery chatter, discussed below |
+| ESP that is not recognisably ESP-NULL | Encrypted payloads |
 
 Everything else passes: neighbour solicitation and advertisement (needed to resolve
 link-local addresses on the link), ICMPv6 echo and errors, Babel on UDP 6696, DNS, NTP,
-HTTP, OSPFv3, and anything unlisted. Non-first IPv6 fragments cannot be inspected and are
-let through. The identification frames are never filtered.
+HTTP, OSPFv3, AH, and anything unlisted. Non-first IPv6 fragments cannot be inspected and
+are let through. The identification frames are never filtered. Above the EtherType level
+this is a deny list: an unknown protocol on an unknown port passes.
 
-Other protocols worth blocking on an amateur link, all encrypted transports, are not on
-by default because the request was for 22 and 443: DNS over TLS 853, SMTPS 465, IMAPS
-993, POP3S 995, RDP 3389, IKE/IPsec 500 and 4500, WireGuard 51820, HTTPS alternate 8443.
-Add any of them with `--block-port`. Things that are noisy but not blocked, in case you
-want them gone too: ICMPv6 Node Information queries (types 139/140), Multicast Router
-Discovery (151–153), NTP broadcast, and any host's own periodic keepalives.
+**ESP-NULL.** IPsec with NULL encryption (RFC 2410) is authentication without secrecy,
+which Part 97 allows and which is exactly the right tool for an authenticated tunnel over
+the mesh. A stateless filter cannot read the SA, so it uses the RFC 5879 heuristic: for
+each usual ICV length (12, 16, 24, 32 octets, and none) the ESP trailer must show the
+RFC 4303 default padding 1, 2, 3, … and a Next Header whose payload parses (an IPv6 or
+IPv4 header, a sane TCP/UDP/ICMPv6 header, or a dummy packet). A match is treated as
+ESP-NULL and the payload is filtered like any other packet, so a global inner destination
+is fine but TCP 443 inside the tunnel is still dropped. Anything else is treated as
+encrypted. Every implementation uses the default padding, but an ESP-NULL stack with
+random or TFC padding would be misclassified; `--allow-esp` passes all ESP if that ever
+matters. AH (next header 51) is passed as an extension header and is the simpler choice
+when only authentication is wanted.
+
+**Tunnels.** IPv6-in-IPv6, GRE (including transparent Ethernet bridging), VXLAN and
+ESP-NULL are followed up to three levels deep and the inner packet gets the same rules
+with the destination-scope check relaxed. Tunnels inside UDP the filter does not know
+(L2TP, Geneve, IP-in-UDP variants) are not looked into; WireGuard and IKE are blocked by
+port.
+
+**LAN discovery chatter, and why it is a hard call.** These protocols exist to find
+things on a LAN, and over a 2 MHz link every multicast frame is a broadcast PPDU at MCS 0
+that nobody acknowledges: a 300-octet mDNS packet costs about 4 ms of air, so a laptop
+that re-announces five services and answers every query it hears can burn a few percent
+of the channel doing nothing useful.
+
+- **mDNS (UDP 5353, ff02::fb)**: Bonjour/Avahi. Every host answers every query for every
+  service type it offers, re-announces at 80/85/90/95 % of each record's TTL, sends
+  goodbye packets, and clients re-query each service type separately. It is also the
+  protocol most likely to be *useful* for peer discovery in a gossip or epidemic scheme,
+  because it is already there and every OS speaks it. The compromise, not implemented
+  yet, would be to pass only records under a chosen name, say `_mesh._udp.local`, and
+  drop the rest: the DNS question and answer sections are plain to parse. Until then the
+  rule is all or nothing (`--allow-discovery`). Babel already announces every node's
+  presence with Hellos every few seconds on ff02::1:6, which is usually the discovery a
+  mesh needs.
+- **LLMNR (UDP 5355, ff02::1:3)**: Windows' fallback name resolution. One multicast query
+  per unresolved name per interface, unicast answers, low volume, but it leaks every
+  mistyped hostname and every internal name a Windows box tries to reach.
+- **SSDP/UPnP (UDP 1900, ff02::c)**: M-SEARCH bursts every few minutes from Windows and
+  media players, NOTIFY alive/byebye from every UPnP device, around a kilobyte each. Zero
+  use over a mesh.
+- **WS-Discovery (UDP 3702, ff02::c)**: Windows Network Discovery and WSD printing. Bursts
+  of Probe/Hello/Bye on interface up and on a timer.
+- **NetBIOS (137 to 139)** and **SMB (445)**: NetBIOS is IPv4 in practice and listed for
+  completeness; SMB 3 encrypts by default and is the classic worm vector.
+- **NAT-PMP/PCP (5350/5351)**: asks a gateway for port mappings; there is no gateway.
+
+**Other noise left alone.** ICMPv6 Node Information queries (139/140), NTP broadcast,
+and any host's own keepalives. Block them with `--block-port` where they have a port.
 
 Knobs: `--no-filter`, `--filter-egress-only`, `--block-port N` / `--allow-port N`,
-`--allow-ipv4`, `--allow-router-discovery`, `--allow-dhcpv6`, `--allow-mld`,
-`--allow-discovery`. The node prints the policy at startup and logs each (direction,
-reason) the first time it fires and then at most every 30 s with a count. The library
-default (`MacConfig::new`) is no filtering; the node turns the policy on.
+`--allow-ipv4`, `--allow-global`, `--allow-router-discovery`, `--allow-dhcpv6`,
+`--allow-mld`, `--allow-discovery`, `--allow-esp`. The node prints the policy at startup
+and logs each (direction, reason) the first time it fires and then at most every 30 s
+with a count. The library default (`MacConfig::new`) is no filtering; the node turns the
+policy on.
 
 ### A-MPDUs, S-MPDUs and the partial AID (background for non-RF readers)
 
