@@ -38,6 +38,7 @@
 //! the first data frame, repeats every `interval_us` while transmitting,
 //! and closes a communication after `end_idle_us` of silence.
 
+use crate::filter::{self, FilterConfig, Verdict};
 use crate::frame::{self, MacAddr, ParsedFrame, Pv1Addr};
 use crate::ident::{self, IdentConfig};
 use crate::ndp::{self, NdpAck, NdpBlockAck, NdpCts, NdpFrame};
@@ -57,6 +58,10 @@ pub enum MacError {
     BadEthernet,
     #[error("frame too large for any PPDU at this MCS")]
     FrameTooBig,
+    /// Dropped by the good-neighbour filter (not an error for the caller
+    /// to retry; the reason is for logging).
+    #[error("filtered: {0}")]
+    Filtered(&'static str),
     #[error("PHY: {0}")]
     Phy(#[from] s2g_phy::PhyError),
 }
@@ -101,6 +106,10 @@ pub struct MacConfig {
     pub ampdu_max_mpdus: usize,
     /// Amateur-radio station identification.
     pub ident: IdentConfig,
+    /// Stateless good-neighbour filter applied to frames leaving for the
+    /// air and arriving from it. Off in the library default; `s2g-node`
+    /// enables [`FilterConfig::good_neighbor`].
+    pub filter: FilterConfig,
 }
 
 impl MacConfig {
@@ -124,6 +133,7 @@ impl MacConfig {
             rate: RateConfig::default(),
             ampdu_max_mpdus: 8,
             ident: IdentConfig::default(),
+            filter: FilterConfig::off(),
         }
     }
 
@@ -146,6 +156,9 @@ pub enum MacEvent {
     IdentSent { text: String },
     /// A station identification frame was heard.
     IdentReceived { src: MacAddr, text: String },
+    /// A frame from the air was dropped by the good-neighbour filter
+    /// (egress drops are reported as `MacError::Filtered` by `enqueue_eth`).
+    Filtered { reason: &'static str },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -242,6 +255,9 @@ pub struct Mac {
     last_data_tx_us: u64,
     /// CFO the PHY measured on the PSDU being processed, Hz.
     rx_cfo_hz: f32,
+    /// Frames the filter dropped on the way to the air / from the air.
+    filtered_egress: u64,
+    filtered_ingress: u64,
 }
 
 fn is_group(addr: &MacAddr) -> bool {
@@ -279,6 +295,8 @@ impl Mac {
             sent_since_ident: false,
             last_data_tx_us: 0,
             rx_cfo_hz: 0.0,
+            filtered_egress: 0,
+            filtered_ingress: 0,
         }
     }
 
@@ -313,6 +331,11 @@ impl Mac {
         self.queue.len()
     }
 
+    /// Frames the good-neighbour filter dropped: (towards the air, from the air).
+    pub fn filtered(&self) -> (u64, u64) {
+        (self.filtered_egress, self.filtered_ingress)
+    }
+
     fn rand_u32(&mut self) -> u32 {
         let mut x = self.rng;
         x ^= x << 13;
@@ -334,6 +357,12 @@ impl Mac {
 
     /// Queue an outgoing Ethernet frame (from the TAP).
     pub fn enqueue_eth(&mut self, eth_frame: &[u8]) -> Result<(), MacError> {
+        if self.cfg.filter.egress {
+            if let Verdict::Drop(reason) = filter::check(&self.cfg.filter, eth_frame) {
+                self.filtered_egress += 1;
+                return Err(MacError::Filtered(reason));
+            }
+        }
         let (dest, src, ethertype, payload) = eth::parse_ethernet(eth_frame).ok_or(MacError::BadEthernet)?;
         if self.queue.len() >= self.cfg.queue_limit {
             return Err(MacError::QueueFull);
@@ -673,7 +702,13 @@ impl Mac {
         if let Some(text) = ident::parse_body(body) {
             out.push(MacEvent::IdentReceived { src, text });
         } else if let Some(ethf) = eth::body_to_ethernet(dest, src, body) {
-            out.push(MacEvent::EthReceived(ethf));
+            match if self.cfg.filter.ingress { filter::check(&self.cfg.filter, &ethf) } else { Verdict::Pass } {
+                Verdict::Pass => out.push(MacEvent::EthReceived(ethf)),
+                Verdict::Drop(reason) => {
+                    self.filtered_ingress += 1;
+                    out.push(MacEvent::Filtered { reason });
+                }
+            }
         }
         needs_block_ack
     }
@@ -1667,5 +1702,45 @@ mod tests {
         mac_b.on_phy_event(&psdu_event(&TxVector::default(), &id), now, &mut out_b);
         assert!(out_b.iter().any(|e| matches!(e, MacEvent::IdentReceived { src, text } if *src == A && text == "DE W1AW")));
         assert!(!out_b.iter().any(|e| matches!(e, MacEvent::EthReceived(_))));
+    }
+
+    #[test]
+    fn good_neighbour_filter_both_directions() {
+        // The test helper builds IPv4 frames: blocked by the policy on the
+        // way out (reported to the caller) and on the way in (event).
+        let mut cfg = MacConfig::new(A);
+        cfg.filter = FilterConfig::good_neighbor();
+        let mut mac = Mac::new(cfg.clone());
+        assert!(matches!(mac.enqueue_eth(&eth_frame(B, A, 40)), Err(MacError::Filtered("IPv4"))));
+        let mut now = 0;
+        let mut out = Vec::new();
+        assert!(drain_tx(&mut mac, &mut now, &mut out).is_none());
+        assert_eq!(mac.filtered(), (1, 0));
+        // An IPv6 Babel packet passes.
+        let mut v6 = Vec::new();
+        v6.extend_from_slice(&B);
+        v6.extend_from_slice(&A);
+        v6.extend_from_slice(&0x86DDu16.to_be_bytes());
+        v6.extend_from_slice(&[0x60, 0, 0, 0, 0, 12, 17, 64]);
+        v6.extend_from_slice(&[0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        v6.extend_from_slice(&[0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 6]);
+        v6.extend_from_slice(&[0x1a, 0x28, 0x1a, 0x28, 0, 12, 0, 0, 1, 2, 3, 4]);
+        mac.enqueue_eth(&v6).unwrap();
+        assert!(drain_tx(&mut mac, &mut now, &mut out).is_some());
+        // Ingress: an IPv4 frame from the air is dropped with an event, the
+        // IPv6 one delivered.
+        let mut mac_b = Mac::new(cfg.clone());
+        let mut out_b = Vec::new();
+        let data4 = frame::build_data(B, A, 1, false, 0, &eth::to_body(0x0800, &[0x45; 30]));
+        mac_b.on_phy_event(&psdu_event(&TxVector::default(), &data4), 0, &mut out_b);
+        assert!(out_b.iter().any(|e| matches!(e, MacEvent::Filtered { reason: "IPv4" })));
+        assert!(!out_b.iter().any(|e| matches!(e, MacEvent::EthReceived(_))));
+        let data6 = frame::build_data(B, A, 2, false, 0, &eth::to_body(0x86DD, &v6[14..]));
+        mac_b.on_phy_event(&psdu_event(&TxVector::default(), &data6), 0, &mut out_b);
+        assert!(out_b.iter().any(|e| matches!(e, MacEvent::EthReceived(_))));
+        assert_eq!(mac_b.filtered(), (0, 1));
+        // Library default: no filtering.
+        let mut plain = Mac::new(MacConfig::new(A));
+        plain.enqueue_eth(&eth_frame(B, A, 40)).unwrap();
     }
 }

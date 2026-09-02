@@ -7,7 +7,7 @@
 
 use anyhow::{bail, Result};
 use clap::Parser;
-use s2g_mac::{IdentConfig, Mac, MacAction, MacConfig, MacEvent, RateConfig};
+use s2g_mac::{FilterConfig, IdentConfig, Mac, MacAction, MacConfig, MacError, MacEvent, RateConfig};
 use s2g_phy::vector::Coding;
 use s2g_tools::nic::Nic;
 use s2g_tools::DEFAULT_CENTER_FREQ_HZ;
@@ -74,6 +74,33 @@ struct Args {
     /// Minutes between identifications while transmitting
     #[arg(long, default_value_t = 10)]
     id_interval_min: u64,
+    /// Disable the good-neighbour filter entirely
+    #[arg(long)]
+    no_filter: bool,
+    /// Filter only frames leaving for the air, deliver everything received
+    #[arg(long)]
+    filter_egress_only: bool,
+    /// Additionally block this TCP/UDP port (repeatable); see README for the recommended list
+    #[arg(long)]
+    block_port: Vec<u16>,
+    /// Remove this port from the blocked list (repeatable)
+    #[arg(long)]
+    allow_port: Vec<u16>,
+    /// Let IPv4 and ARP through
+    #[arg(long)]
+    allow_ipv4: bool,
+    /// Let ICMPv6 Router Solicitation/Advertisement/Redirect through
+    #[arg(long)]
+    allow_router_discovery: bool,
+    /// Let DHCPv6 through
+    #[arg(long)]
+    allow_dhcpv6: bool,
+    /// Let MLD through
+    #[arg(long)]
+    allow_mld: bool,
+    /// Let mDNS/LLMNR/SSDP/WS-Discovery/NetBIOS/SMB through
+    #[arg(long)]
+    allow_discovery: bool,
 
     /// Pluto iiod address
     #[arg(long, default_value = "192.168.2.1")]
@@ -179,6 +206,25 @@ fn main() -> Result<()> {
         ..Default::default()
     };
     cfg.ampdu_max_mpdus = args.ampdu;
+    cfg.filter = if args.no_filter {
+        FilterConfig::off()
+    } else {
+        let mut f = FilterConfig::good_neighbor();
+        f.ingress = !args.filter_egress_only;
+        f.allow_ipv4 = args.allow_ipv4;
+        f.allow_router_discovery = args.allow_router_discovery;
+        f.allow_dhcpv6 = args.allow_dhcpv6;
+        f.allow_mld = args.allow_mld;
+        f.allow_discovery = args.allow_discovery;
+        for p in &args.block_port {
+            if !f.blocked_ports.contains(p) {
+                f.blocked_ports.push(*p);
+            }
+        }
+        f.blocked_ports.retain(|p| !args.allow_port.contains(p));
+        f
+    };
+    eprintln!("good-neighbour filter: {}", cfg.filter.describe());
     cfg.ident = IdentConfig {
         callsign: args.callsign.clone(),
         info: args.id_info.clone(),
@@ -203,6 +249,25 @@ fn main() -> Result<()> {
         nic.describe()
     );
     run_radio(&args, Mac::new(cfg), nic)
+}
+
+/// Rate-limited log of what the good-neighbour filter dropped: the first
+/// frame of each (direction, reason) at once, then a count every 30 s.
+#[derive(Default)]
+struct FilterLog {
+    seen: std::collections::HashMap<(&'static str, &'static str), (u64, Option<std::time::Instant>)>,
+}
+
+impl FilterLog {
+    fn note(&mut self, direction: &'static str, reason: &'static str) {
+        let e = self.seen.entry((direction, reason)).or_insert((0, None));
+        e.0 += 1;
+        let due = e.1.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(30));
+        if due {
+            eprintln!("filter: dropped {} {direction}: {reason}", e.0);
+            e.1 = Some(std::time::Instant::now());
+        }
+    }
 }
 
 #[cfg(feature = "pluto")]
@@ -321,6 +386,7 @@ fn run_radio(args: &Args, mut mac: Mac, nic: Box<dyn Nic>) -> Result<()> {
     let mut interp = s2g_dsp::HalfbandInterp2::new();
     let mut mac_events: Vec<MacEvent> = Vec::new();
     let mut rate_seen: std::collections::HashMap<[u8; 6], u8> = std::collections::HashMap::new();
+    let mut filter_log = FilterLog::default();
     loop {
         let now_us = t0.elapsed().as_micros() as u64;
         match msg_rx.recv_timeout(Duration::from_millis(2)) {
@@ -333,18 +399,18 @@ fn run_radio(args: &Args, mut mac: Mac, nic: Box<dyn Nic>) -> Result<()> {
                         ),
                         RxEvent::RxEnd { status, .. } if *status != s2g_phy::RxEndStatus::NoError => eprintln!("rx end: {status:?}"),
                         RxEvent::RxStart { rxvector, .. } if rxvector.preamble_type == s2g_phy::PreambleType::S1gLong => {
-                            eprintln!("rx: S1G_LONG PPDU ({} µs), not decoded", rxvector.ppdu_duration_us())
+                            eprintln!("rx: S1G_LONG PPDU ({} µs)", rxvector.ppdu_duration_us())
                         }
                         _ => {}
                     }
                 }
                 mac.on_phy_event(&ev, now_us, &mut mac_events);
             }
-            Ok(Msg::Eth(f)) => {
-                if let Err(e) = mac.enqueue_eth(&f) {
-                    eprintln!("drop outgoing frame: {e}");
-                }
-            }
+            Ok(Msg::Eth(f)) => match mac.enqueue_eth(&f) {
+                Ok(()) => {}
+                Err(MacError::Filtered(reason)) => filter_log.note("to air", reason),
+                Err(e) => eprintln!("drop outgoing frame: {e}"),
+            },
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => bail!("worker thread died"),
         }
@@ -376,6 +442,7 @@ fn run_radio(args: &Args, mut mac: Mac, nic: Box<dyn Nic>) -> Result<()> {
                         eprintln!("ndp: {frame:?}");
                     }
                 }
+                MacEvent::Filtered { reason } => filter_log.note("from air", reason),
                 MacEvent::IdentSent { text } => eprintln!("id sent: {text}"),
                 MacEvent::IdentReceived { src, text } => eprintln!("id heard from {}: {text}", fmt_mac(&src)),
             }

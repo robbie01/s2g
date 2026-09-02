@@ -33,11 +33,13 @@ pub mod engine;
 pub mod eth;
 pub mod fcs;
 pub mod frame;
+pub mod filter;
 pub mod ident;
 pub mod ndp;
 pub mod rate;
 
-pub use engine::{Mac, MacAction, MacConfig, MacEvent};
+pub use engine::{Mac, MacAction, MacConfig, MacError, MacEvent};
+pub use filter::{FilterConfig, Verdict};
 pub use ident::IdentConfig;
 pub use rate::{PeerRateInfo, RateConfig, RateControl};
 pub use frame::MacAddr;

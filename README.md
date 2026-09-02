@@ -216,6 +216,40 @@ standard, self-synchronising whitening sequence, not encryption). Under Part 97 
 upper layers you run over the link must not either; that is the operator's call, not
 something the software can enforce.
 
+### Good-neighbour filter
+
+`s2g-node` runs a stateless frame filter (`s2g_mac::filter`) on every frame headed for
+the air and, by default, on every frame received from it. No connection tracking: each
+Ethernet frame is judged on its own. The default policy drops
+
+| Dropped | Why |
+|---|---|
+| TCP or UDP with source or destination port 22 or 443 | SSH and HTTPS/QUIC obscure meaning, which Part 97 forbids |
+| Anything that is not IPv6 (IPv4, ARP, RARP, VLAN tags, LLDP, PPPoE, EAPOL, 802.3/LLC such as STP), plus IPv4 tunnelled in IPv6 | The link is IPv6-only; this also silences DHCP, IGMP, NetBIOS over IPv4 and the rest of the IPv4 background noise in one rule |
+| ICMPv6 Router Solicitation, Router Advertisement, Redirect | SLAAC is off; addresses are static and routes come from Babel |
+| DHCPv6 (UDP 546/547) | Same reason |
+| MLD (ICMPv6 130–132, 143) | A radio link has no snooping switch, multicast is flooded anyway, and hosts otherwise report every group join |
+| mDNS, LLMNR, SSDP/UPnP, WS-Discovery, NetBIOS, SMB, NAT-PMP/PCP | LAN discovery chatter with nothing to discover over a mesh link |
+| IPsec ESP | Encrypted payloads |
+
+Everything else passes: neighbour solicitation and advertisement (needed to resolve
+link-local addresses on the link), ICMPv6 echo and errors, Babel on UDP 6696, DNS, NTP,
+HTTP, OSPFv3, and anything unlisted. Non-first IPv6 fragments cannot be inspected and are
+let through. The identification frames are never filtered.
+
+Other protocols worth blocking on an amateur link, all encrypted transports, are not on
+by default because the request was for 22 and 443: DNS over TLS 853, SMTPS 465, IMAPS
+993, POP3S 995, RDP 3389, IKE/IPsec 500 and 4500, WireGuard 51820, HTTPS alternate 8443.
+Add any of them with `--block-port`. Things that are noisy but not blocked, in case you
+want them gone too: ICMPv6 Node Information queries (types 139/140), Multicast Router
+Discovery (151–153), NTP broadcast, and any host's own periodic keepalives.
+
+Knobs: `--no-filter`, `--filter-egress-only`, `--block-port N` / `--allow-port N`,
+`--allow-ipv4`, `--allow-router-discovery`, `--allow-dhcpv6`, `--allow-mld`,
+`--allow-discovery`. The node prints the policy at startup and logs each (direction,
+reason) the first time it fires and then at most every 30 s with a count. The library
+default (`MacConfig::new`) is no filtering; the node turns the policy on.
+
 ### A-MPDUs, S-MPDUs and the partial AID (background for non-RF readers)
 
 *Aggregation.* An 802.11 PHY frame (PPDU) can carry several MAC frames back to back: an
@@ -277,7 +311,8 @@ to compile). Two nodes need distinct `--mac` addresses (default is randomized).
 - [x] PlutoSDR TX/RX backend (pure-Rust iiod client) at arbitrary carrier
 - [x] OCB MAC: data/RTS/ACK frames, A-MPDU packing with NDP BlockAck selective retry,
       S-MPDU, PV1 reception, CSMA with PHY CCA + NAV + RID + EIFS, NDP responses, retries,
-      dedup, per-peer adaptive MCS (probing + SNR-bounded), amateur station identification
+      dedup, per-peer adaptive MCS (probing + SNR-bounded), amateur station identification,
+      stateless good-neighbour frame filter (IPv6-only, no RA/RS/DHCPv6, no port 22/443)
 - [x] `s2g-node`: TAP (Unix via tappers, Windows via tap-windows6) / UDP network interface
       over the radio
 - [x] Virtual Pluto (iiod server with simulated air) and a two-node end-to-end script;
