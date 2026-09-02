@@ -113,6 +113,18 @@ target/release/s2g-rx --in mat/80211ah_mcs0_chan2_g0.0dB_att10dB_freq864.0MHz_0.
 `S2G_TRACE=1` prints per-symbol pilot tracking (timing offset, CPE, pilot coherence, symbol
 power) for any decode.
 
+## Windows TAP
+
+`s2g-node --tap` on Windows opens an OpenVPN **tap-windows6** adapter (ComponentId
+`tap0901`, shown as "TAP-Windows Adapter V9"): install the driver from the OpenVPN
+installer or the standalone tap-windows package, run the node from an elevated prompt,
+name the adapter with `--tap "TAP-Windows Adapter V9"` if you have several, and give it an
+address with `netsh interface ip set address "TAP-Windows Adapter V9" static 10.44.0.1
+255.255.255.0`. The node sets the adapter's media status to connected and exchanges raw
+Ethernet frames through overlapped `ReadFile`/`WriteFile`. WireGuard's Wintun does not
+work for this: it is a layer-3 TUN, and the MAC carries Ethernet frames. Without any
+TAP driver, `--udp` remains available on every platform.
+
 ## Testing without hardware
 
 - `scripts/validate_captures.py` decodes the three recordings above and fails if any
@@ -266,10 +278,11 @@ to compile). Two nodes need distinct `--mac` addresses (default is randomized).
 - [x] OCB MAC: data/RTS/ACK frames, A-MPDU packing with NDP BlockAck selective retry,
       S-MPDU, PV1 reception, CSMA with PHY CCA + NAV + RID + EIFS, NDP responses, retries,
       dedup, per-peer adaptive MCS (probing + SNR-bounded), amateur station identification
-- [x] `s2g-node`: TAP (Unix) / UDP (Windows) network interface over the radio
+- [x] `s2g-node`: TAP (Unix via tappers, Windows via tap-windows6) / UDP network interface
+      over the radio
 - [x] Virtual Pluto (iiod server with simulated air) and a two-node end-to-end script;
       capture regression script
-- [ ] Windows L2 TAP backend (tap-windows6); hardware-timestamped SIFS/ACK timing
+- [ ] Hardware-timestamped SIFS/ACK timing
 - [x] S1G_LONG SU Data-field reception and short-GI reception (both optional for a ≤ 2 MHz
       STA; validated on the baby-monitor capture) — also available on TX via `TxVector`
 - [ ] Other NDP CMAC types (PS-Poll, Paging, Probe Request), 1/4/8/16 MHz, multi-stream/STBC —

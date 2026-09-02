@@ -19,10 +19,13 @@ rand.workspace = true
 workspace = true
 optional = true
 
-# TAP devices via tappers (Linux, macOS, *BSD; Windows has no L2 TAP there —
-# use the UDP NIC on Windows until a tap-windows6 backend lands).
+# TAP devices via tappers (Linux, macOS, *BSD).
 [target.'cfg(unix)'.dependencies]
 tappers = { version = "0.4", optional = true }
+
+# Windows L2 TAP via the OpenVPN tap-windows6 driver (src/wintap.rs).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Threading", "Win32_System_Registry"] }
 
 [features]
 default = ["pluto"]

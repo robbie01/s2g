@@ -4,6 +4,8 @@
 //! impairment channel used by s2g-sim.
 
 pub mod nic;
+#[cfg(windows)]
+pub mod wintap;
 
 use anyhow::{bail, Context, Result};
 use num_complex::Complex;

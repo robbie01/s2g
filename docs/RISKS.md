@@ -52,6 +52,7 @@ for a while even with a dev kit in hand.
 | Padded-PSDU tolerance (`locate_mpdu`) | External | Baby monitor pads non-aggregated PSDUs to 4-octet multiples |
 | Scrambler seed 0 tolerance | External | imec dataset device uses the all-zero seed ~1/128 of the time |
 | A-MPDU packing, NDP BlockAck bitmap, selective retry | Self-consistent | Unit tests with corrupted MPDUs and a two-node PHY simulation; the 16-bit bitmap and SSN semantics follow 23.3.12.2.6.2 |
+| Windows tap-windows6 backend | Untested | Written against the tap-windows6 ioctl/overlapped interface as OpenVPN uses it; the development machine has only Wintun installed, so it has compiled and enumerated adapters but never passed a frame. First run: `s2g-node --tap --udp`-free, elevated, check `describe()` prints the adapter and that `ping` across two nodes works |
 | Per-peer rate control | Self-consistent | Unit tests with synthetic success ceilings and a two-node PHY simulation at 30 dB / 11 dB SNR; the SNR hint assumes a roughly symmetric link and the probe/back-off constants are untuned against real fading |
 
 ## Deliberate deviations from the standard

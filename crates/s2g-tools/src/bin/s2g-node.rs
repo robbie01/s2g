@@ -15,7 +15,8 @@ use s2g_tools::DEFAULT_CENTER_FREQ_HZ;
 #[derive(Parser, Debug)]
 #[command(name = "s2g-node", about = "S1G OCB network node (NIC ↔ MAC ↔ PHY ↔ Pluto)")]
 struct Args {
-    /// Create/attach a TAP interface (optionally named). Unix + feature "tap".
+    /// Attach a TAP interface (optionally named): tappers on Unix (feature "tap"),
+    /// the OpenVPN tap-windows6 adapter on Windows ("TAP-Windows Adapter V9")
     #[arg(long, num_args = 0..=1, default_missing_value = "", conflicts_with = "udp")]
     tap: Option<String>,
     /// Ethernet-over-UDP NIC: local bind address (e.g. 127.0.0.1:5001)
@@ -139,11 +140,20 @@ fn make_nic(args: &Args) -> Result<Box<dyn Nic>> {
         let n = if name.is_empty() { None } else { Some(name.as_str()) };
         return Ok(Box::new(s2g_tools::nic::TapNic::new(n)?));
     }
-    #[cfg(not(all(unix, feature = "tap")))]
-    if args.tap.is_some() {
-        bail!("TAP support needs a Unix OS and --features tap; on Windows use --udp BIND");
+    #[cfg(windows)]
+    if let Some(name) = &args.tap {
+        let n = if name.is_empty() { None } else { Some(name.as_str()) };
+        let mut tap = s2g_tools::wintap::WinTapNic::new(n)?;
+        if let Some((maj, min)) = tap.driver_version() {
+            eprintln!("tap-windows6 driver {maj}.{min}");
+        }
+        return Ok(Box::new(tap));
     }
-    bail!("choose a NIC: --tap [NAME] (Unix) or --udp BIND")
+    #[cfg(not(any(windows, all(unix, feature = "tap"))))]
+    if args.tap.is_some() {
+        bail!("TAP support needs --features tap on this platform; or use --udp BIND");
+    }
+    bail!("choose a NIC: --tap [NAME] (tappers on Unix, tap-windows6 on Windows) or --udp BIND")
 }
 
 fn main() -> Result<()> {
