@@ -4,11 +4,13 @@
 deployment runs in the 24 cm band rather than sub-1 GHz.
 
 A from-scratch, modular implementation of the IEEE 802.11-2024 Clause 23 **S1G PHY**:
-2 MHz bandwidth, long GI (8 µs), single spatial stream, **BCC and LDPC**, **fixed and
-traveling pilots**, S1G_SHORT preamble, **all valid MCSes (0–8 and 11**, i.e. BPSK½ …
+2 MHz bandwidth, single spatial stream, **long and short GI**, **BCC and LDPC**, **fixed and
+traveling pilots**, **S1G_SHORT and S1G_LONG (SU) preambles**, **all valid MCSes (0–8 and 11**, i.e. BPSK½ …
 256-QAM¾ and 1024-QAM¾; MCS 9/10/12 are "Not valid" at 2 MHz/1SS per Table 23-46**)**,
 NDP CMAC PPDUs, and the mandatory receive procedures of 23.3.20: CCA, RSSI/RCPI,
-S1G_LONG SIG-A detection/decoding, PHY-RXSTART/RXEND statuses, carrier-lost handling.
+SIG/SIG-A decoding, PHY-RXSTART/RXEND statuses, carrier-lost handling. Transmission defaults
+to S1G_SHORT with the 8 µs GI (best range); short GI and S1G_LONG are per-PPDU TXVECTOR
+options, signalled in the SIG like the MCS, so a receiver parked on one channel takes both.
 Runs on an ADALM-Pluto at a **nonstandard 1250 MHz carrier** — the carrier is just a
 tuning parameter; the baseband is band-agnostic. 1 MHz operation is deliberately out of
 scope.
@@ -68,7 +70,7 @@ python scripts/compare_pcap.py 802_11_ah.pcap s2g.pcap
 | PPDUs | s2g result | vs. ground-truth PCAP |
 |---|---|---|
 | 1469 S1G_SHORT (MCS 1–2, BCC, some with traveling pilots) | 1469 decoded, FCS valid | byte-exact match for all 1467 non-Data frames (223 RTS, 51 Action, 71 S1G Beacons, 1122 +HTC-wrapped CTS/BlockAck) plus 2 valid frames the reference decoder missed |
-| 1072 S1G_LONG (MCS 4/7 data, aggregated, traveling pilots) | SIG-A decoded → `RxEnd(UnsupportedRate)` with duration | consistent with the 1296 data MPDUs in the PCAP |
+| 1072 S1G_LONG (MCS 0–7 data, aggregated, traveling pilots, 17 with short GI) | 1072 decoded; 1279 data MPDUs FCS-valid | byte-exact match for 1276 of the 1278 FCS-valid data frames (the reference PCAP also carries 18 frames flagged bad-FCS — radiotap 0x40 — that neither decoder recovered) plus 3 valid data frames the reference missed; all 11 short-GI frames it flags (radiotap 0x80) are among the matches |
 | SIG CRC failures | 2 in 35 s | — |
 
 The chip rounds non-aggregated PSDU lengths up to a multiple of 4 octets and pads after the
@@ -203,6 +205,7 @@ to compile). Two nodes need distinct `--mac` addresses (default is randomized).
       EIFS, NDP responses, retries, dedup
 - [x] `s2g-node`: TAP (Unix) / UDP (Windows) network interface over the radio
 - [ ] Windows L2 TAP backend (tap-windows6); hardware-timestamped SIFS/ACK timing
-- [ ] S1G_LONG Data-field reception (optional for a ≤ 2 MHz STA), other NDP CMAC types
-      (PS-Poll, Paging, Probe Request), short GI, 1/4/8/16 MHz, multi-stream/STBC —
+- [x] S1G_LONG SU Data-field reception and short-GI reception (both optional for a ≤ 2 MHz
+      STA; validated on the baby-monitor capture) — also available on TX via `TxVector`
+- [ ] Other NDP CMAC types (PS-Poll, Paging, Probe Request), 1/4/8/16 MHz, multi-stream/STBC —
       all optional (or 1 MHz: skipped by choice); module boundaries chosen so they slot in

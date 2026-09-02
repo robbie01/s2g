@@ -3,7 +3,7 @@
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use s2g_phy::params::SAMPLE_RATE_HZ;
-use s2g_phy::vector::{Coding, TxVector};
+use s2g_phy::vector::{Coding, GuardInterval, PreambleType, TxVector};
 use s2g_phy::Transmitter;
 use s2g_tools::{parse_hex_psdu, write_cf32, Complex32, Rng, DEFAULT_CENTER_FREQ_HZ, DEFAULT_DEVICE_RATE_HZ};
 use std::path::PathBuf;
@@ -32,6 +32,12 @@ struct Args {
     /// Traveling pilots
     #[arg(long)]
     traveling_pilots: bool,
+    /// Short guard interval (4 µs from the second Data symbol on)
+    #[arg(long)]
+    sgi: bool,
+    /// S1G_LONG (SU) preamble instead of S1G_SHORT
+    #[arg(long)]
+    long_preamble: bool,
     /// Transmit an NDP CMAC PPDU with this 37-bit body (hex) instead of a data PPDU
     #[arg(long, conflicts_with_all = ["hex", "file", "random"])]
     ndp: Option<String>,
@@ -96,6 +102,8 @@ fn main() -> Result<()> {
         aggregation: args.aggregation,
         fec_coding: coding,
         traveling_pilots: args.traveling_pilots,
+        gi: if args.sgi { GuardInterval::Short } else { GuardInterval::Long },
+        preamble_type: if args.long_preamble { PreambleType::S1gLong } else { PreambleType::S1gShort },
         scrambler_seed: args.seed,
         ..Default::default()
     };
@@ -108,10 +116,12 @@ fn main() -> Result<()> {
     } else {
         let (w, info) = tx.generate_with_info(&txv, &psdu).map_err(|e| anyhow::anyhow!("PHY: {e}"))?;
         eprintln!(
-            "PPDU: MCS {} {:?}{} | {} octets | {} samples @ 2 MS/s | TXTIME {} µs | seed {}",
+            "PPDU: MCS {} {:?}{}{}{} | {} octets | {} samples @ 2 MS/s | TXTIME {} µs | seed {}",
             args.mcs,
             coding,
             if args.traveling_pilots { " + traveling pilots" } else { "" },
+            if args.sgi { " + short GI" } else { "" },
+            if args.long_preamble { " + S1G_LONG" } else { "" },
             psdu.len(),
             w.len(),
             info.txtime_us,
@@ -151,11 +161,7 @@ fn s2g_tools_default_uri() -> &'static str {
 fn transmit_pluto(args: &Args, uri: &str, wave: &[Complex32]) -> Result<()> {
     use s2g_sdr::{SdrDevice, SdrTx, StreamConfig};
     let mut pluto = s2g_sdr_pluto::Pluto::open(uri).map_err(|e| anyhow::anyhow!("pluto: {e}"))?;
-    let cfg = StreamConfig {
-        center_freq_hz: args.freq,
-        sample_rate_hz: DEFAULT_DEVICE_RATE_HZ,
-        rf_bandwidth_hz: args.rf_bandwidth,
-    };
+    let cfg = StreamConfig { center_freq_hz: args.freq, sample_rate_hz: DEFAULT_DEVICE_RATE_HZ, rf_bandwidth_hz: args.rf_bandwidth };
     let mut tx = pluto.open_tx(&cfg, args.tx_gain).map_err(|e| anyhow::anyhow!("pluto tx: {e}"))?;
     eprintln!("Pluto @ {} Hz, {} S/s, gain {} dB", args.freq, DEFAULT_DEVICE_RATE_HZ, args.tx_gain);
     let up = interpolate_2x(wave);

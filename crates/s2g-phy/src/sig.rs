@@ -260,9 +260,6 @@ impl SigFields {
     /// chain.
     pub fn from_txvector(txv: &TxVector, length_field: u16, ldpc_extra: bool) -> Result<Self, PhyError> {
         params::mcs_params(txv.mcs)?;
-        if txv.gi != GuardInterval::Long {
-            return Err(PhyError::Unsupported("short GI"));
-        }
         let id = id_from_txvector(txv)?;
         let ldpc = txv.fec_coding == Coding::Ldpc;
         Ok(SigFields {
@@ -271,7 +268,7 @@ impl SigFields {
             bandwidth: 0,
             nsts: 0,
             id,
-            short_gi: false,
+            short_gi: txv.gi == GuardInterval::Short,
             ldpc,
             // BCC: "this field is set to 1" [Table 23-12 B18].
             ldpc_extra: if ldpc { ldpc_extra } else { true },
@@ -350,8 +347,6 @@ impl SigFields {
             Some("STBC")
         } else if n_sts != 1 {
             Some("multiple spatial streams")
-        } else if self.short_gi {
-            Some("short GI")
         } else if params::mcs_params(self.mcs).is_err() {
             Some("MCS not supported")
         } else {
@@ -414,9 +409,35 @@ impl SigASu {
         finish_48(v)
     }
 
-    /// Classify. S1G_LONG Data fields are never decoded by this receiver
-    /// (optional feature for a ≤ 2 MHz STA [4.3.14.1]); the RXVECTOR is
-    /// complete enough for CCA and RID.
+    /// Build from a TXVECTOR for an S1G_LONG SU transmission (1 STS).
+    pub fn from_txvector(txv: &TxVector, length_field: u16, ldpc_extra: bool) -> Result<Self, PhyError> {
+        params::mcs_params(txv.mcs)?;
+        let id = id_from_txvector(txv)?;
+        let ldpc = txv.fec_coding == Coding::Ldpc;
+        Ok(SigASu {
+            stbc: false,
+            uplink_indication: txv.uplink_indication,
+            bandwidth: 0,
+            nsts: 0,
+            id,
+            short_gi: txv.gi == GuardInterval::Short,
+            ldpc,
+            ldpc_extra: if ldpc { ldpc_extra } else { true },
+            mcs: txv.mcs,
+            // With 1 STS, B23 = 0 means "no beam change, smoothing allowed"
+            // [Table 23-14 NOTE 1].
+            beam_change_or_smoothing: !txv.smoothing,
+            aggregation: txv.aggregation,
+            length: length_field,
+            response_indication: txv.response_indication,
+            traveling_pilots: txv.traveling_pilots,
+        })
+    }
+
+    /// Classify and derive the RXVECTOR skeleton. SU PPDUs with one
+    /// space-time stream at 2 MHz are decoded (an optional feature for a
+    /// ≤ 2 MHz STA [4.3.14.1]); everything else is identified for CCA and
+    /// RID only.
     pub fn verdict(&self) -> SigVerdict {
         let n_sts = self.nsts + 1;
         let n_ss = if self.stbc { n_sts / 2 } else { n_sts };
@@ -449,7 +470,11 @@ impl SigASu {
             ldpc_extra: self.ldpc && self.ldpc_extra,
             aggregation: self.aggregation,
             response_indication: self.response_indication,
-            smoothing: n_sts > 1 && self.beam_change_or_smoothing,
+            // 1 STS: B23 = 0 ⇒ the beam-changeable portion is sent through
+            // the same Q as the omni portion and smoothing is fine
+            // [Table 23-14 NOTE 1]. With more streams B23 is the Beam
+            // Change Indication and says nothing about smoothing.
+            smoothing: n_sts == 1 && !self.beam_change_or_smoothing,
             traveling_pilots: self.traveling_pilots,
             uplink_indication: self.uplink_indication,
             color,
@@ -460,7 +485,21 @@ impl SigASu {
             n_sym,
             ..Default::default()
         };
-        SigVerdict::Unsupported(rxv, "S1G_LONG Data field")
+        let unsupported = if self.bandwidth != 0 {
+            Some("bandwidth > 2 MHz")
+        } else if self.stbc {
+            Some("STBC")
+        } else if n_sts != 1 {
+            Some("multiple spatial streams")
+        } else if params::mcs_params(self.mcs).is_err() {
+            Some("MCS not supported")
+        } else {
+            None
+        };
+        match unsupported {
+            Some(why) => SigVerdict::Unsupported(rxv, why),
+            None => SigVerdict::Supported(rxv),
+        }
     }
 }
 
@@ -674,8 +713,8 @@ pub fn encode_ndp(body: u64) -> Vec<Complex32> {
     encode_bits(&finish_48(v), [true, true])
 }
 
-/// TX: S1G_LONG SIG-A waveform (SU). This crate never transmits S1G_LONG
-/// PPDUs; the encoder exists to exercise the mandatory SIG-A receive path.
+/// TX: S1G_LONG SIG-A waveform (SU): SIG-A1 QBPSK, SIG-A2 BPSK
+/// [23.3.8.2.3.2.5].
 pub fn encode_sig_a_su(fields: &SigASu) -> Vec<Complex32> {
     encode_bits(&fields.to_bits(), [true, false])
 }
@@ -702,13 +741,7 @@ pub fn detect_preamble_type(sym2: &[Complex32]) -> (PreambleType, f32) {
 /// RX: decode SIG or SIG-A from the two equalized symbols' 48 data tones
 /// each (in `SIG_SUBCARRIER_INDICES` order, CPE already corrected) plus
 /// per-tone CSI. `ptype` selects the rotation pattern and the bit layout.
-pub fn decode(
-    sym1: &[Complex32],
-    sym2: &[Complex32],
-    csi1: &[f32],
-    csi2: &[f32],
-    ptype: PreambleType,
-) -> Result<SigContent, SigError> {
+pub fn decode(sym1: &[Complex32], sym2: &[Complex32], csi1: &[f32], csi2: &[f32], ptype: PreambleType) -> Result<SigContent, SigError> {
     debug_assert_eq!(sym1.len(), 48);
     debug_assert_eq!(sym2.len(), 48);
     let rotate = match ptype {
@@ -782,10 +815,7 @@ mod tests {
     /// 1101 1001 1101 1010 0111 1011 11 → c3..c0 = 0101.
     #[test]
     fn crc4_spec_example() {
-        let m: Vec<u8> = "11011001110110100111101111"
-            .chars()
-            .map(|c| c.to_digit(2).unwrap() as u8)
-            .collect();
+        let m: Vec<u8> = "11011001110110100111101111".chars().map(|c| c.to_digit(2).unwrap() as u8).collect();
         assert_eq!(m.len(), 26);
         assert_eq!(crc4(&m), [0, 1, 0, 1]);
     }
@@ -875,8 +905,7 @@ mod tests {
             SigContent::LongSu(g) => {
                 assert_eq!(g, f);
                 match g.verdict() {
-                    SigVerdict::Unsupported(rxv, why) => {
-                        assert_eq!(why, "S1G_LONG Data field");
+                    SigVerdict::Supported(rxv) => {
                         assert_eq!(rxv.preamble_type, PreambleType::S1gLong);
                         assert_eq!(rxv.fec_coding, Coding::Ldpc);
                         assert!(rxv.aggregation);
@@ -976,11 +1005,23 @@ mod tests {
         let mut f6 = sample_fields();
         f6.length = 0;
         assert!(matches!(f6.verdict(), SigVerdict::Reserved { duration_us: None, .. }));
-        // Unsupported modes still get a duration.
+        // Short GI is decoded; its first Data symbol keeps the long GI.
         let mut f7 = sample_fields();
         f7.short_gi = true;
         match f7.verdict() {
-            SigVerdict::Unsupported(r, "short GI") => assert_eq!(r.data_duration_us(), 40 + 5 * 36),
+            SigVerdict::Supported(r) => {
+                assert_eq!(r.gi, GuardInterval::Short);
+                assert_eq!(r.data_duration_us(), 40 + 5 * 36);
+            }
+            other => panic!("{other:?}"),
+        }
+        // Unsupported modes still get a duration.
+        let mut f8 = sample_fields();
+        f8.bandwidth = 1;
+        match f8.verdict() {
+            SigVerdict::Unsupported(r, "bandwidth > 2 MHz") => {
+                assert_eq!(r.data_duration_us(), 6 * 40)
+            }
             other => panic!("{other:?}"),
         }
         // Reserved B0 is caught at parse time, with the duration preserved.

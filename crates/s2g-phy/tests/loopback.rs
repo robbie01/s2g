@@ -7,7 +7,7 @@
 use s2g_phy::params::valid_mcs;
 use s2g_phy::rx::{CcaReason, Receiver, RxConfig, RxEndStatus, RxEvent};
 use s2g_phy::sig::{self, SigASu};
-use s2g_phy::vector::{Coding, PreambleType, ResponseIndication, TxVector};
+use s2g_phy::vector::{Coding, GuardInterval, PreambleType, ResponseIndication, TxVector};
 use s2g_phy::{preamble, Complex32, Transmitter};
 
 struct Rng(u64);
@@ -42,23 +42,16 @@ fn awgn(sig: &[Complex32], snr_db: f32, rng: &mut Rng) -> Vec<Complex32> {
 
 fn apply_cfo(sig: &[Complex32], cfo_hz: f32) -> Vec<Complex32> {
     let w = 2.0 * std::f64::consts::PI * cfo_hz as f64 / 2.0e6;
-    sig.iter()
-        .enumerate()
-        .map(|(i, &v)| v * Complex32::from_polar(1.0, (w * i as f64) as f32))
-        .collect()
+    sig.iter().enumerate().map(|(i, &v)| v * Complex32::from_polar(1.0, (w * i as f64) as f32)).collect()
 }
 
 /// Fractional delay via linear interpolation (crude but adequate for tests).
 fn frac_delay(sig: &[Complex32], mu: f32) -> Vec<Complex32> {
-    (0..sig.len().saturating_sub(1))
-        .map(|i| sig[i] * (1.0 - mu) + sig[i + 1] * mu)
-        .collect()
+    (0..sig.len().saturating_sub(1)).map(|i| sig[i] * (1.0 - mu) + sig[i + 1] * mu).collect()
 }
 
 fn lead_noise(n: usize, amp: f32, rng: &mut Rng) -> Vec<Complex32> {
-    (0..n)
-        .map(|_| Complex32::new(rng.gauss(), rng.gauss()) * amp * std::f32::consts::FRAC_1_SQRT_2)
-        .collect()
+    (0..n).map(|_| Complex32::new(rng.gauss(), rng.gauss()) * amp * std::f32::consts::FRAC_1_SQRT_2).collect()
 }
 
 fn silence(n: usize) -> Vec<Complex32> {
@@ -248,9 +241,7 @@ fn timing_and_amplitude_robustness() {
 
 /// Static two-path channel: direct path plus an echo `delay` samples later.
 fn two_path(sig: &[Complex32], delay: usize, gain: Complex32) -> Vec<Complex32> {
-    (0..sig.len())
-        .map(|i| sig[i] + if i >= delay { sig[i - delay] * gain } else { Complex32::new(0.0, 0.0) })
-        .collect()
+    (0..sig.len()).map(|i| sig[i] + if i >= delay { sig[i - delay] * gain } else { Complex32::new(0.0, 0.0) }).collect()
 }
 
 #[test]
@@ -291,11 +282,7 @@ fn sampling_clock_offset_max_length_ppdu() {
             // Expected drift over ~41 000 samples at 40 ppm ≈ 1.6 samples;
             // a fast receiver clock (+ppm) makes the signal appear late.
             let expect = ppm as f32 * 1e-6 * (wave.len() as f32);
-            assert!(
-                (m.timing_drift_samples - expect).abs() < 0.6,
-                "{coding:?} ppm {ppm}: drift {} vs {expect}",
-                m.timing_drift_samples
-            );
+            assert!((m.timing_drift_samples - expect).abs() < 0.6, "{coding:?} ppm {ppm}: drift {} vs {expect}", m.timing_drift_samples);
         }
     }
     // Far beyond spec (−200 ppm ≈ 8 samples of drift) the tracker is what
@@ -449,9 +436,7 @@ fn carrier_lost_then_recovery() {
     let holds: Vec<(u64, u32)> = ev
         .iter()
         .filter_map(|e| match e {
-            RxEvent::Cca { sample_index, busy: true, reason: Some(CcaReason::PpduHold), hold_us } => {
-                Some((*sample_index, *hold_us))
-            }
+            RxEvent::Cca { sample_index, busy: true, reason: Some(CcaReason::PpduHold), hold_us } => Some((*sample_index, *hold_us)),
             _ => None,
         })
         .collect();
@@ -728,7 +713,6 @@ fn spectral_mask_after_interpolation() {
     assert!(r.pass, "mask violated: worst margin {} dB at {} MHz (psd {} dBr, mask {} dBr)", r.worst_margin_db, worst.0, worst.1, worst.2);
 }
 
-
 #[test]
 fn mid_packet_cca_without_preamble() {
     // The receiver joins a PPDU after its preamble: no RXSTART is possible,
@@ -829,4 +813,91 @@ fn reserved_sig_indication_holds_cca_for_the_ppdu() {
     });
     let hold = hold.expect("PpduHold for a reserved SIG with computable duration");
     assert!((hold as i64 - 11 * 40).abs() <= 8, "hold {hold}");
+}
+
+fn rx_start(events: &[RxEvent]) -> s2g_phy::vector::RxVector {
+    events
+        .iter()
+        .find_map(|e| match e {
+            RxEvent::RxStart { rxvector, .. } => Some(rxvector.clone()),
+            _ => None,
+        })
+        .expect("RxStart")
+}
+
+#[test]
+fn short_gi_all_mcs_both_preambles() {
+    let tx = Transmitter::new();
+    let mut rng = Rng(31);
+    for preamble in [PreambleType::S1gShort, PreambleType::S1gLong] {
+        for coding in [Coding::Bcc, Coding::Ldpc] {
+            for mcs in valid_mcs() {
+                let psdu = rng.bytes(180);
+                let txv = TxVector { mcs, preamble_type: preamble, gi: GuardInterval::Short, fec_coding: coding, ..Default::default() };
+                let wave = tx.generate(&txv, &psdu).unwrap();
+                let mut stream = lead_noise(400, 1e-4, &mut rng);
+                stream.extend(&wave);
+                stream.extend(lead_noise(300, 1e-4, &mut rng));
+                // 256/1024-QAM need more than 25 dB.
+                let snr = if mcs >= 8 { 35.0 } else { 25.0 };
+                let noisy = awgn(&apply_cfo(&frac_delay(&stream, 0.4), 12_000.0), snr, &mut rng);
+                let ev = run_rx(&noisy, 777);
+                let got = psdus(&ev);
+                assert_eq!(got.len(), 1, "{preamble:?} MCS {mcs} {coding:?}: {ev:?}");
+                assert_eq!(got[0], &psdu, "{preamble:?} MCS {mcs} {coding:?}");
+                let r = rx_start(&ev);
+                assert_eq!(r.gi, GuardInterval::Short);
+                assert_eq!(r.preamble_type, preamble);
+                // RXEND lands at the predicted end of the PPDU.
+                let end = ev
+                    .iter()
+                    .find_map(|e| match e {
+                        RxEvent::RxEnd { sample_index, status: RxEndStatus::NoError } => Some(*sample_index),
+                        _ => None,
+                    })
+                    .unwrap();
+                let expect = 400 + wave.len() as u64;
+                assert!((end as i64 - expect as i64).abs() <= 4, "end {end} vs {expect}");
+            }
+        }
+    }
+}
+
+#[test]
+fn s1g_long_su_data_decoded_with_impairments() {
+    let tx = Transmitter::new();
+    let mut rng = Rng(32);
+    for (mcs, coding, tp, gi, ppm) in [
+        (0, Coding::Bcc, false, GuardInterval::Long, 20.0),
+        (4, Coding::Ldpc, true, GuardInterval::Long, -30.0),
+        (7, Coding::Bcc, true, GuardInterval::Short, 15.0),
+        (2, Coding::Ldpc, false, GuardInterval::Short, -20.0),
+    ] {
+        let psdu = rng.bytes(700);
+        let txv = TxVector {
+            mcs,
+            preamble_type: PreambleType::S1gLong,
+            gi,
+            fec_coding: coding,
+            traveling_pilots: tp,
+            aggregation: true,
+            ..Default::default()
+        };
+        let wave = tx.generate(&txv, &psdu).unwrap();
+        let mut stream = lead_noise(350, 1e-4, &mut rng);
+        stream.extend(&wave);
+        stream.extend(lead_noise(350, 1e-4, &mut rng));
+        let stretched = s2g_dsp::apply_sfo_ppm(&two_path(&stream, 3, Complex32::new(0.25, -0.15)), ppm);
+        let noisy = awgn(&apply_cfo(&stretched, -9_000.0), 22.0, &mut rng);
+        let ev = run_rx(&noisy, 500);
+        let got = psdus(&ev);
+        assert_eq!(got.len(), 1, "MCS {mcs} {coding:?} tp {tp} {gi:?}: {ev:?}");
+        assert!(carries(got[0], &psdu), "MCS {mcs} {coding:?} tp {tp} {gi:?}");
+        let r = rx_start(&ev);
+        assert_eq!(r.preamble_type, PreambleType::S1gLong);
+        assert_eq!(r.gi, gi);
+        assert_eq!(r.traveling_pilots, tp);
+        assert!(r.smoothing, "B23 = 0 means smoothing allowed for 1 STS");
+        assert!(ends(&ev).contains(&&RxEndStatus::NoError));
+    }
 }

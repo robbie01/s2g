@@ -5,7 +5,7 @@ use anyhow::Result;
 use clap::Parser;
 use s2g_phy::params::valid_mcs;
 use s2g_phy::rx::{Receiver, RxConfig, RxEvent};
-use s2g_phy::vector::{Coding, TxVector};
+use s2g_phy::vector::{Coding, GuardInterval, PreambleType, TxVector};
 use s2g_phy::Transmitter;
 use s2g_tools::{apply_channel, Complex32, Impairments, Rng};
 
@@ -21,6 +21,12 @@ struct Args {
     /// Use traveling pilots
     #[arg(long)]
     traveling_pilots: bool,
+    /// Short guard interval (4 µs from the second Data symbol on)
+    #[arg(long)]
+    sgi: bool,
+    /// S1G_LONG (SU) preamble instead of S1G_SHORT
+    #[arg(long)]
+    long_preamble: bool,
     /// Send as A-MPDU (aggregation bit)
     #[arg(long)]
     aggregation: bool,
@@ -55,24 +61,18 @@ struct Args {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let mcs_list: Vec<u8> = if args.mcs == "all" {
-        valid_mcs().collect()
-    } else {
-        vec![args.mcs.parse()?]
-    };
+    let mcs_list: Vec<u8> = if args.mcs == "all" { valid_mcs().collect() } else { vec![args.mcs.parse()?] };
     let snrs: Vec<f32> = args.snr_db.split(',').map(|s| s.trim().parse().unwrap()).collect();
     let coding = if args.ldpc { Coding::Ldpc } else { Coding::Bcc };
     let tx = Transmitter::new();
     let mut rng = Rng(args.seed);
 
+    println!("{:>4} | {}", "MCS", snrs.iter().map(|s| format!("{s:>7.1}")).collect::<Vec<_>>().join(" "));
     println!(
-        "{:>4} | {}",
-        "MCS",
-        snrs.iter().map(|s| format!("{s:>7.1}")).collect::<Vec<_>>().join(" ")
-    );
-    println!(
-        "     | PER at each SNR (dB); {coding:?}{} cfo={:+.0} Hz, mu={}, sfo={} ppm, echo={}",
+        "     | PER at each SNR (dB); {coding:?}{}{}{} cfo={:+.0} Hz, mu={}, sfo={} ppm, echo={}",
         if args.traveling_pilots { " + traveling pilots" } else { "" },
+        if args.sgi { " + short GI" } else { "" },
+        if args.long_preamble { " + S1G_LONG" } else { "" },
         args.cfo_hz,
         args.frac_delay,
         args.sfo_ppm,
@@ -91,12 +91,12 @@ fn main() -> Result<()> {
                     fec_coding: coding,
                     traveling_pilots: args.traveling_pilots,
                     aggregation: args.aggregation,
+                    gi: if args.sgi { GuardInterval::Short } else { GuardInterval::Long },
+                    preamble_type: if args.long_preamble { PreambleType::S1gLong } else { PreambleType::S1gShort },
                     ..Default::default()
                 };
                 let wave = tx.generate(&txv, &psdu).expect("tx");
-                let mut stream: Vec<Complex32> = (0..400)
-                    .map(|_| Complex32::new(rng.gauss(), rng.gauss()) * 1e-4)
-                    .collect();
+                let mut stream: Vec<Complex32> = (0..400).map(|_| Complex32::new(rng.gauss(), rng.gauss()) * 1e-4).collect();
                 stream.extend(&wave);
                 stream.extend((0..200).map(|_| Complex32::new(rng.gauss(), rng.gauss()) * 1e-4));
                 let imp = Impairments {
@@ -113,9 +113,9 @@ fn main() -> Result<()> {
                 rx.process(&noisy, &mut ev);
                 rx.finish(&mut ev);
                 // An aggregated PSDU comes back padded to the symbol capacity.
-                let ok = ev.iter().any(|e| {
-                    matches!(e, RxEvent::PsduReceived { psdu: p, .. } if p.len() >= psdu.len() && p[..psdu.len()] == psdu[..])
-                });
+                let ok = ev
+                    .iter()
+                    .any(|e| matches!(e, RxEvent::PsduReceived { psdu: p, .. } if p.len() >= psdu.len() && p[..psdu.len()] == psdu[..]));
                 if !ok {
                     errors += 1;
                 }

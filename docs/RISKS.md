@@ -25,9 +25,12 @@ for a while even with a dev kit in hand.
 | S1G_SHORT preamble, SIG, BCC MCS 0–2, fixed pilots | External | Byte-exact frames from three chips (baby monitor, HaLow router, imec dataset) |
 | Traveling pilots (RX) | External | Baby-monitor Action frames and router MCS 0 A-MPDUs use them; all decoded |
 | Traveling pilots (TX) | Self-consistent | Our RX decodes our TX; positions transcribed from Table 23-23 |
-| MCS 3–8, 11 | Self-consistent | Loopback only; no capture above MCS 2 in S1G_SHORT (baby monitor uses MCS 4/7 only in S1G_LONG). Sensitivity simulation meets Table 23-35 with margin |
+| MCS 3–7 (16-QAM … 64-QAM 5/6) | External | Baby-monitor S1G_LONG data PPDUs (MCS 3–7) decode byte-exact (2026-09-02) |
+| MCS 8, 11 (256/1024-QAM) | Self-consistent | Loopback only; no capture uses them. Sensitivity simulation meets Table 23-35 with margin |
 | LDPC (all rates, all block lengths) | Self-consistent | Annex F matrices verified by H·cᵀ = 0; PPDU process (shortening / puncturing / repetition / extra symbol / tone mapper) round-trips. No external LDPC S1G signal exists in our captures. `scripts/matlab_vectors.m` generates reference waveforms if WLAN Toolbox is available |
-| S1G_LONG SIG-A decoding | External | 1181 real data PPDUs identified with plausible fields; the Data field is not decoded (optional) |
+| S1G_LONG SU Data reception (D-LTF1/SIG-B estimate merged with LTF1, Eq 23-56 pilots) | External | Baby-monitor capture (2026-09-02): 1276 of 1278 FCS-valid data frames byte-exact vs the reference PCAP; the 18 frames the reference flags bad-FCS are the only other misses |
+| Short-GI reception | External | All 11 FCS-valid short-GI PPDUs in the baby-monitor capture (radiotap flag 0x80) decode byte-exact; 3-sample window backoff on short-GI symbols |
+| Short-GI / S1G_LONG transmission | Self-consistent | Loopback with CFO, echo and ±30 ppm SFO; TX defaults stay S1G_SHORT + 8 µs GI |
 | Sampling-clock tracking | External (weak) | Real captures show 9 ppm tracked and RTL-SDR sample-drop jumps snapped; ±40 ppm only in simulation |
 | CCA energy / preamble / mid-packet detect | Self-consistent | Thresholds are in dBm and depend on `cal_offset_db`; nothing checks the calibration. The mid-packet (guard-interval correlation) detector is tested on our own waveform only; its false-alarm rate on real interference is unmeasured |
 | RSSI / RCPI / SNR | Unmeasurable here | Monotonic and encoded per Table 9-215; absolute dBm accuracy (±5 dB) needs a calibrated source |
@@ -63,6 +66,6 @@ for a while even with a dev kit in hand.
 
 - **LDPC / traveling pilots TX**: run `scripts/matlab_vectors.m` (WLAN Toolbox) and decode the `.cf32` files with `s2g-rx --mac`; or capture any device that advertises LDPC (Morse Micro MM61xx modules do).
 - **NDP CMAC**: needs a device that sends NDP Ack/CTS; Newracom NRC7292-based modules reportedly do — capture with a Pluto at 3.84 MS/s and look for `NdpReceived` in `s2g-rx` output.
-- **MCS 3–8, 11 in S1G_SHORT**: any dev kit with rate control disabled, or MATLAB vectors.
+- **MCS 8, 11**: any dev kit with rate control disabled, or MATLAB vectors.
 - **RF conformance**: spectrum analyser on the Pluto output; the `conformance` module then applies to a captured loopback as well.
 - **Calibration**: inject a known-level tone, set `--cal-offset-db` so that `rcpi_dbm` matches.

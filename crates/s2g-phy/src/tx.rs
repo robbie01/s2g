@@ -1,7 +1,9 @@
-//! Full TX chain: TXVECTOR + PSDU → S1G_SHORT 2 MHz PPDU samples at 2 MS/s
+//! Full TX chain: TXVECTOR + PSDU → 2 MHz PPDU samples at 2 MS/s
 //! [23.3.4.3, 23.3.4.6.1; digest coding-chain §11].
 //!
-//! PPDU = STF ‖ LTF1 ‖ SIG ‖ Data. Data field:
+//! PPDU = STF ‖ LTF1 ‖ SIG ‖ Data (S1G_SHORT) or STF ‖ LTF1 ‖ SIG-A ‖
+//! D-STF ‖ D-LTF ‖ SIG-B ‖ Data (S1G_LONG SU, 1 STS). Data symbols carry
+//! an 8 µs GI, or 4 µs from the second symbol on with short GI. Data field:
 //!
 //! * **BCC**: SERVICE(8×0) + PSDU bits (LSB-first per octet) + pad →
 //!   scramble → append 6 zero tail bits → BCC encode/puncture → per-symbol
@@ -18,11 +20,11 @@
 use crate::bits::bytes_to_bits;
 use crate::error::PhyError;
 use crate::ldpc::PpduParams;
-use crate::params::{self, McsParams, N_GI_LONG, N_SERVICE, N_SYM_MAX, N_TAIL, N_TONE_DATA, PSDU_MAX_NO_AGG};
-use crate::vector::{Coding, GuardInterval, TxVector};
+use crate::params::{self, McsParams, N_GI_LONG, N_GI_SHORT, N_SERVICE, N_SYM_MAX, N_TAIL, N_TONE_DATA, PSDU_MAX_NO_AGG};
+use crate::vector::{self, Coding, GuardInterval, PreambleType, TxVector};
 use crate::{bcc, interleaver, mapping, ofdm, pilots, preamble, scrambler, sig, Complex32};
 
-/// Transmitter for 2 MHz S1G_SHORT PPDUs.
+/// Transmitter for 2 MHz single-stream PPDUs.
 pub struct Transmitter {
     /// Output amplitude scale applied to the unit-power waveform.
     pub amplitude: f32,
@@ -81,12 +83,13 @@ pub fn n_sym(mcs: u8, psdu_len: usize, aggregation: bool) -> Result<usize, PhyEr
     Ok(data_geometry(mcs, psdu_len, aggregation, Coding::Bcc)?.n_sym)
 }
 
-/// PPDU airtime in µs for a BCC PPDU [Eq 23-74 specialized: 240 + 40·N_SYM].
+/// PPDU airtime in µs for a BCC S1G_SHORT / long-GI PPDU [Eq 23-74
+/// specialized: 240 + 40·N_SYM].
 pub fn txtime_us(mcs: u8, psdu_len: usize, aggregation: bool) -> Result<u32, PhyError> {
     txtime_us_coded(mcs, psdu_len, aggregation, Coding::Bcc)
 }
 
-/// PPDU airtime in µs for either coding.
+/// PPDU airtime in µs for either coding (S1G_SHORT, long GI).
 pub fn txtime_us_coded(mcs: u8, psdu_len: usize, aggregation: bool, coding: Coding) -> Result<u32, PhyError> {
     Ok(params::T_PREAMBLE_US + params::T_SYML_US * data_geometry(mcs, psdu_len, aggregation, coding)?.n_sym as u32)
 }
@@ -105,10 +108,7 @@ pub fn aggregated_capacity(mcs: u8, min_octets: usize, coding: Coding) -> Result
 
 fn pick_seed() -> u8 {
     // Pseudo-random nonzero 7-bit seed [Table 17-7]; entropy from the clock.
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(12345);
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(12345);
     (nanos % 127) as u8 + 1
 }
 
@@ -133,12 +133,12 @@ impl Transmitter {
 
     /// Generate the PPDU and report the scrambler seed and geometry used.
     pub fn generate_with_info(&self, txv: &TxVector, psdu: &[u8]) -> Result<(Vec<Complex32>, TxInfo), PhyError> {
-        if txv.gi != GuardInterval::Long {
-            return Err(PhyError::Unsupported("short GI"));
-        }
         let p: &McsParams = params::mcs_params(txv.mcs)?;
         let geom = data_geometry(txv.mcs, psdu.len(), txv.aggregation, txv.fec_coding)?;
-        let fields = sig::SigFields::from_txvector(txv, geom.length_field, geom.ldpc_extra)?;
+        let sig_wave = match txv.preamble_type {
+            PreambleType::S1gShort => sig::encode(&sig::SigFields::from_txvector(txv, geom.length_field, geom.ldpc_extra)?),
+            PreambleType::S1gLong => sig::encode_sig_a_su(&sig::SigASu::from_txvector(txv, geom.length_field, geom.ldpc_extra)?),
+        };
         let seed = match txv.scrambler_seed {
             Some(s) if (1..=127).contains(&s) => s,
             Some(_) => return Err(PhyError::InvalidTxVector("scrambler seed must be 1..=127")),
@@ -174,10 +174,19 @@ impl Transmitter {
 
         // ---- Waveform assembly ----
         let scale = 1.0 / (N_TONE_DATA as f32).sqrt();
-        let mut out = Vec::with_capacity(480 + geom.n_sym * 80);
+        let mut out = Vec::with_capacity(720 + geom.n_sym * 80);
         out.extend(preamble::stf_time());
         out.extend(preamble::ltf1_time());
-        out.extend(sig::encode(&fields));
+        out.extend(sig_wave);
+        if txv.preamble_type == PreambleType::S1gLong {
+            // Beam-changeable portion [23.3.8.2.3.3]: D-STF, one D-LTF
+            // (1 STS) and SIG-B, which for an SU PPDU repeats D-LTF1.
+            out.extend(preamble::dstf_time());
+            out.extend(preamble::dltf_time());
+            out.extend(preamble::dltf_time());
+        }
+        // Data pilots: p_{n+2} for S1G_SHORT [Eq 23-55] and for S1G_LONG SU
+        // [Eq 23-56, z(n) = n + 2] alike.
         let tp = txv.traveling_pilots;
         for n in 0..geom.n_sym {
             let sym_bits = &coded[n * p.n_cbps..(n + 1) * p.n_cbps];
@@ -191,12 +200,16 @@ impl Transmitter {
                 &pilots::pilot_positions(n, tp),
                 &pilots::data_pilots(n, tp),
             );
-            out.extend(ofdm::to_time_domain(&sym, N_GI_LONG, scale));
+            // Short GI starts with the second Data symbol [Eq 23-58].
+            let gi = if n > 0 && txv.gi == GuardInterval::Short { N_GI_SHORT } else { N_GI_LONG };
+            out.extend(ofdm::to_time_domain(&sym, gi, scale));
         }
         for v in &mut out {
             *v *= self.amplitude;
         }
-        let info = TxInfo { scrambler_seed: seed, geometry: geom, txtime_us: 240 + 40 * geom.n_sym as u32 };
+        let txtime_us = vector::ppdu_duration_us(txv.preamble_type, txv.gi, geom.n_sym);
+        debug_assert_eq!(out.len() as u32, 2 * txtime_us);
+        let info = TxInfo { scrambler_seed: seed, geometry: geom, txtime_us };
         Ok((out, info))
     }
 
@@ -278,15 +291,40 @@ mod tests {
     }
 
     #[test]
+    fn long_preamble_and_short_gi_shapes() {
+        let tx = Transmitter::new();
+        let psdu = [0x3Cu8; 90];
+        let n = n_sym(3, 90, false).unwrap();
+        let long = tx
+            .generate_with_info(
+                &TxVector { mcs: 3, preamble_type: PreambleType::S1gLong, scrambler_seed: Some(4), ..Default::default() },
+                &psdu,
+            )
+            .unwrap();
+        assert_eq!(long.0.len(), 720 + 80 * n);
+        assert_eq!(long.1.txtime_us, 360 + 40 * n as u32);
+        // Omni portion up to the SIG-A shares STF/LTF1 with S1G_SHORT.
+        let short = tx.generate(&TxVector { mcs: 3, scrambler_seed: Some(4), ..Default::default() }, &psdu).unwrap();
+        assert_eq!(&long.0[..320], &short[..320]);
+        assert_ne!(&long.0[320..480], &short[320..480]);
+        // D-LTF and SIG-B are identical symbols.
+        assert_eq!(&long.0[560..640], &long.0[640..720]);
+        let sgi = tx
+            .generate_with_info(&TxVector { mcs: 3, gi: GuardInterval::Short, scrambler_seed: Some(4), ..Default::default() }, &psdu)
+            .unwrap();
+        assert_eq!(sgi.0.len(), 480 + 80 + 72 * (n - 1));
+        assert_eq!(sgi.1.txtime_us, 240 + 40 + 36 * (n as u32 - 1));
+        // The first Data symbol is unchanged by the GI choice; the SIG differs.
+        assert_ne!(&sgi.0[320..480], &short[320..480]);
+        assert_eq!(&sgi.0[480..560], &short[480..560]);
+    }
+
+    #[test]
     fn seed_changes_data_not_length() {
         let tx = Transmitter::new();
         let psdu = [0xAAu8; 64];
-        let a = tx
-            .generate(&TxVector { scrambler_seed: Some(1), ..Default::default() }, &psdu)
-            .unwrap();
-        let b = tx
-            .generate(&TxVector { scrambler_seed: Some(77), ..Default::default() }, &psdu)
-            .unwrap();
+        let a = tx.generate(&TxVector { scrambler_seed: Some(1), ..Default::default() }, &psdu).unwrap();
+        let b = tx.generate(&TxVector { scrambler_seed: Some(77), ..Default::default() }, &psdu).unwrap();
         assert_eq!(a.len(), b.len());
         // Preamble + SIG identical; data differs.
         assert_eq!(&a[..480], &b[..480]);
@@ -298,9 +336,7 @@ mod tests {
         let tx = Transmitter::new();
         let psdu = [0x5Au8; 64];
         let a = tx.generate(&TxVector { scrambler_seed: Some(9), ..Default::default() }, &psdu).unwrap();
-        let b = tx
-            .generate(&TxVector { scrambler_seed: Some(9), traveling_pilots: true, ..Default::default() }, &psdu)
-            .unwrap();
+        let b = tx.generate(&TxVector { scrambler_seed: Some(9), traveling_pilots: true, ..Default::default() }, &psdu).unwrap();
         assert_eq!(a.len(), b.len());
         assert_eq!(&a[..320], &b[..320]); // STF + LTF1
         assert_ne!(&a[320..480], &b[320..480]); // SIG carries the TP bit

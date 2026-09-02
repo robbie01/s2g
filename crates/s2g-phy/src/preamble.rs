@@ -84,9 +84,45 @@ pub fn ltf1_time() -> Vec<Complex32> {
     out
 }
 
+/// D-STF of the S1G_LONG beam-changeable portion: the same STF sequence
+/// over one 40 µs symbol = 5 periods, 80 samples [23.3.8.2.3.3.3].
+pub fn dstf_time() -> Vec<Complex32> {
+    let p = stf_period();
+    let mut out = Vec::with_capacity(80);
+    for _ in 0..5 {
+        out.extend_from_slice(&p);
+    }
+    out
+}
+
+/// One D-LTF symbol: [GI 16 = last 16 samples of the LTS][LTS 64], 80
+/// samples [23.3.8.2.3.3.4, Eq 23-27]. For an SU PPDU the SIG-B symbol is
+/// an identical copy [23.3.8.2.3.3.5].
+pub fn dltf_time() -> Vec<Complex32> {
+    let x = ltf_period();
+    let mut out = Vec::with_capacity(80);
+    out.extend_from_slice(&x[48..]);
+    out.extend_from_slice(&x);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn beam_changeable_fields() {
+        let dstf = dstf_time();
+        let dltf = dltf_time();
+        assert_eq!(dstf.len(), 80);
+        assert_eq!(dltf.len(), 80);
+        assert_eq!(&dstf[..64], &stf_time()[..64]);
+        let x = ltf_period();
+        for i in 0..16 {
+            assert!((dltf[i] - x[48 + i]).norm() < 1e-6);
+        }
+        assert_eq!(&dltf[16..], &x[..]);
+    }
 
     #[test]
     fn field_lengths_and_power() {

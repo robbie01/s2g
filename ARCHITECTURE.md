@@ -8,12 +8,12 @@ ADALM-Pluto SDR at a **nonstandard carrier of 1250 MHz**.
 | Aspect | Choice | Notes |
 |---|---|---|
 | Bandwidth | 2 MHz only | 1 MHz (mandatory for a compliant S1G STA) deliberately ignored; 4/8/16 MHz PPDUs are identified from the SIG BW field for CCA/RID only |
-| Guard interval | Long GI (8 µs) | Short-GI PPDUs are identified (duration predicted) but not decoded |
+| Guard interval | Long GI (8 µs) is the TX default; **long and short GI are received** (short GI on TX via `TxVector::gi`) | Short GI applies from the second Data symbol on [Eq 23-58]; those symbols use a 3-sample FFT-window backoff, compensated as a known timing offset |
 | MCS | 0–8 and 11 (all valid for 2 MHz / 1 SS) | Mandatory floor is MCS 0–2 (non-AP) / 0–7 (AP) [4.3.14.1] |
 | Spatial streams | 1 | Pluto is 1×1; multi-stream/STBC PPDUs are identified from SIG for CCA/RID |
 | Coding | BCC (mandatory) **and LDPC** (optional) | Annex F matrices, 19.3.11.7.5 shortening/puncturing/repetition, LDPC extra symbol, tone mapper |
 | Pilots | Fixed (mandatory) **and traveling** (optional, Table 23-23) | Traveling pilots also drive per-tone channel tracking on RX |
-| Preamble | S1G_SHORT TX/RX; **S1G_LONG SIG-A detect + decode** (mandatory, SU and MU layouts) | S1G_LONG Data fields are not decoded (optional for a ≤ 2 MHz STA) → `RxEnd(UnsupportedRate)` with a complete RXVECTOR |
+| Preamble | S1G_SHORT TX/RX (default); **S1G_LONG SU TX/RX** (1 STS): SIG-A, D-STF, D-LTF1, SIG-B (= D-LTF1 for SU), Data with p_{n+2} pilots [23.3.8.2.3.3, Eq 23-56] | MU and multi-stream S1G_LONG PPDUs are identified from SIG-A for CCA/RID → `RxEnd(UnsupportedRate)` with a complete RXVECTOR |
 | PPDU | SU data PPDUs + NDP CMAC PPDUs | NDP CTS / Ack / BlockAck bodies are built and parsed in `s2g-mac` |
 | PHY procedures (23.3.20) | CCA (energy detect, preamble detect, predicted-duration hold), RSSI/RCPI/SNR in the RXVECTOR, PHY-RXSTART, PHY-RXEND statuses (NoError / FormatViolation / UnsupportedRate / CarrierLost), RXTIME wait-out | Thresholds in dBm via a calibration offset (`RxConfig::cal_offset_db`) |
 | RX tracking | Pilot CPE loop, sampling-clock-drift tracking with FFT-window stepping, channel smoothing when the SIG recommends it | ±20 ppm per end (23.3.17.3) handled with margin |

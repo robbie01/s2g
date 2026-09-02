@@ -180,7 +180,9 @@ impl Printer {
                     s2g_mac::ndp::NdpFrame::Cts(_) => "NDP CTS".to_string(),
                     s2g_mac::ndp::NdpFrame::Ack(_) => "NDP Ack".to_string(),
                     s2g_mac::ndp::NdpFrame::BlockAck(_) => "NDP BlockAck".to_string(),
-                    s2g_mac::ndp::NdpFrame::Other { ndp_type, .. } => format!("NDP type {ndp_type}"),
+                    s2g_mac::ndp::NdpFrame::Other { ndp_type, .. } => {
+                        format!("NDP type {ndp_type}")
+                    }
                 };
                 *self.stats.ndp_types.entry(kind).or_default() += 1;
                 println!(
@@ -190,9 +192,15 @@ impl Printer {
             }
             RxEvent::PsduReceived { sample_index, rxvector, psdu, metrics } => {
                 self.psdus += 1;
-                *self.stats.psdu_by_mcs.entry(format!("MCS{} {:?}", rxvector.mcs, rxvector.fec_coding)).or_default() += 1;
+                let sgi = if rxvector.gi == s2g_phy::vector::GuardInterval::Short { " SGI" } else { "" };
+                *self
+                    .stats
+                    .psdu_by_mcs
+                    .entry(format!("MCS{} {:?} {:?}{sgi}", rxvector.mcs, rxvector.fec_coding, rxvector.preamble_type))
+                    .or_default() += 1;
                 println!(
-                    "[{sample_index}] PSDU mcs={} {:?} len={} agg={} tp={} seed={} snr={:.1}dB cfo={:+.0}Hz evm={:.1}dB rssi={:.1}dBFS drift={:+.2} ldpc_fail={}",
+                    "[{sample_index}] PSDU {:?}{sgi} mcs={} {:?} len={} agg={} tp={} seed={} snr={:.1}dB cfo={:+.0}Hz evm={:.1}dB rssi={:.1}dBFS drift={:+.2} ldpc_fail={}",
+                    rxvector.preamble_type,
                     rxvector.mcs,
                     rxvector.fec_coding,
                     psdu.len(),
@@ -241,7 +249,12 @@ impl Printer {
                                 Ok(ParsedFrame::Other { fc, duration_us }) => {
                                     let addr1 = if m.len() >= 10 { mac_str(&m[4..10]) } else { "-".into() };
                                     let addr2 = if m.len() >= 16 { mac_str(&m[10..16]) } else { "-".into() };
-                                    format!("{} fc={:02x}{:02x} dur={duration_us} a1 {addr1} a2 {addr2}", frame_type_name(fc[0]), fc[0], fc[1])
+                                    format!(
+                                        "{} fc={:02x}{:02x} dur={duration_us} a1 {addr1} a2 {addr2}",
+                                        frame_type_name(fc[0]),
+                                        fc[0],
+                                        fc[1]
+                                    )
                                 }
                                 Err(e) => format!("{e} ({} octets)", m.len()),
                             };
@@ -265,7 +278,10 @@ impl Printer {
     fn summary(&self) {
         let s = &self.stats;
         eprintln!("--- summary ---");
-        eprintln!("preamble detections: {} | RXSTART short: {} long: {} | NDP: {} {:?}", s.detections, s.starts_short, s.starts_long, s.ndps, s.ndp_types);
+        eprintln!(
+            "preamble detections: {} | RXSTART short: {} long: {} | NDP: {} {:?}",
+            s.detections, s.starts_short, s.starts_long, s.ndps, s.ndp_types
+        );
         eprintln!("RXEND: {:?}", s.ends);
         eprintln!("PSDUs by MCS: {:?}", s.psdu_by_mcs);
         if self.mac || self.pcap.is_some() {
@@ -343,11 +359,7 @@ fn receive_pluto(args: &Args, rx: &mut Receiver, printer: &mut Printer) -> Resul
         RxGain::Manual(args.gain.parse().map_err(|_| anyhow::anyhow!("--gain must be 'auto' or a dB value"))?)
     };
     let mut pluto = s2g_sdr_pluto::Pluto::open(uri).map_err(|e| anyhow::anyhow!("pluto: {e}"))?;
-    let cfg = StreamConfig {
-        center_freq_hz: args.freq,
-        sample_rate_hz: DEFAULT_DEVICE_RATE_HZ,
-        rf_bandwidth_hz: args.rf_bandwidth,
-    };
+    let cfg = StreamConfig { center_freq_hz: args.freq, sample_rate_hz: DEFAULT_DEVICE_RATE_HZ, rf_bandwidth_hz: args.rf_bandwidth };
     let mut stream = pluto.open_rx(&cfg, gain).map_err(|e| anyhow::anyhow!("pluto rx: {e}"))?;
     eprintln!("Pluto RX @ {} Hz, {} S/s (decimating to 2 MS/s)", args.freq, DEFAULT_DEVICE_RATE_HZ);
     let mut dec = s2g_dsp::HalfbandDecim2::new();

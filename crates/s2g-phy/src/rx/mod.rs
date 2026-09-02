@@ -11,8 +11,15 @@
 //!
 //! All FFT windows back off [`BACKOFF`] samples into the preceding GI
 //! (ISI-safe; the common linear phase is absorbed by the channel estimate
-//! since every window uses the same offset), and the window position is
-//! advanced/retarded as pilot phase slopes reveal sampling-clock drift.
+//! since every window uses the same offset — short-GI symbols back off
+//! less and the difference is compensated as a known timing offset), and
+//! the window position is advanced/retarded as pilot phase slopes reveal
+//! sampling-clock drift.
+//!
+//! S1G_LONG SU PPDUs (1 STS) continue after SIG-A through the
+//! beam-changeable portion: the D-STF is skipped, D-LTF1 and SIG-B (a
+//! repeat of D-LTF1 for SU) re-estimate the channel, and the Data field is
+//! decoded exactly like an S1G_SHORT one [23.3.8.2.3.3; Eq 23-56].
 
 pub mod chanest;
 pub mod decode;
@@ -20,7 +27,7 @@ pub mod sync;
 
 use crate::ofdm::{self, SIG_SUBCARRIER_INDICES};
 use crate::params::{self, rf, SAMPLE_RATE_HZ};
-use crate::vector::{PreambleType, RxVector};
+use crate::vector::{GuardInterval, PreambleType, RxVector};
 use crate::{pilots, sig, Complex32};
 use chanest::Equalizer;
 use decode::DataDecoder;
@@ -142,6 +149,12 @@ fn trace_enabled() -> bool {
 /// (5 µs) together with ±6 samples of timing error before ISI appears; the
 /// timing tracker keeps the residual error well inside that.
 const BACKOFF: u64 = 6;
+/// Window backoff for short-GI Data symbols (8-sample GI): leaves 5
+/// samples (2.5 µs) for the delay spread a short GI is meant for.
+const BACKOFF_SGI: u64 = 3;
+/// S1G_LONG beam-changeable portion for one space-time stream: D-STF (80)
+/// + D-LTF (80) + SIG-B (80) samples [23.3.8.2.3.3].
+const LONG_BEAM_PORTION: u64 = 240;
 /// Overlap re-scanned across `process` calls so a detection run split by a
 /// chunk boundary is still found.
 const SCAN_OVERLAP: u64 = 112;
@@ -158,8 +171,24 @@ const SAMPLES_PER_US: u64 = 2;
 
 enum State {
     Search,
-    LtfSync { trig: u64, coarse_cfo: f32 },
-    Sig { anchor: u64, cfo: f32, eq: Equalizer, rssi: f32 },
+    LtfSync {
+        trig: u64,
+        coarse_cfo: f32,
+    },
+    Sig {
+        anchor: u64,
+        cfo: f32,
+        eq: Equalizer,
+        rssi: f32,
+    },
+    /// S1G_LONG SU: SIG-A accepted, waiting for D-STF / D-LTF / SIG-B.
+    LongPreamble {
+        anchor: u64,
+        cfo: f32,
+        eq: Equalizer,
+        rssi: f32,
+        rxv: RxVector,
+    },
     Data(Box<DataState>),
 }
 
@@ -270,6 +299,13 @@ struct DataState {
     timing: TimingTracker,
     phase: PhaseTracker,
     lost_run: usize,
+    /// First sample of the Data field (absolute).
+    data_start: u64,
+    /// Data symbol period: 80 samples, or 72 with short GI (the first
+    /// symbol always has the long GI, so payload n sits at
+    /// `data_start + 16 + n·sym_len` either way) [Eq 23-58, 23-61].
+    sym_len: u64,
+    sgi: bool,
 }
 
 /// Streaming receiver state machine.
@@ -367,7 +403,11 @@ impl Receiver {
     }
 
     fn fft_window(&self, payload_abs: u64, cfo: f32, ref_abs: u64) -> Option<ofdm::FreqSymbol> {
-        let t = self.extract(payload_abs - BACKOFF, 64, cfo, ref_abs)?;
+        self.fft_window_backoff(payload_abs, BACKOFF, cfo, ref_abs)
+    }
+
+    fn fft_window_backoff(&self, payload_abs: u64, backoff: u64, cfo: f32, ref_abs: u64) -> Option<ofdm::FreqSymbol> {
+        let t = self.extract(payload_abs - backoff, 64, cfo, ref_abs)?;
         Some(ofdm::fft_symbol(&t))
     }
 
@@ -481,6 +521,7 @@ impl Receiver {
                 State::Search => self.step_search(events),
                 State::LtfSync { .. } => self.step_ltf(events),
                 State::Sig { .. } => self.step_sig(events),
+                State::LongPreamble { .. } => self.step_long_preamble(),
                 State::Data(_) => self.step_data(events),
             };
             if !progressed {
@@ -612,9 +653,7 @@ impl Receiver {
             return false;
         };
         let w1 = self.fft_window(anchor + 128 + 16, cfo, anchor).expect("buffered");
-        let State::Sig { eq, rssi, .. } = std::mem::replace(&mut self.state, State::Search) else {
-            unreachable!()
-        };
+        let State::Sig { eq, rssi, .. } = std::mem::replace(&mut self.state, State::Search) else { unreachable!() };
         let e1 = eq.equalize(&w1, &SIG_SUBCARRIER_INDICES, &pilots::PILOT_INDICES, &pilots::sig_pilots(0));
         let e2 = eq.equalize(&w2, &SIG_SUBCARRIER_INDICES, &pilots::PILOT_INDICES, &pilots::sig_pilots(1));
         let (ptype, _conf) = sig::detect_preamble_type(&e2.data);
@@ -638,29 +677,11 @@ impl Receiver {
             Ok(content) => match content.verdict().expect("non-NDP") {
                 sig::SigVerdict::Supported(mut rxv) => {
                     self.fill_measurements(&mut rxv, &eq, rssi);
-                    let p = params::mcs_params(rxv.mcs).expect("validated");
-                    let end = ppdu_end(&rxv);
                     events.push(RxEvent::RxStart { sample_index: anchor, rxvector: rxv.clone() });
-                    let mut eq = eq;
-                    if rxv.smoothing {
-                        // The LTF windows start BACKOFF samples early, which
-                        // the estimate carries as a known linear phase.
-                        eq.smooth(-2.0 * core::f32::consts::PI * BACKOFF as f32 / 64.0);
+                    match rxv.preamble_type {
+                        PreambleType::S1gShort => self.enter_data(anchor, cfo, eq, rssi, rxv, sig_end),
+                        PreambleType::S1gLong => self.state = State::LongPreamble { anchor, cfo, eq, rssi, rxv },
                     }
-                    let dec = DataDecoder::new(p, &rxv, self.cfg.max_ldpc_iterations);
-                    self.state = State::Data(Box::new(DataState {
-                        anchor,
-                        cfo,
-                        eq,
-                        rxv,
-                        dec,
-                        n: 0,
-                        rssi,
-                        end,
-                        timing: TimingTracker::new(),
-                        phase: PhaseTracker::new(),
-                        lost_run: 0,
-                    }));
                 }
                 sig::SigVerdict::Unsupported(mut rxv, why) => {
                     self.fill_measurements(&mut rxv, &eq, rssi);
@@ -692,22 +713,96 @@ impl Receiver {
         true
     }
 
+    /// S1G_LONG beam-changeable portion [23.3.8.2.3.3]: skip the D-STF,
+    /// re-estimate the channel from D-LTF1 and SIG-B (an SU SIG-B repeats
+    /// D-LTF1, so the pair is as good as LTF1), then start the Data field.
+    fn step_long_preamble(&mut self) -> bool {
+        let (anchor, cfo) = match &self.state {
+            State::LongPreamble { anchor, cfo, .. } => (*anchor, *cfo),
+            _ => unreachable!(),
+        };
+        let beam_start = anchor + 288;
+        // D-LTF LTS payload at +80 (D-STF) + 16 (GI); SIG-B LTS at +160 + 16.
+        let Some(l2) = self.fft_window(beam_start + 176, cfo, anchor) else {
+            return false;
+        };
+        let l1 = self.fft_window(beam_start + 96, cfo, anchor).expect("buffered");
+        let State::LongPreamble { eq, rssi, rxv, .. } = std::mem::replace(&mut self.state, State::Search) else { unreachable!() };
+        let fresh = chanest::estimate(&l1, &l2);
+        // With B23 = 0 the beam-changeable portion is meant to see the same
+        // channel as LTF1; average the two estimates when they agree.
+        let sim = eq.estimate().similarity(&fresh);
+        if trace_enabled() {
+            let d = chanest::estimate(&l1, &l1);
+            let s = chanest::estimate(&l2, &l2);
+            eprintln!(
+                "trace long-preamble b23_smooth {} sim(ltf1,pair) {sim:.4} sim(ltf1,dltf) {:.4} sim(ltf1,sigb) {:.4} sim(dltf,sigb) {:.4} snr ltf1 {:.1} pair {:.1}",
+                rxv.smoothing,
+                eq.estimate().similarity(&d),
+                eq.estimate().similarity(&s),
+                d.similarity(&s),
+                eq.estimate().snr_db(),
+                fresh.snr_db()
+            );
+            let taps = ofdm::idft(&eq.estimate().h, 1.0);
+            let pdp: Vec<String> = (0..64).map(|i| format!("{:.3}", taps[(i + 52) % 64].norm())).take(28).collect();
+            eprintln!("trace pdp (taps -12..+15): {}", pdp.join(" "));
+        }
+        let est = if rxv.smoothing && sim > 0.9 { eq.estimate().merge(&fresh) } else { fresh };
+        self.enter_data(anchor, cfo, Equalizer::new(est), rssi, rxv, beam_start + LONG_BEAM_PORTION);
+        true
+    }
+
+    /// Channel estimate and RXVECTOR settled: decode the Data field that
+    /// starts at `data_start`.
+    fn enter_data(&mut self, anchor: u64, cfo: f32, mut eq: Equalizer, rssi: f32, rxv: RxVector, data_start: u64) {
+        let p = params::mcs_params(rxv.mcs).expect("validated");
+        if rxv.smoothing {
+            // The LTF windows start BACKOFF samples early, which the
+            // estimate carries as a known linear phase.
+            eq.smooth(-2.0 * core::f32::consts::PI * BACKOFF as f32 / 64.0);
+        }
+        let sgi = rxv.gi == GuardInterval::Short;
+        let end = Self::ppdu_end_sample(anchor, &rxv);
+        let dec = DataDecoder::new(p, &rxv, self.cfg.max_ldpc_iterations);
+        self.state = State::Data(Box::new(DataState {
+            anchor,
+            cfo,
+            eq,
+            rxv,
+            dec,
+            n: 0,
+            rssi,
+            end,
+            timing: TimingTracker::new(),
+            phase: PhaseTracker::new(),
+            lost_run: 0,
+            data_start,
+            sym_len: if sgi { 72 } else { 80 },
+            sgi,
+        }));
+    }
+
     fn step_data(&mut self, events: &mut Vec<RxEvent>) -> bool {
-        let (payload, anchor, cfo, n, shift) = match &self.state {
+        let (payload, backoff, anchor, cfo, n) = match &self.state {
             State::Data(ds) => (
-                (ds.anchor as i64 + 288 + 16 + 80 * ds.n as i64 + ds.timing.shift) as u64,
+                (ds.data_start as i64 + 16 + ds.sym_len as i64 * ds.n as i64 + ds.timing.shift) as u64,
+                if ds.sgi && ds.n > 0 { BACKOFF_SGI } else { BACKOFF },
                 ds.anchor,
                 ds.cfo,
                 ds.n,
-                ds.timing.shift,
             ),
             _ => unreachable!(),
         };
-        let _ = shift;
-        let Some(w) = self.fft_window(payload, cfo, anchor) else { return false };
-        let State::Data(mut ds) = std::mem::replace(&mut self.state, State::Search) else {
-            unreachable!()
+        let Some(w) = self.fft_window_backoff(payload, backoff, cfo, anchor) else {
+            return false;
         };
+        let State::Data(mut ds) = std::mem::replace(&mut self.state, State::Search) else { unreachable!() };
+        // A window that backs off less than the LTF windows did sees the
+        // symbol `BACKOFF − backoff` samples early relative to the channel
+        // estimate: a known offset, excluded from drift tracking and put
+        // back when equalizing.
+        let known = backoff as f32 - BACKOFF as f32;
         let tp = ds.rxv.traveling_pilots;
         let positions = pilots::pilot_positions(n, tp);
         let expected = pilots::data_pilots(n, tp);
@@ -727,12 +822,12 @@ impl Receiver {
         }
 
         // ---- Pilot tracking: CPE loop + timing-drift filter ----
-        let hint = self.cfg.timing_tracking.then(|| chanest::slope_for_timing_offset(ds.timing.filtered));
+        let hint = self.cfg.timing_tracking.then(|| chanest::slope_for_timing_offset(ds.timing.filtered + known));
         let m = ds.eq.measure_pilots(&w, &positions, &expected, hint);
         let cpe = ds.phase.update(m.cpe);
         let slope = if self.cfg.timing_tracking {
-            let residual = if m.quality > 0.5 { ds.timing.update(m.timing_offset_samples()) } else { ds.timing.filtered };
-            chanest::slope_for_timing_offset(residual)
+            let residual = if m.quality > 0.5 { ds.timing.update(m.timing_offset_samples() - known) } else { ds.timing.filtered };
+            chanest::slope_for_timing_offset(residual + known)
         } else {
             m.slope
         };
@@ -741,9 +836,20 @@ impl Receiver {
             ds.eq.track_pilots(&w, &positions, &expected, cpe, slope, 0.5);
         }
         if trace_enabled() {
+            if std::env::var_os("S2G_DUMP_TONES").is_some() {
+                let tones: Vec<String> = e.data.iter().map(|v| format!("{:.4},{:.4}", v.re, v.im)).collect();
+                eprintln!("tones sym {n} mcs {} k {:?} : {}", ds.rxv.mcs, indices, tones.join(" "));
+                let ep = ds.eq.apply(&w, &positions, cpe, slope);
+                let ratios: Vec<String> = ep.data.iter().zip(&expected).map(|(v, x)| format!("{:.3}", v.norm() / x.norm())).collect();
+                eprintln!(
+                    "pilots sym {n} amp/expected {} phase {:?}",
+                    ratios.join(" "),
+                    ep.data.iter().zip(&expected).map(|(v, x)| (v * x.conj()).arg()).collect::<Vec<_>>()
+                );
+            }
             eprintln!(
                 "trace sym {n:3} raw_off {:+.3} filt {:+.3} shift {:+} cpe {:+.3} meas_cpe {:+.3} q {:.3} p_sym/sig {:.2}",
-                m.timing_offset_samples(),
+                m.timing_offset_samples() - known,
                 ds.timing.filtered,
                 ds.timing.shift,
                 cpe,
@@ -758,7 +864,7 @@ impl Receiver {
         match result {
             None => {
                 // Trim consumed symbols to bound memory on long PPDUs.
-                let consumed = ds.anchor + 288 + 80 * (ds.n as u64 - 1);
+                let consumed = ds.data_start + ds.sym_len * (ds.n as u64 - 1);
                 self.state = State::Data(ds);
                 self.trim(consumed);
                 true
@@ -792,7 +898,3 @@ impl Receiver {
         anchor - 192 + rxv.ppdu_duration_us() as u64 * SAMPLES_PER_US
     }
 }
-
-/// Unused-format guard for the `PreambleType` import (kept for readers).
-#[allow(dead_code)]
-fn _preamble_type_marker(_: PreambleType) {}

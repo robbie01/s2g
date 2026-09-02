@@ -29,6 +29,34 @@ impl ChannelEstimate {
         10.0 * (self.signal_power / self.noise_var.max(1e-12)).log10()
     }
 
+    /// Average two independent estimates of the same channel (e.g. LTF1
+    /// and the D-LTF/SIG-B pair of an S1G_LONG SU PPDU whose SIG-A says the
+    /// beam did not change): halves the estimation noise.
+    pub fn merge(&self, other: &ChannelEstimate) -> ChannelEstimate {
+        let mut h = self.h;
+        for (a, o) in h.iter_mut().zip(&other.h) {
+            *a = (*a + *o) * 0.5;
+        }
+        ChannelEstimate {
+            h,
+            noise_var: 0.5 * (self.noise_var + other.noise_var),
+            signal_power: 0.5 * (self.signal_power + other.signal_power),
+        }
+    }
+
+    /// Normalized correlation of two estimates over the used tones (1 =
+    /// identical channel up to a common scale).
+    pub fn similarity(&self, other: &ChannelEstimate) -> f32 {
+        let ltf = preamble::ltf_freq();
+        let (mut x, mut p1, mut p2) = (Complex32::new(0.0, 0.0), 0.0f32, 0.0f32);
+        for a in (0..64).filter(|&a| ltf[a].norm_sqr() > 0.0) {
+            x += self.h[a] * other.h[a].conj();
+            p1 += self.h[a].norm_sqr();
+            p2 += other.h[a].norm_sqr();
+        }
+        x.norm() / (p1 * p2).sqrt().max(1e-12)
+    }
+
     /// RXVECTOR SNR [Table 23-1]: the mean over the used tones of the
     /// per-tone SNR in dB.
     pub fn mean_tone_snr_db(&self) -> f32 {
@@ -63,11 +91,7 @@ pub fn estimate(lts1: &FreqSymbol, lts2: &FreqSymbol) -> ChannelEstimate {
             used += 1;
         }
     }
-    ChannelEstimate {
-        h,
-        noise_var: noise / used as f32,
-        signal_power: sig / used as f32,
-    }
+    ChannelEstimate { h, noise_var: noise / used as f32, signal_power: sig / used as f32 }
 }
 
 /// Mean power per used tone (±1..±28) of an FFT-domain symbol — compared
@@ -402,7 +426,13 @@ mod tests {
         // has been refreshed.
         let (l1, l2) = ltf_fft_pair(|_| Complex32::new(1.0, 0.0));
         let mut eq = Equalizer::new(estimate(&l1, &l2));
-        let chan = |k: i32| if k == 5 { Complex32::new(0.5, 0.5) } else { Complex32::new(1.0, 0.0) };
+        let chan = |k: i32| {
+            if k == 5 {
+                Complex32::new(0.5, 0.5)
+            } else {
+                Complex32::new(1.0, 0.0)
+            }
+        };
         for n in 0..14 {
             let pos = pilots::pilot_positions(n, true);
             let vals = pilots::data_pilots(n, true);

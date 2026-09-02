@@ -3,15 +3,17 @@
 //!
 //! These are the PHY↔MAC contract. The MAC constructs a [`TxVector`] per PPDU
 //! and receives an [`RxVector`] with `PHY-RXSTART` / each decoded PSDU.
-//! Transmission is restricted to 1 spatial stream, S1G_SHORT, long GI, BCC or
-//! LDPC. Reception decodes the same set; every other mode the SIG / SIG-A can
-//! signal is still *identified* (for CCA and RID) and reported as an
-//! unsupported rate.
+//! Transmission and reception cover 1 spatial stream, S1G_SHORT or S1G_LONG
+//! (SU) preambles, long or short GI, BCC or LDPC. Every other mode the SIG /
+//! SIG-A can signal (STBC, multiple streams, wider bandwidths, MU) is still
+//! *identified* (for CCA and RID) and reported as an unsupported rate.
 
 use crate::params::{self, N_SERVICE, N_TAIL, T_DLTF_US, T_DSTF_US, T_LTF_US, T_PREAMBLE_US, T_SIGB_US, T_SYML_US, T_SYMS_US};
 
-/// Guard interval selection. Only `Long` (8 µs) is transmitted/decoded;
-/// `Short` PPDUs are identified for duration prediction only.
+/// Data-field guard interval, signalled per PPDU by the Short GI bit of
+/// SIG/SIG-A (like the MCS, independent of the channel the STA is parked
+/// on). `Short` (4 µs) applies from the second Data symbol on; the first
+/// Data symbol always carries the 8 µs GI [Eq 23-58].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum GuardInterval {
     #[default]
@@ -70,7 +72,11 @@ impl ResponseIndication {
 pub struct TxVector {
     /// S1G MCS index; valid for 2 MHz / 1 SS: 0..=8 or 11.
     pub mcs: u8,
-    /// Guard interval (must be `Long`).
+    /// PREAMBLE_TYPE: S1G_SHORT (default) or S1G_LONG (SU, 1 STS). Both are
+    /// received; S1G_LONG costs 120 µs more preamble.
+    pub preamble_type: PreambleType,
+    /// Data-field guard interval. `Short` saves 10 % airtime but halves the
+    /// delay-spread tolerance; keep `Long` for range.
     pub gi: GuardInterval,
     /// FEC_CODING: BCC (mandatory) or LDPC (optional, 23.3.9.4.4).
     pub fec_coding: Coding,
@@ -102,6 +108,7 @@ impl Default for TxVector {
     fn default() -> Self {
         Self {
             mcs: 0,
+            preamble_type: PreambleType::S1gShort,
             gi: GuardInterval::Long,
             fec_coding: Coding::Bcc,
             aggregation: false,
@@ -246,9 +253,13 @@ impl RxVector {
     /// RXTIME as literally defined by Eq 23-69 (S1G_SHORT) / Eq 23-70
     /// (S1G_LONG): the duration after SIG/SIG-A plus one 40 µs margin.
     pub fn rxtime_us(&self) -> u32 {
-        self.ppdu_duration_us() - T_PREAMBLE_US + T_DSTF_US
-            - if self.preamble_type == PreambleType::S1gLong { T_DSTF_US } else { 0 }
+        self.ppdu_duration_us() - T_PREAMBLE_US + T_DSTF_US - if self.preamble_type == PreambleType::S1gLong { T_DSTF_US } else { 0 }
     }
+}
+
+/// TXTIME of a 1-STS PPDU with `n_sym` Data symbols, µs [Eq 23-73/23-74].
+pub fn ppdu_duration_us(preamble_type: PreambleType, gi: GuardInterval, n_sym: usize) -> u32 {
+    RxVector { preamble_type, gi, n_sym, num_sts: 1, ..Default::default() }.ppdu_duration_us()
 }
 
 /// N_SYM and PSDU_LENGTH from the SIG/SIG-A fields, for any coding and STBC
