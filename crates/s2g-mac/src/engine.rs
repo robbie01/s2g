@@ -1729,7 +1729,9 @@ mod tests {
         assert!(drain_tx(&mut mac, &mut now, &mut out).is_some());
         // Ingress: an IPv4 frame from the air is dropped with an event, the
         // IPv6 one delivered.
-        let mut mac_b = Mac::new(cfg.clone());
+        let mut cfg_b = MacConfig::new(B);
+        cfg_b.filter = FilterConfig::good_neighbor();
+        let mut mac_b = Mac::new(cfg_b);
         let mut out_b = Vec::new();
         let data4 = frame::build_data(B, A, 1, false, 0, &eth::to_body(0x0800, &[0x45; 30]));
         mac_b.on_phy_event(&psdu_event(&TxVector::default(), &data4), 0, &mut out_b);
