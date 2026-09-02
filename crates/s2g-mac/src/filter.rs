@@ -308,7 +308,7 @@ fn check_icmpv6(cfg: &FilterConfig, icmp: &[u8]) -> Verdict {
         134 if !cfg.allow_router_discovery => Verdict::Drop("ICMPv6 Router Advertisement"),
         137 if !cfg.allow_router_discovery => Verdict::Drop("ICMPv6 Redirect"),
         130 | 131 | 132 | 143 if !cfg.allow_mld => Verdict::Drop("MLD"),
-        151 | 152 | 153 if !cfg.allow_mld => Verdict::Drop("Multicast Router Discovery"),
+        151..=153 if !cfg.allow_mld => Verdict::Drop("Multicast Router Discovery"),
         _ => Verdict::Pass,
     }
 }
