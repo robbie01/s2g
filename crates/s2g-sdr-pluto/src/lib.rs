@@ -240,6 +240,7 @@ mod tests {
                 std::thread::spawn(move || {
                     let mut r = BufReader::new(conn.try_clone().unwrap());
                     let mut w = conn;
+                    let mut new_client = false;
                     loop {
                         let mut line = String::new();
                         if r.read_line(&mut line).unwrap_or(0) == 0 {
@@ -254,7 +255,11 @@ mod tests {
                             "PRINT" => {
                                 write!(w, "{}\n{}", XML.len(), XML).unwrap();
                             }
-                            "TIMEOUT" | "OPEN" | "CLOSE" | "SET" => {
+                            "TIMEOUT" | "CLOSE" | "SET" => {
+                                write!(w, "0\n").unwrap();
+                            }
+                            "OPEN" => {
+                                new_client = true;
                                 write!(w, "0\n").unwrap();
                             }
                             "READ" => {
@@ -284,12 +289,18 @@ mod tests {
                                     v = v.wrapping_add(1);
                                 }
                                 data.truncate(want);
+                                // Real iiod framing: the mask line only with the
+                                // first chunk after OPEN, no trailing 0 when all
+                                // requested bytes were delivered.
                                 let half = want / 2;
-                                write!(w, "{half}\n00000003\n").unwrap();
+                                write!(w, "{half}\n").unwrap();
+                                if new_client {
+                                    write!(w, "00000003\n").unwrap();
+                                    new_client = false;
+                                }
                                 w.write_all(&data[..half]).unwrap();
-                                write!(w, "{}\n00000003\n", want - half).unwrap();
+                                write!(w, "{}\n", want - half).unwrap();
                                 w.write_all(&data[half..]).unwrap();
-                                write!(w, "0\n").unwrap();
                             }
                             "WRITEBUF" => {
                                 let len: usize = tok[2].parse().unwrap();
@@ -327,6 +338,14 @@ mod tests {
         let mut buf = vec![Complex32::new(0.0, 0.0); 100];
         let n = rx.recv(&mut buf).expect("recv");
         assert_eq!(n, 100);
+        // The rest of that buffer, then a second buffer whose chunks carry
+        // no mask line, must still parse.
+        let mut rest = vec![Complex32::new(0.0, 0.0); BUF_SAMPLES];
+        let n2 = rx.recv(&mut rest).expect("recv rest of first buffer");
+        assert_eq!(n2, BUF_SAMPLES - 100);
+        let n3 = rx.recv(&mut rest).expect("recv second buffer");
+        assert_eq!(n3, BUF_SAMPLES);
+        assert!((rest[0].re - (-64.0 / 2048.0)).abs() < 1e-6);
         // Ramp check: first sample = (−64, 64)/2048.
         assert!((buf[0].re - (-64.0 / 2048.0)).abs() < 1e-6);
         assert!((buf[0].im - (64.0 / 2048.0)).abs() < 1e-6);

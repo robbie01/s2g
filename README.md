@@ -86,8 +86,8 @@ target/release/s2g-rx --in baseband_862004550Hz_09-28-46_19-07-2026.wav --shift-
 
 | Capture | Result |
 |---|---|
-| "router looking for client", 864 MHz, 6 s | 102/102 PSDUs FCS-valid (MCS 0 A-MPDUs with traveling pilots, Action No Ack) |
-| same capture, 866 MHz channel | 93/93 FCS-valid |
+| "router looking for client", first 6 s, 864 MHz | 42/42 PSDUs FCS-valid (MCS 0 Action No Ack); an earlier revision of this table claimed 102, which the commit that produced it does not reproduce — `scripts/validate_captures.py` asserts 42 |
+| same capture, 866 MHz channel | 42/42 FCS-valid |
 | "15 MB transfer", 866 MHz, 8 s | 263/263 S1G_SHORT FCS-valid (119 RTS, 129 wrapped CTS/BlockAck, 5 S1G Beacons, 6 Action No Ack, 4 Action); the 109 S1G_LONG data PPDUs (MCS 6/7, 7 with short GI) now decode, but this recording's noise floor leaves them only 14–24 dB SNR: 4 of the 7 short MCS 6 MPDUs pass FCS, the 482-symbol MCS 7 transfers at 15 dB do not (64-QAM 5/6 needs ~23 dB) |
 
 `scripts/mega_get.py` fetches the Mega-hosted files.
@@ -112,6 +112,22 @@ target/release/s2g-rx --in mat/80211ah_mcs0_chan2_g0.0dB_att10dB_freq864.0MHz_0.
 
 `S2G_TRACE=1` prints per-symbol pilot tracking (timing offset, CPE, pilot coherence, symbol
 power) for any decode.
+
+## Testing without hardware
+
+- `scripts/validate_captures.py` decodes the three recordings above and fails if any
+  documented count drops (`--quick` skips the slow 20 MS/s WAVs). Run it before and after
+  touching the PHY.
+- `s2g-virtual-pluto` is an iiod server hosting virtual AD9363 radios coupled over a
+  simulated air interface: path loss, noise, per-radio oscillator error, propagation delay,
+  real-time pacing and iiod-style TX back-pressure. `s2g-node --uri 127.0.0.1:31431` talks to
+  it exactly as it would to a Pluto, so the whole streaming path runs on one machine.
+  `scripts/virtual_link.py` starts two radios 20 ppm apart, two nodes on UDP NICs, pushes
+  frames through both directions and prints delivery, latency, the reported peer offset
+  (±20 ppm to three digits) and the rate-control decisions. Building it caught two
+  framing bugs in the iiod client that the earlier canned mock had hidden: the channel-mask
+  line comes only with the first READBUF after OPEN, and a trailing 0 only after a partial
+  read (see `docs/iiod-protocol.md`).
 
 ## Hardware notes
 
@@ -251,6 +267,8 @@ to compile). Two nodes need distinct `--mac` addresses (default is randomized).
       S-MPDU, PV1 reception, CSMA with PHY CCA + NAV + RID + EIFS, NDP responses, retries,
       dedup, per-peer adaptive MCS (probing + SNR-bounded), amateur station identification
 - [x] `s2g-node`: TAP (Unix) / UDP (Windows) network interface over the radio
+- [x] Virtual Pluto (iiod server with simulated air) and a two-node end-to-end script;
+      capture regression script
 - [ ] Windows L2 TAP backend (tap-windows6); hardware-timestamped SIFS/ACK timing
 - [x] S1G_LONG SU Data-field reception and short-GI reception (both optional for a ≤ 2 MHz
       STA; validated on the baby-monitor capture) — also available on TX via `TxVector`

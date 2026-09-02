@@ -27,6 +27,9 @@ pub struct Client {
     s: TcpStream,
     rd: Vec<u8>,
     pos: usize,
+    /// iiod sends the channel-mask line only with the first READBUF chunk
+    /// after OPEN (`thd->new_client` in iiod/ops.c).
+    mask_pending: bool,
 }
 
 fn ioerr(e: std::io::Error) -> SdrError {
@@ -48,7 +51,7 @@ impl Client {
         s.set_read_timeout(Some(Duration::from_secs(10))).map_err(ioerr)?;
         s.set_write_timeout(Some(Duration::from_secs(10))).map_err(ioerr)?;
         s.set_nodelay(true).ok();
-        Ok(Self { s, rd: Vec::new(), pos: 0 })
+        Ok(Self { s, rd: Vec::new(), pos: 0, mask_pending: false })
     }
 
     fn fill(&mut self) -> Result<(), SdrError> {
@@ -183,6 +186,7 @@ impl Client {
         if r < 0 {
             return Err(reterr("OPEN", r));
         }
+        self.mask_pending = true;
         Ok(())
     }
 
@@ -195,8 +199,12 @@ impl Client {
         Ok(())
     }
 
-    /// Read up to `nbytes` of raw buffer data (READBUF chunk framing:
-    /// retcode line, hex mask line, then raw bytes; 0 terminates).
+    /// Read up to `nbytes` of raw buffer data. READBUF framing as iiod
+    /// implements it (iiod/ops.c `rw_dev` / `send_data`, libiio
+    /// `iiod_client_read_unlocked`): a retcode line with the chunk size,
+    /// a hex channel-mask line only with the first chunk after OPEN, then
+    /// the raw bytes; chunks repeat until `nbytes` have arrived, and a
+    /// retcode of 0 (sent only after a partial delivery) ends the read.
     pub fn readbuf(&mut self, dev: &str, nbytes: usize) -> Result<Vec<u8>, SdrError> {
         self.send(&format!("READBUF {dev} {nbytes}"))?;
         let mut out = Vec::with_capacity(nbytes);
@@ -208,7 +216,10 @@ impl Client {
             if n == 0 {
                 break;
             }
-            let _mask = self.read_line()?;
+            if self.mask_pending {
+                let _mask = self.read_line()?;
+                self.mask_pending = false;
+            }
             out.extend(self.read_exact_n(n as usize)?);
             if out.len() >= nbytes {
                 break;

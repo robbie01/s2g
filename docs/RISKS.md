@@ -27,7 +27,7 @@ for a while even with a dev kit in hand.
 | Traveling pilots (TX) | Self-consistent | Our RX decodes our TX; positions transcribed from Table 23-23 |
 | MCS 3–7 (16-QAM … 64-QAM 5/6) | External | Baby-monitor S1G_LONG data PPDUs (MCS 3–7) decode byte-exact (2026-09-02) |
 | MCS 8, 11 (256/1024-QAM) | Self-consistent | Loopback only; no capture uses them. Sensitivity simulation meets Table 23-35 with margin |
-| LDPC (all rates, all block lengths) | Self-consistent | Annex F matrices verified by H·cᵀ = 0; PPDU process (shortening / puncturing / repetition / extra symbol / tone mapper) round-trips. No external LDPC S1G signal exists in our captures. `scripts/matlab_vectors.m` generates reference waveforms if WLAN Toolbox is available |
+| LDPC (all rates, all block lengths) | Self-consistent, audited | Annex F matrices verified by H·cᵀ = 0; PPDU process (shortening / puncturing / repetition / extra symbol / tone mapper) round-trips. No external LDPC S1G signal exists in our captures. `scripts/matlab_vectors.m` generates reference waveforms if WLAN Toolbox is available. The PPDU process (Table 19-16 codeword selection, Eq 19-37..19-42, S1G N_pld/N_avbits, shortening/puncturing/repetition placement, D_TM = 4) was re-derived from the text on 2026-09-02 with no discrepancy |
 | S1G_LONG SU Data reception (D-LTF1/SIG-B estimate merged with LTF1, Eq 23-56 pilots) | External | Baby-monitor capture (2026-09-02): 1276 of 1278 FCS-valid data frames byte-exact vs the reference PCAP; the 18 frames the reference flags bad-FCS are the only other misses |
 | Short-GI reception | External | All 11 FCS-valid short-GI PPDUs in the baby-monitor capture (radiotap flag 0x80) decode byte-exact; 3-sample window backoff on short-GI symbols |
 | Short-GI / S1G_LONG transmission | Self-consistent | Loopback with CFO, echo and ±30 ppm SFO; TX defaults stay S1G_SHORT + 8 µs GI |
@@ -45,9 +45,10 @@ for a while even with a dev kit in hand.
 | Feature | Status | Evidence / gap |
 |---|---|---|
 | Data / RTS / Ack / A-MPDU wire formats, FCS, LLC/SNAP | External | Frames from real chips parse and re-serialise byte-exact |
-| NDP Ack / NDP BlockAck / NDP CTS bodies, Ack ID derivation | Self-consistent | Layouts transcribed from 23.3.12; the three recorded chips all use +HTC-wrapped CTS/BlockAck frames instead (allowed when link adaptation is negotiated), so no external check exists |
+| NDP Ack / NDP BlockAck / NDP CTS bodies, Ack ID derivation | Self-consistent, audited | Layouts re-derived field by field from Figures 23-23/23-29/23-33 and 10.56 on 2026-09-02 with no discrepancy; the Ack ID takes SERVICE bits B0–B6 (the raw scrambled bits, which the seed convention reproduces) and FCS field bits 23–31 in transmission order. The three recorded chips all use +HTC-wrapped CTS/BlockAck frames instead, so no external check exists |
 | RID, NAV, EIFS, PHY-driven CCA deferral | Self-consistent | Unit tests; timing values from Tables 23-41 / 10-3 |
-| PV1 reception | Self-consistent | Layout from 9.8; no PV1 frame seen in any capture |
+| PV1 reception | Self-consistent, audited | Frame Control bits, Table 9-670 addressing, SID flags, Sequence Control presence and Table 9-673 subtypes re-checked against 9.8 on 2026-09-02; no PV1 frame seen in any capture |
+| Pluto iiod client | Self-consistent (libiio semantics) | The virtual Pluto reproduces iiod's READBUF framing from the libiio sources and found two client bugs (mask line once per OPEN, no trailing 0 on full reads), now fixed; a real Pluto is still the only proof |
 | Padded-PSDU tolerance (`locate_mpdu`) | External | Baby monitor pads non-aggregated PSDUs to 4-octet multiples |
 | Scrambler seed 0 tolerance | External | imec dataset device uses the all-zero seed ~1/128 of the time |
 | A-MPDU packing, NDP BlockAck bitmap, selective retry | Self-consistent | Unit tests with corrupted MPDUs and a two-node PHY simulation; the 16-bit bitmap and SSN semantics follow 23.3.12.2.6.2 |

@@ -20,7 +20,7 @@ implement it directly in Rust (no native deps). Verified against libiio `libiio-
 | `TIMEOUT <ms>\r\n` | retcode |
 | `OPEN <dev> <samples_count> <mask> [CYCLIC]\r\n` | retcode. `<mask>` = one 8-hex-digit word per 32 channels, `%08x`, highest word first (Pluto RX/TX have <32 channels → a single word, e.g. `00000003` for voltage0+voltage1 = I+Q) |
 | `CLOSE <dev>\r\n` | retcode |
-| `READBUF <dev> <bytes>\r\n` | loop: retcode line (= bytes in this chunk, 0 ⇒ done, negative ⇒ error), then a hex mask line (`%08x…\n`), then that many raw binary bytes |
+| `READBUF <dev> <bytes>\r\n` | loop: retcode line (= bytes in this chunk, negative ⇒ error), then — **only with the first chunk after OPEN** (`thd->new_client` in iiod/ops.c) — a hex mask line (`%08x…\n`), then that many raw binary bytes. Chunks repeat until `<bytes>` have been delivered; a retcode of 0 is sent only after a *partial* delivery (or on error) and ends the read. The virtual Pluto (`s2g-virtual-pluto`) reproduces this exactly; it caught a client that expected a mask on every chunk |
 | `WRITEBUF <dev> <bytes>\r\n` | retcode line (OK to proceed), client sends raw payload, then retcode line (bytes consumed) |
 | `READ <dev> <attr>\r\n` | retcode (= value length), then value bytes + `\n` |
 | `READ <dev> INPUT\|OUTPUT <chan> <attr>\r\n` | same |
