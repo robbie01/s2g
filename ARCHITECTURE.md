@@ -18,7 +18,7 @@ ADALM-Pluto SDR at a **nonstandard carrier of 1250 MHz**.
 | PHY procedures (23.3.20) | CCA (energy detect, preamble detect, predicted-duration hold), RSSI/RCPI/SNR in the RXVECTOR, PHY-RXSTART, PHY-RXEND statuses (NoError / FormatViolation / UnsupportedRate / CarrierLost), RXTIME wait-out | Thresholds in dBm via a calibration offset (`RxConfig::cal_offset_db`) |
 | RX tracking | Pilot CPE loop, sampling-clock-drift tracking with FFT-window stepping, channel smoothing when the SIG recommends it | ±20 ppm per end (23.3.17.3) handled with margin |
 | TX conformance | `conformance` module: spectral flatness (Table 23-33), EVM vs Table 23-34, 2 MHz spectral mask (Fig 23-40), DC leakage | Measurements on baseband streams; the mask test runs on the 8 MS/s interpolated waveform |
-| MAC | OCB (no BSS); NDP Ack / NDP BlockAck / NDP CTS responses, RTS protection, RID, NAV, PHY-driven CCA | The only OCB liberty in the NDP path is the 9-bit partial AID derived from the MAC address |
+| MAC | OCB (no BSS); NDP Ack / NDP BlockAck / NDP CTS responses, RTS protection, RID, NAV, PHY-driven CCA, per-peer rate control (`rate.rs`: EWMA success per MCS, one-step probing with back-off, retry step-down, SNR-bounded) | The only OCB liberty in the NDP path is the 9-bit partial AID derived from the MAC address; rate adaptation is implementation-defined in 802.11 |
 
 ## Crate layout
 

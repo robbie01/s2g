@@ -140,7 +140,18 @@ Frames above `--rts-threshold` are protected by RTS → **NDP CTS**. None of thi
 BSS or association; the one OCB liberty is deriving the 9-bit partial AID from the MAC
 address. Timeouts are relaxed to SDR-latency scale; real SIFS needs hardware
 timestamping. The engine is IO-free and clock-injected — fully unit-tested plus
-two-node over-the-air simulation tests (NDP Ack, NDP BlockAck, RTS/NDP CTS, retries).
+two-node over-the-air simulation tests (NDP Ack, NDP BlockAck, RTS/NDP CTS, retries,
+rate control).
+
+**Per-peer rate control** (`s2g_mac::rate`, on by default in `s2g-node`; `--fixed-mcs`
+turns it off, `--min-mcs`/`--max-mcs` bound it): every unicast destination gets its own
+MCS. The controller keeps a smoothed success probability per MCS from the
+acknowledgements, uses the highest MCS still above a reliability floor, probes one step
+up every few frames (with exponential back-off after failed probes), steps down on
+retries, and caps probing with the SNR the PHY measures on whatever it hears from that
+peer (frames, NDP Acks, NDP CTS). Broadcasts stay at `--mcs`. 802.11 leaves rate
+adaptation to the implementation, so nothing here is spec-constrained; it is tuned for a
+link where a lost frame costs a long timeout rather than a SIFS.
 
 ### A-MPDUs, S-MPDUs and the partial AID (background for non-RF readers)
 
@@ -202,7 +213,7 @@ to compile). Two nodes need distinct `--mac` addresses (default is randomized).
 - [x] NDP CMAC PPDU TX/RX; NDP CTS / Ack / BlockAck frame bodies (bitmap protection)
 - [x] PlutoSDR TX/RX backend (pure-Rust iiod client) at arbitrary carrier
 - [x] OCB MAC: data/RTS/ACK frames, S-MPDU, PV1 reception, CSMA with PHY CCA + NAV + RID +
-      EIFS, NDP responses, retries, dedup
+      EIFS, NDP responses, retries, dedup, per-peer adaptive MCS (probing + SNR-bounded)
 - [x] `s2g-node`: TAP (Unix) / UDP (Windows) network interface over the radio
 - [ ] Windows L2 TAP backend (tap-windows6); hardware-timestamped SIFS/ACK timing
 - [x] S1G_LONG SU Data-field reception and short-GI reception (both optional for a ≤ 2 MHz

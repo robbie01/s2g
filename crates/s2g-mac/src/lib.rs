@@ -34,7 +34,9 @@ pub mod eth;
 pub mod fcs;
 pub mod frame;
 pub mod ndp;
+pub mod rate;
 
 pub use engine::{Mac, MacAction, MacConfig, MacEvent};
+pub use rate::{PeerRateInfo, RateConfig, RateControl};
 pub use frame::MacAddr;
 pub use ndp::NdpFrame;

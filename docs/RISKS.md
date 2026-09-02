@@ -49,6 +49,7 @@ for a while even with a dev kit in hand.
 | PV1 reception | Self-consistent | Layout from 9.8; no PV1 frame seen in any capture |
 | Padded-PSDU tolerance (`locate_mpdu`) | External | Baby monitor pads non-aggregated PSDUs to 4-octet multiples |
 | Scrambler seed 0 tolerance | External | imec dataset device uses the all-zero seed ~1/128 of the time |
+| Per-peer rate control | Self-consistent | Unit tests with synthetic success ceilings and a two-node PHY simulation at 30 dB / 11 dB SNR; the SNR hint assumes a roughly symmetric link and the probe/back-off constants are untuned against real fading |
 
 ## Deliberate deviations from the standard
 

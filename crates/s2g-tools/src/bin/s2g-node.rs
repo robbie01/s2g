@@ -7,7 +7,7 @@
 
 use anyhow::{bail, Result};
 use clap::Parser;
-use s2g_mac::{Mac, MacAction, MacConfig, MacEvent};
+use s2g_mac::{Mac, MacAction, MacConfig, MacEvent, RateConfig};
 use s2g_phy::vector::Coding;
 use s2g_tools::nic::Nic;
 use s2g_tools::DEFAULT_CENTER_FREQ_HZ;
@@ -51,6 +51,15 @@ struct Args {
     ack_timeout_ms: u64,
     #[arg(long, default_value_t = 3)]
     retries: u32,
+    /// Send every unicast frame at --mcs instead of adapting the MCS per peer
+    #[arg(long)]
+    fixed_mcs: bool,
+    /// Lowest MCS rate control falls back to
+    #[arg(long, default_value_t = 0)]
+    min_mcs: u8,
+    /// Highest MCS rate control probes
+    #[arg(long, default_value_t = 8)]
+    max_mcs: u8,
 
     /// Pluto iiod address
     #[arg(long, default_value = "192.168.2.1")]
@@ -135,13 +144,21 @@ fn main() -> Result<()> {
     cfg.rts_threshold = args.rts_threshold;
     cfg.ack_timeout_us = args.ack_timeout_ms * 1000;
     cfg.max_retries = args.retries;
+    cfg.rate = RateConfig {
+        enabled: !args.fixed_mcs,
+        start_mcs: args.mcs,
+        min_mcs: args.min_mcs,
+        max_mcs: args.max_mcs,
+        ..Default::default()
+    };
     let nic = make_nic(&args)?;
     eprintln!(
-        "s2g-node: mac {} | mcs {} {:?}{} | ack {} ({}) | rts {:?} | nic {}",
+        "s2g-node: mac {} | mcs {} {:?}{} | rate control {} | ack {} ({}) | rts {:?} | nic {}",
         fmt_mac(&addr),
         args.mcs,
         cfg.fec_coding,
         if args.traveling_pilots { " + traveling pilots" } else { "" },
+        if cfg.rate.enabled { format!("on ({}..={}, start {})", cfg.rate.min_mcs, cfg.rate.max_mcs, cfg.rate.start_mcs) } else { "off".to_string() },
         cfg.ack_enabled,
         if cfg.ndp_ack { "NDP" } else { "legacy" },
         cfg.rts_threshold,
@@ -250,6 +267,7 @@ fn run_radio(args: &Args, mut mac: Mac, nic: Box<dyn Nic>) -> Result<()> {
     let t0 = Instant::now();
     let mut interp = s2g_dsp::HalfbandInterp2::new();
     let mut mac_events: Vec<MacEvent> = Vec::new();
+    let mut rate_seen: std::collections::HashMap<[u8; 6], u8> = std::collections::HashMap::new();
     loop {
         let now_us = t0.elapsed().as_micros() as u64;
         match msg_rx.recv_timeout(Duration::from_millis(2)) {
@@ -282,9 +300,14 @@ fn run_radio(args: &Args, mut mac: Mac, nic: Box<dyn Nic>) -> Result<()> {
                 MacEvent::EthReceived(f) => {
                     let _ = nic_out_tx.send(f);
                 }
-                MacEvent::TxComplete { dest, acked, retries } => {
+                MacEvent::TxComplete { dest, acked, retries, mcs } => {
                     if args.verbose {
-                        eprintln!("tx done → {} acked={acked} retries={retries}", fmt_mac(&dest));
+                        eprintln!("tx done → {} acked={acked} retries={retries} mcs={mcs}", fmt_mac(&dest));
+                    }
+                    if let Some(now_mcs) = mac.peer_mcs(&dest) {
+                        if rate_seen.insert(dest, now_mcs) != Some(now_mcs) {
+                            eprintln!("rate → {}: MCS {now_mcs}", fmt_mac(&dest));
+                        }
                     }
                 }
                 MacEvent::TxDropped { dest, reason } => {

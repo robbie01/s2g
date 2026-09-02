@@ -5,7 +5,7 @@
 
 use num_complex::Complex;
 use s2g_mac::ndp::NdpFrame;
-use s2g_mac::{Mac, MacAction, MacConfig, MacEvent};
+use s2g_mac::{Mac, MacAction, MacConfig, MacEvent, RateConfig};
 use s2g_phy::rx::{Receiver, RxConfig, RxEvent};
 use s2g_phy::vector::Coding;
 use s2g_phy::Transmitter;
@@ -107,12 +107,18 @@ fn eth(dest: [u8; 6], src: [u8; 6], n: usize) -> Vec<u8> {
 /// Run both nodes for up to `max_ms` virtual milliseconds; `drop_tx` returns
 /// true when a given transmission (by 0-based index) should be lost in the
 /// air.
-fn run(a: &mut Node, b: &mut Node, max_ms: u64, mut drop_tx: impl FnMut(usize) -> bool) {
+fn run(a: &mut Node, b: &mut Node, max_ms: u64, drop_tx: impl FnMut(usize) -> bool) {
+    run_snr(a, b, max_ms, 25.0, drop_tx);
+}
+
+/// Like `run` with an explicit channel SNR.
+fn run_snr(a: &mut Node, b: &mut Node, max_ms: u64, snr_db: f32, mut drop_tx: impl FnMut(usize) -> bool) {
     fn step(
         me: &mut Node,
         peer: &mut Node,
         now: u64,
         rng: &mut Rng,
+        snr_db: f32,
         tx_count: &mut usize,
         drop_tx: &mut impl FnMut(usize) -> bool,
     ) {
@@ -127,7 +133,7 @@ fn run(a: &mut Node, b: &mut Node, max_ms: u64, mut drop_tx: impl FnMut(usize) -
         let idx = *tx_count;
         *tx_count += 1;
         if !drop_tx(idx) {
-            let air = channel(&wave, 25.0, 9_000.0, rng);
+            let air = channel(&wave, snr_db, 9_000.0, rng);
             peer.hear(&air, now);
         }
     }
@@ -135,8 +141,8 @@ fn run(a: &mut Node, b: &mut Node, max_ms: u64, mut drop_tx: impl FnMut(usize) -
     let mut tx_count = 0usize;
     for i in 0..max_ms * 2 {
         let now = i * 500;
-        step(a, b, now, &mut rng, &mut tx_count, &mut drop_tx);
-        step(b, a, now, &mut rng, &mut tx_count, &mut drop_tx);
+        step(a, b, now, &mut rng, snr_db, &mut tx_count, &mut drop_tx);
+        step(b, a, now, &mut rng, snr_db, &mut tx_count, &mut drop_tx);
     }
 }
 
@@ -248,4 +254,37 @@ fn lost_ndp_ack_retried_and_deduplicated() {
     assert_eq!(delivered(&b).len(), 1, "B events: {:?}", b.events);
     assert!(a.events.iter().any(|e| matches!(e, MacEvent::TxComplete { acked: true, retries: 1, .. })), "{:?}", a.events);
     assert_eq!(b.ndps_sent, 2);
+}
+
+#[test]
+fn rate_control_climbs_on_a_clean_link_and_settles_on_a_noisy_one() {
+    for (snr, lo, hi) in [(30.0f32, 6u8, 8u8), (11.0, 0, 3)] {
+        let mut cfg_a = Node::config(A, 0, true);
+        cfg_a.rate = RateConfig { enabled: true, ..Default::default() };
+        let mut a = Node::new(cfg_a);
+        let mut b = Node::new(Node::config(B, 0, true));
+        let frames: Vec<Vec<u8>> = (0..40).map(|i| eth(B, A, 120 + i)).collect();
+        for f in &frames {
+            a.mac.enqueue_eth(f).unwrap();
+        }
+        run_snr(&mut a, &mut b, 6000, snr, |_| false);
+        let got = delivered(&b);
+        assert_eq!(got.len(), frames.len(), "snr {snr}: {} delivered; A events: {:?}", got.len(), a.events.len());
+        for (g, f) in got.iter().zip(&frames) {
+            assert_eq!(*g, f);
+        }
+        let mcs = a.mac.peer_mcs(&B).expect("peer known");
+        assert!((lo..=hi).contains(&mcs), "snr {snr}: settled at MCS {mcs}: {:?}", a.mac.rate_control().info(&B));
+        // The controller only ever moved one step at a time from MCS 0.
+        let used: Vec<u8> = a
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                MacEvent::TxComplete { mcs, .. } => Some(*mcs),
+                _ => None,
+            })
+            .collect();
+        assert!(!used.is_empty());
+        assert!(used.iter().all(|&m| m <= hi), "snr {snr}: used {used:?}");
+    }
 }
