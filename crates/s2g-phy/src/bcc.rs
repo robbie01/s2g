@@ -62,7 +62,7 @@ pub fn encode(bits: &[u8], rate: CodeRate) -> Vec<u8> {
 /// always satisfy this per-field.
 pub fn punctured_len(n_info_bits: usize, rate: CodeRate) -> usize {
     let (num, den) = rate.as_fraction();
-    debug_assert!(n_info_bits % num == 0);
+    debug_assert!(n_info_bits.is_multiple_of(num));
     n_info_bits * den / num
 }
 

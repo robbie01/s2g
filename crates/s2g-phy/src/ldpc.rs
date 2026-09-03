@@ -8,7 +8,7 @@
 //! (block-row) scheduling and early termination.
 //!
 //! The PPDU-level process (codeword length/count selection, shortening,
-//! puncturing, repetition — 19.3.11.7.5 with the S1G N_pld/N_avbits
+//! puncturing, repetition: 19.3.11.7.5 with the S1G N_pld/N_avbits
 //! substitutions of 23.3.9.4.4) lives in [`PpduParams`]; `encode_data` /
 //! `decode_data` turn N_pld scrambled data bits into N_avbits coded bits and
 //! back. No BCC interleaver is used for LDPC; the constellation points are
@@ -469,8 +469,8 @@ impl PpduParams {
             let rx = &llrs[pos..pos + base_len + rep];
             pos += base_len + rep;
             // Shortened bits are known zeros: give them an LLR that dominates
-            // every received one (LLR scale is arbitrary — it depends on the
-            // CSI weighting — so derive it from the data).
+            // every received one (the LLR scale is arbitrary, since it
+            // depends on the CSI weighting, so derive it from the data).
             let max_abs = rx.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
             let known_zero = (16.0 * max_abs).max(1.0e3);
             let mut l = vec![0.0f32; code.n];

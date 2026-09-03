@@ -4,7 +4,7 @@
 //! against `preamble::ltf_freq()`; the noise variance comes from their
 //! difference. Per-symbol common phase error (CPE) and residual linear phase
 //! slope (timing offset / sampling-clock drift) are estimated from the 4
-//! pilots — fixed or traveling — and removed before the data tones are
+//! pilots (fixed or traveling) and removed before the data tones are
 //! handed to the demapper. CSI weight per tone is |H|²/σ² (for LLR
 //! scaling). With traveling pilots the estimate at each visited tone is
 //! refreshed, so a slowly varying channel is tracked through the PPDU.
@@ -84,8 +84,8 @@ pub fn estimate(lts1: &FreqSymbol, lts2: &FreqSymbol) -> ChannelEstimate {
             // The reference has unit magnitude (±1): dividing by r is exact.
             h[a] = avg / r;
             let d = lts1[a] - lts2[a];
-            // Var of (n1−n2)/1 is 2σ²; the averaged estimate sees σ²/2 but we
-            // report the per-tone, per-symbol σ².
+            // Var of (n1−n2) is 2σ²; the averaged estimate sees σ²/2, but
+            // the reported value is the per-tone, per-symbol σ².
             noise += d.norm_sqr() * 0.5;
             sig += avg.norm_sqr();
             used += 1;
@@ -94,7 +94,7 @@ pub fn estimate(lts1: &FreqSymbol, lts2: &FreqSymbol) -> ChannelEstimate {
     ChannelEstimate { h, noise_var: noise / used as f32, signal_power: sig / used as f32 }
 }
 
-/// Mean power per used tone (±1..±28) of an FFT-domain symbol — compared
+/// Mean power per used tone (±1..±28) of an FFT-domain symbol, compared
 /// with `ChannelEstimate::signal_power` to detect loss of carrier.
 pub fn used_tone_power(sym: &FreqSymbol) -> f32 {
     let mut p = 0.0f32;
@@ -217,11 +217,11 @@ impl Equalizer {
 
     /// Smooth the channel estimate across adjacent used tones with a
     /// [1 2 1]/4 kernel (the "Smoothing recommended" SIG bit means the
-    /// channel is benign enough for this) — trades a little bias in
+    /// channel is benign enough for this): a little bias in
     /// frequency-selective channels for ~2 dB less estimation noise.
     /// `known_slope` is a linear phase (radians per subcarrier) that the
-    /// estimate is known to contain — e.g. from the FFT window backoff — and
-    /// is removed before averaging so it does not bias the result.
+    /// estimate is known to contain, e.g. from the FFT window backoff; it is
+    /// removed before averaging so it does not bias the result.
     pub fn smooth(&mut self, known_slope: f32) {
         let ltf = preamble::ltf_freq();
         let used: Vec<usize> = (0..64).filter(|&a| ltf[a].norm_sqr() > 0.0).collect();
@@ -285,9 +285,9 @@ impl Equalizer {
             rot[l] = sym[a] * self.inv_h[a] * expected_pilots[l].conj() * Complex32::from_polar(1.0, -hint * k as f32);
             weights[l] = self.est.h[a].norm_sqr();
         }
-        // Residual slope from the two pilot *pairs* (independent of the
+        // Residual slope from the two pilot pairs (independent of the
         // CPE), weighted least squares through the origin. Positions are
-        // ascending, so the pairs are (0,3) — precise — and (1,2).
+        // ascending, so the pairs are (0,3), the precise one, and (1,2).
         let pair = |i: usize, j: usize| -> (f32, f32, f32) {
             let span = (pilot_positions[j] - pilot_positions[i]) as f32;
             ((rot[j] * rot[i].conj()).arg(), span, (weights[i] * weights[j]).sqrt())

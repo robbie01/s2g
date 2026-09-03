@@ -1,6 +1,7 @@
 //! 802.11 frame construction/parsing for OCB operation: Data frames with
-//! the wildcard BSSID [9.3.2; OCB per 11.1.4], Ack [9.3.1.4] and RTS
-//! [9.3.1.2] control frames. All frames carry an FCS.
+//! the wildcard BSSID [9.3.2; OCB per 11.18], Ack [9.3.1.4] and RTS
+//! [9.3.1.2] control frames. All frames carry an FCS. Parsed frames borrow
+//! their body from the MPDU.
 
 use crate::fcs;
 use thiserror::Error;
@@ -46,7 +47,7 @@ pub fn build_data(dest: MacAddr, src: MacAddr, seq: u16, retry: bool, duration_u
 }
 
 /// Build a QoS Data frame (subtype 8) with Normal Ack policy and the given
-/// TID: the MPDU type an A-MPDU carries [9.7.3, Table 9-664].
+/// TID: the MPDU type an A-MPDU carries [9.7.3, Table 9-661].
 pub fn build_qos_data(dest: MacAddr, src: MacAddr, seq: u16, retry: bool, duration_us: u16, tid: u8, body: &[u8]) -> Vec<u8> {
     let mut f = Vec::with_capacity(QOS_DATA_HDR_LEN + body.len() + 4);
     f.push(0x88); // version 0, type 2 (Data), subtype 8 (QoS Data)
@@ -95,9 +96,9 @@ pub enum Pv1Addr {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ParsedFrame {
+pub enum ParsedFrame<'a> {
     /// PV0 Data (subtype 0) or QoS Data (subtype 8, `tid` set).
-    Data { dest: MacAddr, src: MacAddr, bssid: MacAddr, seq: u16, retry: bool, duration_us: u16, tid: Option<u8>, body: Vec<u8> },
+    Data { dest: MacAddr, src: MacAddr, bssid: MacAddr, seq: u16, retry: bool, duration_us: u16, tid: Option<u8>, body: &'a [u8] },
     Ack { ra: MacAddr },
     Rts { ra: MacAddr, ta: MacAddr, duration_us: u16 },
     /// A PV1 (short MAC header) frame [9.8]: reception is mandatory for an
@@ -115,7 +116,7 @@ pub enum ParsedFrame {
         /// Ack Policy Indicator: false = Normal Ack, true = No Ack / Block Ack.
         no_ack: bool,
         protected: bool,
-        body: Vec<u8>,
+        body: &'a [u8],
     },
     /// Valid FCS but a type/subtype this MAC doesn't handle.
     Other { fc: [u8; 2], duration_us: u16 },
@@ -144,7 +145,7 @@ pub fn build_pv1_data(dest: MacAddr, src: MacAddr, seq: u16, tid: u8, no_ack: bo
     f
 }
 
-fn parse_pv1(inner: &[u8]) -> Result<ParsedFrame, FrameError> {
+fn parse_pv1(inner: &[u8]) -> Result<ParsedFrame<'_>, FrameError> {
     let fc0 = inner[0];
     let fc1 = inner[1];
     let ptype = (fc0 >> 2) & 7;
@@ -195,7 +196,7 @@ fn parse_pv1(inner: &[u8]) -> Result<ParsedFrame, FrameError> {
                 seq: None,
                 no_ack,
                 protected,
-                body: inner[pos..].to_vec(),
+                body: &inner[pos..],
             });
         }
     };
@@ -219,13 +220,13 @@ fn parse_pv1(inner: &[u8]) -> Result<ParsedFrame, FrameError> {
     };
     let a3 = if a3p { Some(take_mac(&mut pos)?) } else { None };
     let a4 = if a4p { Some(take_mac(&mut pos)?) } else { None };
-    Ok(ParsedFrame::Pv1 { ptype, subtype, from_ds, a1, a2, a3, a4, seq, no_ack, protected, body: inner[pos..].to_vec() })
+    Ok(ParsedFrame::Pv1 { ptype, subtype, from_ds, a1, a2, a3, a4, seq, no_ack, protected, body: &inner[pos..] })
 }
 
-/// Locate the MPDU inside a non-aggregated PSDU. Some S1G chips (seen on a
-/// commercial HaLow baby monitor) round the SIG Length up to a multiple of
-/// 4 octets and pad after the FCS, so try the full PSDU first and then up
-/// to 3 shorter prefixes; returns the longest prefix whose FCS verifies.
+/// Locate the MPDU inside a non-aggregated PSDU. Some S1G chips round the
+/// SIG Length up to a multiple of 4 octets and pad after the FCS, so try
+/// the full PSDU first and then up to 3 shorter prefixes; returns the
+/// longest prefix whose FCS verifies.
 pub fn locate_mpdu(psdu: &[u8]) -> Option<&[u8]> {
     (0..4usize).filter_map(|trim| psdu.len().checked_sub(trim)).find(|&len| len >= 10 && fcs::check_and_strip(&psdu[..len]).is_some()).map(|len| &psdu[..len])
 }
@@ -237,7 +238,7 @@ fn addr(b: &[u8]) -> MacAddr {
 }
 
 /// Parse an MPDU (with FCS).
-pub fn parse(mpdu: &[u8]) -> Result<ParsedFrame, FrameError> {
+pub fn parse(mpdu: &[u8]) -> Result<ParsedFrame<'_>, FrameError> {
     let inner = fcs::check_and_strip(mpdu).ok_or(FrameError::BadFcs)?;
     if inner.len() < 10 {
         return Err(FrameError::TooShort);
@@ -268,7 +269,7 @@ pub fn parse(mpdu: &[u8]) -> Result<ParsedFrame, FrameError> {
                 retry: fc1 & 0x08 != 0,
                 duration_us,
                 tid,
-                body: inner[hdr..].to_vec(),
+                body: &inner[hdr..],
             })
         }
         (1, 13) => Ok(ParsedFrame::Ack { ra: addr(&inner[4..10]) }),
@@ -366,7 +367,7 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
-        // A PV1 control frame (type 2) is recognised and not misread as PV0.
+        // A PV1 control frame (type 2) is recognized and not misread as PV0.
         let mut c = vec![1 | (PV1_TYPE_CONTROL << 2), 0x00];
         c.extend_from_slice(&0x0042u16.to_le_bytes());
         c.extend_from_slice(&[0xaa; 6]);

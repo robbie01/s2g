@@ -20,7 +20,6 @@ rustfft = "6.4"
 thiserror = "2"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
-rand = "0.9"
 
 s2g-phy = { path = "crates/s2g-phy" }
 s2g-mac = { path = "crates/s2g-mac" }

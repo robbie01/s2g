@@ -1,6 +1,6 @@
 //! NDP CMAC PPDU bodies for 2 MHz (NDP_2M, 37 bits) [23.3.12]: NDP CTS,
-//! NDP Ack and NDP BlockAck — the three CMAC frames every S1G STA must
-//! support [4.3.14.1]. The other types are recognised by their type code
+//! NDP Ack and NDP BlockAck, the three CMAC frames every S1G STA must
+//! support [4.3.14.1]. The other types are recognized by their type code
 //! and passed through opaque.
 //!
 //! Bit numbering follows the PHY: body bit B0 is the LSB of the `u64`
@@ -179,7 +179,7 @@ pub fn block_ack_id(seed: u8) -> u8 {
     seed & 0x3f
 }
 
-/// OCB stand-in for the 9-bit partial AID of a station [10.21]: there is
+/// OCB substitute for the 9-bit partial AID of a station [10.21]: there is
 /// no AID without an association, so the low 9 bits of the CRC-32 of the
 /// MAC address are used. Deliberately nonstandard (documented in the crate
 /// docs); both ends of an OCB link derive it the same way.

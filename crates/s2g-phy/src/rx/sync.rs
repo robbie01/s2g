@@ -44,9 +44,9 @@ pub fn detect_stf(buf: &[Complex32], from: usize, threshold: f32) -> Option<(usi
     }
     // Sliding sums. The half-period (lag-8) correlation is tracked as a
     // guard: the STF's occupied tones (multiples of 4) cancel exactly at
-    // lag 8 through any LTI channel, while DC offset (Pluto LO leakage!)
-    // and CW interferers correlate at *every* lag. Requiring low lag-8
-    // correlation rejects those without touching real preambles.
+    // lag 8 through any LTI channel, while DC offset (LO leakage) and CW
+    // interferers correlate at every lag. Requiring low lag-8 correlation
+    // rejects those without touching real preambles.
     let mut c = Complex32::new(0.0, 0.0);
     let mut c8 = Complex32::new(0.0, 0.0);
     let mut e = 0.0f32;
@@ -81,16 +81,6 @@ pub fn detect_stf(buf: &[Complex32], from: usize, threshold: f32) -> Option<(usi
         e += buf[n + WIN + LAG].norm_sqr() - buf[n + LAG].norm_sqr();
         n += 1;
     }
-}
-
-/// Apply a frequency shift of `-cfo_hz` to `buf` (correcting a +cfo_hz
-/// offset), with phase zero at index 0.
-pub fn derotate(buf: &[Complex32], cfo_hz: f32) -> Vec<Complex32> {
-    let w = -2.0 * core::f32::consts::PI * cfo_hz / SAMPLE_RATE_HZ as f32;
-    buf.iter()
-        .enumerate()
-        .map(|(i, &v)| v * Complex32::from_polar(1.0, w * i as f32))
-        .collect()
 }
 
 /// Locate LTF1 in `buf` (already coarse-CFO corrected), searching LTS-start
@@ -152,7 +142,7 @@ pub struct MidPacket {
 /// (the useful symbol length), sums over the guard interval and over the
 /// symbols in `buf` (≥ 212 µs = 424 samples), and looks for one symbol
 /// phase where that correlation is coherent. Tones (CW, DC) and the STF/LTF
-/// correlate at *every* phase, so a peak is only accepted when it clearly
+/// correlate at every phase, so a peak is only accepted when it clearly
 /// exceeds the mean over phases. Tries the long-GI (80-sample) and
 /// short-GI (72-sample) symbol periods.
 pub fn detect_mid_packet(buf: &[Complex32]) -> Option<MidPacket> {
@@ -195,26 +185,21 @@ mod tests {
     use super::*;
     use crate::preamble::{ltf1_time, stf_time};
 
+    /// Shift `buf` by `-cfo_hz`, phase zero at index 0.
+    fn derotate(buf: &[Complex32], cfo_hz: f32) -> Vec<Complex32> {
+        let w = -2.0 * core::f32::consts::PI * cfo_hz / SAMPLE_RATE_HZ as f32;
+        buf.iter().enumerate().map(|(i, &v)| v * Complex32::from_polar(1.0, w * i as f32)).collect()
+    }
+
     fn add_cfo(buf: &[Complex32], cfo_hz: f32) -> Vec<Complex32> {
         derotate(buf, -cfo_hz)
     }
 
+    /// Zero-mean uniform noise. A raw LCG has lattice correlation at the
+    /// STF lag and falsely triggers the detector; splitmix64 does not.
     fn noise(n: usize, amp: f32, seed: u64) -> Vec<Complex32> {
-        // splitmix64 — unlike a raw LCG, it has no lattice correlation at
-        // the STF lag (a raw LCG shows ~0.73 autocorrelation at lag 32
-        // steps, which falsely triggers the detector).
-        let mut s = seed;
-        let mut next = || {
-            s = s.wrapping_add(0x9E37_79B9_7F4A_7C15);
-            let mut z = s;
-            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-            z ^= z >> 31;
-            // 32 bits → [0,2) → [−1,1). (A >>33 here leaves a −0.5 DC
-            // offset that autocorrelates at every lag.)
-            ((z >> 32) as f32 / (1u64 << 31) as f32) - 1.0
-        };
-        (0..n).map(|_| Complex32::new(next() * amp, next() * amp)).collect()
+        let mut rng = crate::sim::Rng(seed);
+        (0..n).map(|_| Complex32::new((rng.uniform() * 2.0 - 1.0) * amp, (rng.uniform() * 2.0 - 1.0) * amp)).collect()
     }
 
     fn preamble_stream(cfo: f32, lead: usize) -> (Vec<Complex32>, usize) {

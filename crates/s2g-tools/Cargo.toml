@@ -13,7 +13,6 @@ s2g-sdr.workspace = true
 num-complex.workspace = true
 anyhow.workspace = true
 clap.workspace = true
-rand.workspace = true
 
 [dependencies.s2g-sdr-pluto]
 workspace = true

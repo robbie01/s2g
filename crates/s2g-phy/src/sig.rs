@@ -7,9 +7,9 @@
 //! 48 data tones (±1..±26 minus pilots) + Clause-17 pilots, scaled 1/√52,
 //! 8 µs GI. The difference is the constellation rotation:
 //!
-//! * S1G_SHORT SIG: **both** symbols rotated +90° (QBPSK).
-//! * S1G_LONG SIG-A: symbol 1 rotated (QBPSK), symbol 2 plain BPSK — that
-//!   asymmetry is how a receiver tells the two ≥ 2 MHz formats apart, and
+//! * S1G_SHORT SIG: both symbols rotated +90° (QBPSK).
+//! * S1G_LONG SIG-A: symbol 1 rotated (QBPSK), symbol 2 plain BPSK. The
+//!   asymmetry is how a receiver tells the two ≥ 2 MHz formats apart;
 //!   decoding SIG-A is mandatory for every S1G STA [4.3.14.1].
 //!
 //! All numeric fields are LSB-first [23.3.8.1].
@@ -159,7 +159,7 @@ fn duration_from_fields(
 }
 
 /// CRC-4, G(D)=D⁴+D+1, register init all-ones, output ones-complemented,
-/// c3 first [23.3.8.2.2.6; validated against the spec's worked example].
+/// c3 first [23.3.8.2.2.6].
 pub fn crc4(bits: &[u8]) -> [u8; 4] {
     let (mut c3, mut c2, mut c1, mut c0) = (1u8, 1, 1, 1);
     for &b in bits {
@@ -256,7 +256,7 @@ impl SigFields {
     }
 
     /// Build from a TXVECTOR plus the Length-field value (octets or N_SYM
-    /// per aggregation) and the LDPC Extra flag — both computed by the TX
+    /// per aggregation) and the LDPC Extra flag, both computed by the TX
     /// chain.
     pub fn from_txvector(txv: &TxVector, length_field: u16, ldpc_extra: bool) -> Result<Self, PhyError> {
         params::mcs_params(txv.mcs)?;
@@ -358,15 +358,6 @@ impl SigFields {
         }
     }
 
-    /// Derive the RXVECTOR for a supported PPDU (legacy helper; see
-    /// [`SigFields::verdict`]).
-    pub fn to_rxvector(&self) -> Result<RxVector, PhyError> {
-        match self.verdict() {
-            SigVerdict::Supported(r) => Ok(r),
-            SigVerdict::Unsupported(_, why) => Err(PhyError::Unsupported(why)),
-            SigVerdict::Reserved { reason, .. } => Err(PhyError::InvalidLength { len: self.length as usize, reason }),
-        }
-    }
 }
 
 impl SigASu {
@@ -471,7 +462,7 @@ impl SigASu {
             aggregation: self.aggregation,
             response_indication: self.response_indication,
             // 1 STS: B23 = 0 ⇒ the beam-changeable portion is sent through
-            // the same Q as the omni portion and smoothing is fine
+            // the same Q as the omni portion and smoothing is allowed
             // [Table 23-14 NOTE 1]. With more streams B23 is the Beam
             // Change Indication and says nothing about smoothing.
             smoothing: n_sts == 1 && !self.beam_change_or_smoothing,
@@ -604,8 +595,8 @@ fn parse_short(bits: &[u8; 48]) -> Result<SigContent, SigError> {
         traveling_pilots: bits[36] == 1,
     };
     if bits[0] != 1 {
-        // Reserved bit is transmitted as 1 in S1G_SHORT; the other fields
-        // still tell us how long to hold CCA.
+        // The reserved bit is transmitted as 1 in S1G_SHORT; the other
+        // fields still give the CCA hold time.
         return Err(SigError::Reserved { reason: "SIG B0 = 0", duration_us: fields.duration_if_computable() });
     }
     Ok(SigContent::Normal(fields))
@@ -749,13 +740,12 @@ pub fn decode(sym1: &[Complex32], sym2: &[Complex32], csi1: &[f32], csi2: &[f32]
         PreambleType::S1gLong => [true, false],
     };
     let mut llrs = Vec::with_capacity(96);
+    let mut derot = [Complex32::new(0.0, 0.0); 48];
     for (n, (sym, csi)) in [(sym1, csi1), (sym2, csi2)].into_iter().enumerate() {
-        let derot: Vec<Complex32> = if rotate[n] {
+        for (d, v) in derot.iter_mut().zip(sym) {
             // Undo the QBPSK rotation: multiply by −j.
-            sym.iter().map(|v| Complex32::new(v.im, -v.re)).collect()
-        } else {
-            sym.to_vec()
-        };
+            *d = if rotate[n] { Complex32::new(v.im, -v.re) } else { *v };
+        }
         let sym_llrs = mapping::demap_llrs(&derot, csi, params::Modulation::Bpsk);
         llrs.extend(interleaver::deinterleave_sig_llrs(&sym_llrs));
     }
@@ -963,12 +953,18 @@ mod tests {
         }
     }
 
+    fn supported(f: &SigFields) -> RxVector {
+        match f.verdict() {
+            SigVerdict::Supported(r) => r,
+            other => panic!("{other:?}"),
+        }
+    }
+
     #[test]
     fn rxvector_derivation() {
         // Non-aggregated, MCS 4 (N_DBPS 156), 100 octets:
         // N_SYM = ceil(814/156) = 6.
-        let f = sample_fields();
-        let rxv = f.to_rxvector().unwrap();
+        let rxv = supported(&sample_fields());
         assert_eq!(rxv.psdu_length, 100);
         assert_eq!(rxv.n_sym, 6);
         assert_eq!(rxv.length, 100);
@@ -976,7 +972,7 @@ mod tests {
         let mut fa = sample_fields();
         fa.aggregation = true;
         fa.length = 20;
-        let rxa = fa.to_rxvector().unwrap();
+        let rxa = supported(&fa);
         assert_eq!(rxa.n_sym, 20);
         assert_eq!(rxa.psdu_length, (20 * 156 - 14) / 8);
     }

@@ -95,7 +95,7 @@ def main():
     # 2. imec Sub-GHz dataset: one 2 MHz file (RTL-SDR glitches cost ~1 %).
     imec = os.path.join(args.data, "fontaine", "mat", "80211ah_mcs0_chan2_g0.0dB_att10dB_freq864.0MHz_0.cf32")
     if os.path.exists(imec):
-        err, dt = run_rx(exe, ["--in", imec, "--rate", "2.048e6", "--mac", "--quiet"])
+        err, dt = run_rx(exe, ["--in", imec, "--rate-hz", "2.048e6", "--mac", "--quiet"])
         c = summary_counts(err)
         print(f"imec: {c} in {dt:.0f} s")
         rep.check("imec MPDUs FCS-valid", c["fcs_ok"], 1560, "of 1585 PPDUs")

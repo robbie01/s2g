@@ -4,7 +4,7 @@
 //!
 //! These operate on baseband sample streams, so they verify the digital
 //! waveform (and, fed with a captured loopback, the whole radio). The
-//! measurement recipe follows 23.3.17.4.4: the EVM path literally runs the
+//! measurement recipe follows 23.3.17.4.4: the EVM path runs the
 //! receiver (sync, LTF channel estimate, pilot tracking) and compares each
 //! equalized data tone with the nearest constellation point.
 
@@ -119,7 +119,7 @@ pub fn tx_evm(wave: &[Complex32]) -> Option<EvmReport> {
 /// Transmit spectral mask result.
 #[derive(Debug, Clone)]
 pub struct MaskReport {
-    /// (offset MHz, PSD dBr, mask dBr) for every analysed bin.
+    /// (offset MHz, PSD dBr, mask dBr) for every analyzed bin.
     pub bins: Vec<(f32, f32, f32)>,
     /// Smallest (mask − PSD) over all bins; negative = violation.
     pub worst_margin_db: f32,
@@ -160,7 +160,7 @@ pub fn psd(wave: &[Complex32], sample_rate_hz: f64, rbw_hz: f64) -> Vec<(f64, f6
 
 /// Check a waveform (at any sample rate) against the 2 MHz transmit
 /// spectral mask [23.3.17.1], 10 kHz RBW. Only offsets within ±fs/2 can be
-/// examined — feed an interpolated (≥ 6 MS/s) stream to cover the full
+/// examined; feed an interpolated (≥ 6 MS/s) stream to cover the full
 /// ±3 MHz mask.
 pub fn spectral_mask(wave: &[Complex32], sample_rate_hz: f64) -> MaskReport {
     let spectrum = psd(wave, sample_rate_hz, 10_000.0);

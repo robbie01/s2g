@@ -7,7 +7,7 @@
 //! OPEN/CLOSE, READBUF/WRITEBUF, TIMEOUT, SET). What one radio writes to
 //! its TX buffer is what the others read from their RX buffers, after path
 //! loss, additive noise, a carrier offset from each radio's oscillator
-//! error, and a fixed pipeline latency — all paced in real time at the
+//! error, and a fixed pipeline latency, all paced in real time at the
 //! configured sample rate, with iiod-style back-pressure on the TX side.
 //! Underruns happen exactly as on hardware: samples written after the air
 //! clock has passed are lost.
@@ -19,6 +19,7 @@
 use anyhow::Result;
 use clap::Parser;
 use num_complex::Complex;
+use s2g_phy::sim::Rng;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -36,20 +37,19 @@ struct Args {
     /// First TCP port; radio k listens on base-port + k
     #[arg(long, default_value_t = 31431)]
     base_port: u16,
-    /// Air sample rate the clients are expected to configure, S/s
+    /// Air sample rate the clients are expected to configure, Hz
     #[arg(long, default_value_t = 4_000_000.0)]
-    rate: f64,
+    rate_hz: f64,
     /// Carrier frequency assumed for the oscillator-error model, Hz
     #[arg(long, default_value_t = 1.25e9)]
-    freq: f64,
+    freq_hz: f64,
     /// Oscillator error of each radio in ppm, comma separated (missing entries = 0)
     #[arg(long, default_value = "0")]
     ppm: String,
     /// Path loss between any two radios, dB
     #[arg(long, default_value_t = 30.0)]
     path_loss_db: f64,
-    /// Receiver noise floor, dBFS per complex sample (a Pluto at moderate gain
-    /// sits near -60; below about -66 the 12-bit quantiser swallows it)
+    /// Receiver noise floor, dBFS per complex sample
     #[arg(long, default_value_t = -60.0)]
     noise_dbfs: f64,
     /// Propagation delay between radios, samples
@@ -117,25 +117,12 @@ struct Air {
     noise_amp: f32,
     delay: u64,
     radios: Vec<Radio>,
-    rng: u64,
+    rng: Rng,
 }
 
 impl Air {
     fn now(&self) -> u64 {
         (self.t0.elapsed().as_secs_f64() * self.rate) as u64
-    }
-
-    fn gauss(&mut self) -> f32 {
-        let mut s = 0.0f32;
-        for _ in 0..6 {
-            self.rng = self.rng.wrapping_add(0x9E37_79B9_7F4A_7C15);
-            let mut z = self.rng;
-            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-            z ^= z >> 31;
-            s += (z >> 32) as f32 / (1u64 << 31) as f32 - 1.0;
-        }
-        s / (2.0f32).sqrt()
     }
 
     /// What radio `k` hears during air samples [from, from + n).
@@ -157,7 +144,7 @@ impl Air {
         }
         let na = self.noise_amp * std::f32::consts::FRAC_1_SQRT_2;
         for o in out.iter_mut() {
-            *o += C32::new(self.gauss() * na, self.gauss() * na);
+            *o += C32::new(self.rng.gauss() * na, self.rng.gauss() * na);
         }
         out
     }
@@ -180,9 +167,9 @@ fn serve(conn: TcpStream, k: usize, air: Arc<Mutex<Air>>, args: Arc<Args>) {
         let tok: Vec<&str> = line.split_whitespace().collect();
         let reply: Result<(), std::io::Error> = match tok[0] {
             "PRINT" => write!(w, "{}\n{}", XML.len(), XML),
-            "VERSION" => write!(w, "0\n"),
+            "VERSION" => writeln!(w, "0"),
             "TIMEOUT" | "SET" | "CLOSE" => {
-                write!(w, "0\n")
+                writeln!(w, "0")
             }
             "EXIT" => break,
             "OPEN" => {
@@ -192,7 +179,7 @@ fn serve(conn: TcpStream, k: usize, air: Arc<Mutex<Air>>, args: Arc<Args>) {
                     let now = a.now();
                     a.radios[k].rx_pos = Some(now);
                 }
-                write!(w, "0\n")
+                writeln!(w, "0")
             }
             "READ" => {
                 let attr = tok.last().copied().unwrap_or("");
@@ -203,7 +190,7 @@ fn serve(conn: TcpStream, k: usize, air: Arc<Mutex<Air>>, args: Arc<Args>) {
                     .get(&key)
                     .cloned()
                     .unwrap_or_else(|| default_attr(attr).to_string());
-                write!(w, "{}\n{}\n", v.len(), v)
+                writeln!(w, "{}\n{}", v.len(), v)
             }
             "WRITE" => {
                 let len: usize = tok.last().and_then(|s| s.parse().ok()).unwrap_or(0);
@@ -217,7 +204,7 @@ fn serve(conn: TcpStream, k: usize, air: Arc<Mutex<Air>>, args: Arc<Args>) {
                     eprintln!("radio {k}: {key} = {val}");
                 }
                 air.lock().unwrap().radios[k].attrs.insert(key, val);
-                write!(w, "{len}\n")
+                writeln!(w, "{len}")
             }
             "READBUF" => {
                 let want: usize = tok.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
@@ -235,7 +222,7 @@ fn serve(conn: TcpStream, k: usize, air: Arc<Mutex<Air>>, args: Arc<Args>) {
                     if now >= ready_at {
                         break;
                     }
-                    let wait = (ready_at - now) as f64 / args.rate;
+                    let wait = (ready_at - now) as f64 / args.rate_hz;
                     std::thread::sleep(Duration::from_secs_f64(wait.clamp(0.0005, 0.05)));
                 }
                 let samples = {
@@ -260,7 +247,7 @@ fn serve(conn: TcpStream, k: usize, air: Arc<Mutex<Air>>, args: Arc<Args>) {
             }
             "WRITEBUF" => {
                 let len: usize = tok.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
-                if write!(w, "0\n").and_then(|_| w.flush()).is_err() {
+                if writeln!(w, "0").and_then(|_| w.flush()).is_err() {
                     break;
                 }
                 let mut payload = vec![0u8; len];
@@ -290,12 +277,24 @@ fn serve(conn: TcpStream, k: usize, air: Arc<Mutex<Air>>, args: Arc<Args>) {
                 {
                     let mut a = air.lock().unwrap();
                     let now = a.now();
-                    let keep_from = now.saturating_sub((args.rate as u64).max(1));
+                    let keep_from = now.saturating_sub((args.rate_hz as u64).max(1));
                     let tx = &mut a.radios[k].tx;
                     if tx.end() < now {
-                        // Underrun (or first buffer): the stream restarts now.
-                        tx.origin = now + BUF_SAMPLES / 4;
-                        tx.buf.clear();
+                        // Underrun (or first buffer): the DMA restarts a
+                        // little ahead of the air clock. What was written
+                        // before stays on the timeline, because receivers
+                        // read the air a few buffers late and may not have
+                        // reached it yet; the gap is silence, unless the
+                        // stream has been dead for longer than anyone looks
+                        // back.
+                        let restart = now + BUF_SAMPLES / 4;
+                        if tx.buf.is_empty() || tx.end() < keep_from {
+                            tx.origin = restart;
+                            tx.buf.clear();
+                        } else {
+                            let gap = (restart - tx.end()) as usize;
+                            tx.buf.resize(tx.buf.len() + gap, C32::new(0.0, 0.0));
+                        }
                     }
                     tx.buf.extend_from_slice(&samples);
                     tx.trim(keep_from);
@@ -303,9 +302,9 @@ fn serve(conn: TcpStream, k: usize, air: Arc<Mutex<Air>>, args: Arc<Args>) {
                         eprintln!("radio {k}: TX {} samples, stream ends at {} (air now {now})", samples.len(), tx.end());
                     }
                 }
-                write!(w, "{len}\n")
+                writeln!(w, "{len}")
             }
-            _ => write!(w, "-22\n"),
+            _ => writeln!(w, "-22"),
         };
         if reply.and_then(|_| w.flush()).is_err() {
             break;
@@ -333,13 +332,13 @@ fn main() -> Result<()> {
         .collect();
     let air = Arc::new(Mutex::new(Air {
         t0: Instant::now(),
-        rate: args.rate,
-        freq: args.freq,
+        rate: args.rate_hz,
+        freq: args.freq_hz,
         gain: 10f32.powf(-(args.path_loss_db as f32) / 20.0),
         noise_amp: 10f32.powf(args.noise_dbfs as f32 / 20.0),
         delay: args.delay_samples,
         radios,
-        rng: 0x1234_5678_9ABC_DEF1,
+        rng: Rng(0x1234_5678_9ABC_DEF1),
     }));
     let mut handles = Vec::new();
     for k in 0..args.radios {
@@ -360,7 +359,7 @@ fn main() -> Result<()> {
     }
     eprintln!(
         "air: {} S/s, path loss {} dB, noise {} dBFS, delay {} samples, RX latency {} buffers",
-        args.rate, args.path_loss_db, args.noise_dbfs, args.delay_samples, args.rx_latency_buffers
+        args.rate_hz, args.path_loss_db, args.noise_dbfs, args.delay_samples, args.rx_latency_buffers
     );
     for h in handles {
         let _ = h.join();

@@ -54,9 +54,9 @@ So: **Data symbols use tones ±1..±28 (56 tones), SIG symbols use tones ±1..±
 
 ## 2. TXVECTOR / RXVECTOR parameters (Table 23-1) [23.2.2, p3733–3740]
 
-Legend: **TX/RX** = present in TXVECTOR / RXVECTOR (Y present, N not, O optional, MU per-user array). Rows below are restricted to what exists for our configuration (FORMAT=S1G, CH_BANDWIDTH=CBW2, PREAMBLE_TYPE=S1G_SHORT_PREAMBLE, SU); parameters that are "Not present" under these conditions are listed at the end.
+Legend: **TX/RX** = present in TXVECTOR / RXVECTOR (Y present, N not, O optional, MU per-user array). Rows below are restricted to what exists for the baseline configuration (FORMAT=S1G, CH_BANDWIDTH=CBW2, PREAMBLE_TYPE=S1G_SHORT_PREAMBLE, SU); parameters that are "Not present" under these conditions are listed at the end.
 
-| Parameter | TX | RX | Allowed values / semantics (our config) | Lands in SIG bits? |
+| Parameter | TX | RX | Allowed values / semantics (baseline config) | Lands in SIG bits? |
 |---|---|---|---|---|
 | `FORMAT` | Y | Y | Enum: `S1G` (ours), `S1G_DUP_1M`, `S1G_DUP_2M` [p3733] | No (implied by preamble structure) |
 | `PREAMBLE_TYPE` | Y | Y | For FORMAT=S1G & CBW2: `S1G_SHORT_PREAMBLE` (23.3.8.2.2) or `S1G_LONG_PREAMBLE` (23.3.8.2.3). Ours: SHORT. [p3733] | No (RX detects via QBPSK rotation of SIG symbols, see §5.3) |
@@ -88,7 +88,7 @@ Legend: **TX/RX** = present in TXVECTOR / RXVECTOR (Y present, N not, O optional
 | `COLOR` | Y | Y | Present when UPLINK_INDICATION=0, NDP_INDICATION=0, SU, CBW≠1. **0–7**, BSS color (10.21) [p3740] | Yes — inside SIG-1 B7–B9 when Uplink Indication=0 |
 | `SCRAMBLER_OR_CRC` | N | Y | RX-only. For NDP_INDICATION=0: the 7-bit scrambler initialization [B0:B6] of the SERVICE field recovered prior to descrambling. (For NDP: the 4-bit SIG CRC.) [p3740] | It *is* the descrambled seed; TX seed goes in SERVICE field, not SIG |
 
-**Not present in our configuration** (conditions unmet): `MU_SU` (long preamble only), `NDP_CMAC_PPDU_BODY` (NDP only), `SECTOR_ID`, `EXPANSION_MAT`, `CHAN_MAT`, `DELTA_SNR` (long-preamble/sounding), `USER_POSITION`, `GROUP_ID` (MU only), `BEAM_CHANGE` (long preamble only). [Table 23-1, p3733–3740]
+**Not present in the baseline configuration** (conditions unmet): `MU_SU` (long preamble only), `NDP_CMAC_PPDU_BODY` (NDP only), `SECTOR_ID`, `EXPANSION_MAT`, `CHAN_MAT`, `DELTA_SNR` (long-preamble/sounding), `USER_POSITION`, `GROUP_ID` (MU only), `BEAM_CHANGE` (long preamble only). [Table 23-1, p3733–3740]
 
 **Scrambler initialization**: There is no TXVECTOR scrambler parameter. The SERVICE field (Table 23-20) is 8 bits: B0–B6 "Scrambler Initialization" **set to 0** (i.e., transmitted as zeros; the actual pseudorandom nonzero initial state of the self-synchronizing scrambler of 17.3.5.5 is recovered by the receiver from these 7 bits after descrambling with state 0), B7 reserved (0). Bit 0 transmitted first. [23.3.9.2, p3794; 23.3.9.3 → 17.3.5.5]
 
@@ -103,7 +103,7 @@ For FORMAT=S1G, CH_BANDWIDTH=CBW2: *"The STA transmits an S1G PPDU of 2 MHz band
 ## 4. S1G PPDU formats [23.3.2, p3743–3745]
 
 Three formats: **S1G_SHORT**, **S1G_LONG**, **S1G_1M** [p3743].
-S1G_SHORT is used for **SU transmission at 2/4/8/16 MHz** — exactly our case.
+S1G_SHORT is used for **SU transmission at 2/4/8/16 MHz**: the baseline case.
 
 ### 4.1 S1G_SHORT layout (Figure 23-1) [p3743, verified against PDF]
 
@@ -123,7 +123,7 @@ Per-field durations at 2 MHz, long GI, N_STS = 1 (⇒ N_LTF = 1, so **no LTF2..L
 | LTF2..LTF_NLTF | 0 µs (N_LTF=1) | would be 40 µs each for N_STS>1 |
 | Data | N_SYM × 40 µs | long GI |
 
-Total preamble+SIG for our config = **240 µs**.
+Total preamble+SIG for the baseline config = **240 µs**.
 
 `N_LTF` vs `N_STS` (Table 23-11) [23.3.8.2.2.4, p3762]:
 
@@ -177,7 +177,7 @@ STF/LTF1 construction highlights (sequences belong to another digest): STF symbo
 
 ### SIG-1
 
-| Bits | Field | Width | Value (our config in **bold**) |
+| Bits | Field | Width | Value (baseline config in **bold**) |
 |---|---|---|---|
 | B0 | Reserved | 1 | **1** on transmit (see 23.3.20 on receive) |
 | B1 | STBC | 1 | **0** (no STBC) |

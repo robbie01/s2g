@@ -1,29 +1,29 @@
-//! Stateless "good neighbour" frame filter.
+//! Stateless "good neighbor" frame filter.
 //!
 //! A radio link shared with other amateurs should carry only what the
 //! operators mean to send, and an OS attached to a TAP interface emits a
-//! surprising amount it does not: IPv4 and ARP on a link meant to be
-//! IPv6-only, router discovery and DHCPv6 when addressing is static and
-//! routing comes from Babel, and the whole zoo of LAN discovery protocols
-//! (mDNS, LLMNR, SSDP, WS-Discovery). Part 97 also forbids obscuring the
-//! meaning of a transmission, which rules out SSH, TLS and encrypted ESP.
+//! lot it does not: IPv4 and ARP on a link meant to be IPv6-only, router
+//! discovery and DHCPv6 when addressing is static and routing comes from
+//! Babel, and the LAN discovery protocols (mDNS, LLMNR, SSDP,
+//! WS-Discovery). Part 97 also forbids obscuring the meaning of a
+//! transmission, which rules out SSH, TLS and encrypted ESP.
 //!
-//! The filter is a pure function of one Ethernet frame — no connection
-//! tracking, no state — applied to frames leaving for the air and, by
+//! The filter is a pure function of one Ethernet frame (no connection
+//! tracking, no state), applied to frames leaving for the air and, by
 //! default, to frames arriving from it. Everything not explicitly blocked
-//! passes: neighbour discovery (NS/NA, needed to resolve link-local
+//! passes: neighbor discovery (NS/NA, needed to resolve link-local
 //! addresses on the link), ICMPv6 echo and errors, Babel (UDP 6696 on
 //! ff02::1:6), DNS, NTP, HTTP, OSPFv3, AH, anything unlisted.
 //!
 //! Tunnels are looked into rather than trusted: IPv6-in-IPv6, GRE, VXLAN
 //! and ESP-NULL payloads are checked with the same rules (the inner
-//! destination may be global, the rest still applies). ESP is recognised as
-//! ESP-NULL by the RFC 5879 heuristic — RFC 4303 default padding plus a
-//! plausible inner header for one of the usual ICV lengths — and dropped
-//! as encrypted otherwise.
+//! destination may be global, the rest still applies). ESP is recognized as
+//! ESP-NULL by the RFC 5879 heuristic (RFC 4303 default padding plus a
+//! plausible inner header for one of the usual ICV lengths) and dropped as
+//! encrypted otherwise.
 //!
 //! Defaults, and the reasoning behind them, are in the README section
-//! "Good-neighbour filter".
+//! "Good-neighbor filter".
 
 /// What to do with a frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,7 +58,7 @@ pub struct FilterConfig {
     /// Allow LAN discovery chatter: mDNS, LLMNR, SSDP, WS-Discovery,
     /// NetBIOS/SMB, NAT-PMP/PCP.
     pub allow_discovery: bool,
-    /// Allow every ESP packet, not only those recognised as ESP-NULL.
+    /// Allow every ESP packet, not only those recognized as ESP-NULL.
     pub allow_esp: bool,
     /// Allow non-IPv6 EtherTypes other than the identification frame:
     /// VLAN tags, LLDP, PPPoE, EAPOL, 802.3/LLC (STP) and the rest.
@@ -220,7 +220,7 @@ fn check_ethertype(cfg: &FilterConfig, ethertype: u16, payload: &[u8], depth: u8
         ETHERTYPE_IPV6 => check_ipv6(cfg, payload, depth, global_ok),
         ETHERTYPE_IPV4 | 0x0806 | 0x8035 => {
             if !cfg.allow_ipv4 {
-                return Verdict::Drop(if depth > 0 { "IPv4 tunnelled in IPv6" } else { ethertype_name(ethertype) });
+                return Verdict::Drop(if depth > 0 { "IPv4 tunneled in IPv6" } else { ethertype_name(ethertype) });
             }
             if ethertype == ETHERTYPE_IPV4 {
                 check_ipv4(cfg, payload, depth)
@@ -282,7 +282,7 @@ fn check_transport(cfg: &FilterConfig, nh: u8, data: &[u8], depth: u8) -> Verdic
             if cfg.allow_ipv4 {
                 check_ipv4(cfg, data, depth + 1)
             } else {
-                Verdict::Drop("IPv4 tunnelled in IPv6")
+                Verdict::Drop("IPv4 tunneled in IPv6")
             }
         }
         41 => {
@@ -386,11 +386,11 @@ fn check_gre(cfg: &FilterConfig, gre: &[u8], depth: u8) -> Verdict {
 }
 
 /// ESP (RFC 4303): SPI, sequence number, payload, padding, pad length,
-/// next header, ICV. Without the SA we cannot know the cipher, so we
-/// apply the RFC 5879 heuristic: for each usual ICV length the trailer
-/// must show RFC 4303 default padding (1, 2, 3, …) and a next-header value
-/// whose payload parses. Then the payload is checked like any other
-/// packet. Anything else is treated as encrypted.
+/// next header, ICV. The cipher is unknown without the SA, so the RFC 5879
+/// heuristic applies: for each usual ICV length the trailer must show
+/// RFC 4303 default padding (1, 2, 3, …) and a next-header value whose
+/// payload parses. Then the payload is checked like any other packet.
+/// Anything else is treated as encrypted.
 fn check_esp(cfg: &FilterConfig, esp: &[u8], depth: u8) -> Verdict {
     if cfg.allow_esp {
         return Verdict::Pass;
@@ -562,7 +562,7 @@ mod tests {
         assert_eq!(v(&eth(0x86DD, &ipv6(17, &udp(50000, 1900)))), Verdict::Drop("SSDP/UPnP"));
         assert_eq!(v(&eth(0x86DD, &ipv6(17, &udp(50000, 3702)))), Verdict::Drop("WS-Discovery"));
         assert_eq!(v(&eth(0x86DD, &ipv6(6, &tcp(50000, 445)))), Verdict::Drop("SMB"));
-        assert_eq!(v(&eth(0x86DD, &ipv6(4, &[0x45; 20]))), Verdict::Drop("IPv4 tunnelled in IPv6"));
+        assert_eq!(v(&eth(0x86DD, &ipv6(4, &[0x45; 20]))), Verdict::Drop("IPv4 tunneled in IPv6"));
     }
 
     #[test]
@@ -590,14 +590,14 @@ mod tests {
         // GRE carrying IPv4: dropped. GRE carrying IPv6 to a global host: fine.
         let mut gre4 = vec![0, 0, 0x08, 0x00];
         gre4.extend_from_slice(&[0x45; 24]);
-        assert_eq!(v(&eth(0x86DD, &ipv6_to(ULA_DST, 47, &gre4))), Verdict::Drop("IPv4 tunnelled in IPv6"));
+        assert_eq!(v(&eth(0x86DD, &ipv6_to(ULA_DST, 47, &gre4))), Verdict::Drop("IPv4 tunneled in IPv6"));
         let mut gre6 = vec![0x20, 0, 0x86, 0xDD, 0, 0, 0, 5]; // key present
         gre6.extend_from_slice(&ipv6_to(GLOBAL_DST, 17, &udp(1, 80)));
         assert_eq!(v(&eth(0x86DD, &ipv6_to(ULA_DST, 47, &gre6))), Verdict::Pass);
         // GRE bridging a whole Ethernet frame that carries ARP: dropped.
         let mut greb = vec![0, 0, 0x65, 0x58];
         greb.extend_from_slice(&eth(0x0806, &[0; 28]));
-        assert_eq!(v(&eth(0x86DD, &ipv6_to(ULA_DST, 47, &greb))), Verdict::Drop("IPv4 tunnelled in IPv6"));
+        assert_eq!(v(&eth(0x86DD, &ipv6_to(ULA_DST, 47, &greb))), Verdict::Drop("IPv4 tunneled in IPv6"));
         // VXLAN with an inner IPv6 frame to a global address: fine; inner IPv4: dropped.
         let mut vx6 = udp(40000, 4789);
         vx6.truncate(8);
@@ -606,7 +606,7 @@ mod tests {
         vx6.extend_from_slice(&eth(0x86DD, &ipv6_to(GLOBAL_DST, 17, &udp(1, 80))));
         vx4.extend_from_slice(&eth(0x0800, &[0x45; 40]));
         assert_eq!(v(&eth(0x86DD, &ipv6_to(ULA_DST, 17, &vx6))), Verdict::Pass);
-        assert_eq!(v(&eth(0x86DD, &ipv6_to(ULA_DST, 17, &vx4))), Verdict::Drop("IPv4 tunnelled in IPv6"));
+        assert_eq!(v(&eth(0x86DD, &ipv6_to(ULA_DST, 17, &vx4))), Verdict::Drop("IPv4 tunneled in IPv6"));
     }
 
     #[test]
@@ -618,8 +618,8 @@ mod tests {
         }
         // ESP-NULL transport mode carrying TCP 443: the port rule still bites.
         assert_eq!(v(&eth(0x86DD, &ipv6_to(ULA_DST, 50, &esp_null(6, &tcp(1, 443), 12)))), Verdict::Drop("HTTPS/QUIC (port 443)"));
-        // ESP-NULL carrying IPv4: dropped like any tunnelled IPv4.
-        assert_eq!(v(&eth(0x86DD, &ipv6_to(ULA_DST, 50, &esp_null(4, &[0x45; 24], 12)))), Verdict::Drop("IPv4 tunnelled in IPv6"));
+        // ESP-NULL carrying IPv4: dropped like any tunneled IPv4.
+        assert_eq!(v(&eth(0x86DD, &ipv6_to(ULA_DST, 50, &esp_null(4, &[0x45; 24], 12)))), Verdict::Drop("IPv4 tunneled in IPv6"));
         // A dummy packet (next header 59) passes.
         assert_eq!(v(&eth(0x86DD, &ipv6_to(ULA_DST, 50, &esp_null(59, &[], 12)))), Verdict::Pass);
         // Ciphertext: no default padding, no plausible next header.

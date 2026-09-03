@@ -7,27 +7,11 @@ use num_complex::Complex;
 use s2g_mac::ndp::NdpFrame;
 use s2g_mac::{Mac, MacAction, MacConfig, MacEvent, RateConfig};
 use s2g_phy::rx::{Receiver, RxConfig, RxEvent};
+use s2g_phy::sim::{apply_cfo, awgn, Rng};
 use s2g_phy::vector::Coding;
 use s2g_phy::Transmitter;
 
 type C32 = Complex<f32>;
-
-struct Rng(u64);
-impl Rng {
-    fn next(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
-    fn gauss(&mut self) -> f32 {
-        let s: f32 = (0..6)
-            .map(|_| ((self.next() >> 32) as f32 / (1u64 << 31) as f32) - 1.0)
-            .sum();
-        s / (2.0f32).sqrt()
-    }
-}
 
 struct Node {
     mac: Mac,
@@ -80,14 +64,11 @@ impl Node {
     }
 }
 
+/// The PPDU with CFO and AWGN at `snr_db` relative to its own power,
+/// between 300 samples of near-silence on either side.
 fn channel(wave: &[C32], snr_db: f32, cfo_hz: f32, rng: &mut Rng) -> Vec<C32> {
-    let p: f32 = wave.iter().map(|v| v.norm_sqr()).sum::<f32>() / wave.len() as f32;
-    let sigma = (p / 10f32.powf(snr_db / 10.0) / 2.0).sqrt();
-    let w = 2.0 * std::f64::consts::PI * cfo_hz as f64 / 2.0e6;
     let mut out: Vec<C32> = vec![C32::new(1e-4, 1e-4); 300];
-    out.extend(wave.iter().enumerate().map(|(i, &v)| {
-        v * C32::from_polar(1.0, (w * i as f64) as f32) + C32::new(rng.gauss() * sigma, rng.gauss() * sigma)
-    }));
+    out.extend(awgn(&apply_cfo(wave, cfo_hz), snr_db, rng));
     out.extend(std::iter::repeat_n(C32::new(1e-4, -1e-4), 300));
     out
 }

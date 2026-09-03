@@ -1,6 +1,6 @@
-//! SDR hardware abstraction. `s2g-phy` never sees these traits — apps wire
-//! PHY ↔ SDR together — but every backend (Pluto today, others later)
-//! implements this interface so apps are backend-agnostic.
+//! SDR hardware abstraction. `s2g-phy` never sees these traits (apps wire
+//! PHY ↔ SDR together), but every backend implements this interface so
+//! apps are backend-agnostic.
 //!
 //! Sample convention: interleaved-in-time `Complex<f32>` normalized to
 //! roughly ±1.0 full scale, at [`StreamConfig::sample_rate_hz`].
@@ -58,8 +58,8 @@ pub trait SdrTx {
     fn flush(&mut self) -> Result<(), SdrError>;
 }
 
-/// A device that can open RX and/or TX streams. RX-only backends simply
-/// return `Unsupported` from `open_tx`.
+/// A device that can open RX and/or TX streams. RX-only backends return
+/// `SdrError::Config` from `open_tx`.
 pub trait SdrDevice {
     type Rx: SdrRx;
     type Tx: SdrTx;

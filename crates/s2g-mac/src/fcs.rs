@@ -1,5 +1,5 @@
 //! Frame check sequence: IEEE CRC-32 (reflected 0xEDB88320, init/xorout
-//! all-ones), appended little-endian [9.2.4.8].
+//! all-ones), appended little-endian [9.2.4.9].
 
 pub fn crc32(data: &[u8]) -> u32 {
     let mut crc = 0xFFFF_FFFFu32;

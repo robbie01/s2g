@@ -63,17 +63,17 @@ fn pad4(n: usize) -> usize {
     n.div_ceil(4) * 4
 }
 
-/// Length of the pre-EOF A-MPDU for a single MPDU (delimiter + MPDU,
-/// final-subframe padding not counted — the EOF fill handles alignment).
+/// Length of the pre-EOF A-MPDU for a single MPDU: delimiter + MPDU. The
+/// final-subframe padding is not counted; the EOF fill handles alignment.
 pub fn pre_eof_len(mpdu_len: usize) -> usize {
     DELIM_LEN + mpdu_len
 }
 
-/// Build an **S-MPDU** — an A-MPDU carrying a single MPDU whose delimiter
-/// has EOF = 1 [9.7.3, 10.12.8] — padded to exactly `capacity` octets (the
-/// PSDU capacity of the chosen symbol count). An S-MPDU follows the rules
-/// of a non-aggregated frame: any MPDU that is valid on its own is valid
-/// inside it, and it is acknowledged with an (NDP) Ack, not a BlockAck.
+/// Build an S-MPDU, an A-MPDU carrying a single MPDU whose delimiter has
+/// EOF = 1 [9.7.3, 10.12.8], padded to exactly `capacity` octets (the PSDU
+/// capacity of the chosen symbol count). An S-MPDU follows the rules of a
+/// non-aggregated frame: any MPDU that is valid on its own is valid inside
+/// it, and it is acknowledged with an (NDP) Ack, not a BlockAck.
 pub fn aggregate(mpdu: &[u8], capacity: usize) -> Vec<u8> {
     assert!(mpdu.len() <= MAX_MPDU_LEN);
     assert!(capacity >= DELIM_LEN + mpdu.len());
@@ -126,14 +126,14 @@ pub fn aggregate_many(mpdus: &[&[u8]], capacity: usize) -> Vec<u8> {
 /// Extract MPDUs from an A-MPDU (deaggregation per Annex O.2: scan 4-octet
 /// aligned positions, resync on delimiter errors). Each MPDU comes with its
 /// delimiter's EOF flag: a lone MPDU with EOF = 1 is an S-MPDU.
-pub fn deaggregate_with_eof(psdu: &[u8]) -> Vec<(Vec<u8>, bool)> {
+pub fn deaggregate_with_eof(psdu: &[u8]) -> Vec<(&[u8], bool)> {
     let mut out = Vec::new();
     let mut pos = 0usize;
     while pos + DELIM_LEN <= psdu.len() {
         match parse_delimiter(&psdu[pos..pos + DELIM_LEN]) {
             Some((0, _eof)) => pos += DELIM_LEN,
             Some((len, eof)) if pos + DELIM_LEN + len <= psdu.len() => {
-                out.push((psdu[pos + DELIM_LEN..pos + DELIM_LEN + len].to_vec(), eof));
+                out.push((&psdu[pos + DELIM_LEN..pos + DELIM_LEN + len], eof));
                 pos = pad4(pos + DELIM_LEN + len);
             }
             _ => pos += DELIM_LEN, // bad delimiter or truncated: resync
@@ -143,7 +143,7 @@ pub fn deaggregate_with_eof(psdu: &[u8]) -> Vec<(Vec<u8>, bool)> {
 }
 
 /// Extract MPDUs from an A-MPDU.
-pub fn deaggregate(psdu: &[u8]) -> Vec<Vec<u8>> {
+pub fn deaggregate(psdu: &[u8]) -> Vec<&[u8]> {
     deaggregate_with_eof(psdu).into_iter().map(|(m, _)| m).collect()
 }
 
@@ -177,7 +177,7 @@ mod tests {
         let a = aggregate(&mpdu, cap);
         assert_eq!(a.len(), cap);
         let got = deaggregate(&a);
-        assert_eq!(got, vec![mpdu.clone()]);
+        assert_eq!(got, vec![&mpdu[..]]);
         assert!(is_s_mpdu(&a));
         // A two-MPDU A-MPDU is not an S-MPDU.
         let mut two = Vec::new();
@@ -202,18 +202,18 @@ mod tests {
         assert_eq!(a.len(), cap);
         let got = deaggregate_with_eof(&a);
         assert_eq!(got.len(), 3);
-        assert_eq!(got[0], (m1, false));
-        assert_eq!(got[1], (m2, false));
-        assert_eq!(got[2], (m3, false));
+        assert_eq!(got[0], (&m1[..], false));
+        assert_eq!(got[1], (&m2[..], false));
+        assert_eq!(got[2], (&m3[..], false));
         assert!(!is_s_mpdu(&a));
     }
 
     #[test]
     fn eof_padding_survives_scan() {
-        // Small MPDU, big capacity → lots of EOF delimiters; scan stays sane.
+        // Small MPDU, big capacity: many EOF delimiters to scan past.
         let mpdu = vec![0xAB; 30];
         let a = aggregate(&mpdu, 400);
-        assert_eq!(deaggregate(&a), vec![mpdu]);
+        assert_eq!(deaggregate(&a), vec![&mpdu[..]]);
     }
 
     #[test]
@@ -230,6 +230,6 @@ mod tests {
         a.extend_from_slice(&m2);
         a[0] ^= 0xff; // corrupt first delimiter
         let got = deaggregate(&a);
-        assert_eq!(got, vec![m2.clone()], "second MPDU at {second_at} recovered");
+        assert_eq!(got, vec![&m2[..]], "second MPDU at {second_at} recovered");
     }
 }

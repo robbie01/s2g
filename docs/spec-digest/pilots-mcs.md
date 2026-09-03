@@ -1,6 +1,6 @@
 # S1G PHY digest: Pilot subcarriers + 2 MHz MCS parameter tables
 
-Scope: IEEE 802.11-2024, Clause 23 (S1G PHY). Target configuration: **2 MHz bandwidth, S1G_SHORT preamble, SU PPDU, NSS = NSTS = 1, no STBC, BCC, Long GI (8 us)**. All PDF page citations are the *printed* page number (PDF viewer page = printed page + 1; e.g. printed p3798 is PDF viewer page 3799). Every table/equation below was verified visually against the rendered PDF pages.
+Scope: IEEE 802.11-2024, Clause 23 (S1G PHY). Baseline configuration for the worked examples: **2 MHz bandwidth, S1G_SHORT preamble, SU PPDU, NSS = NSTS = 1, no STBC, BCC, Long GI (8 us)** (the implementation also covers short GI, LDPC and S1G_LONG SU). All PDF page citations are the *printed* page number (PDF viewer page = printed page + 1; e.g. printed p3798 is PDF viewer page 3799).
 
 ---
 

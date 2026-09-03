@@ -12,8 +12,7 @@ pub const SAMPLE_RATE_HZ: f64 = 2.0e6;
 pub const DELTA_F_HZ: f64 = 31_250.0;
 /// Long guard interval, samples (8 µs) [Table 23-5].
 pub const N_GI_LONG: usize = 16;
-/// Short guard interval, samples (4 µs) [Table 23-5]. Only used for PPDU
-/// duration prediction (short-GI PPDUs are not decoded).
+/// Short guard interval, samples (4 µs) [Table 23-5].
 pub const N_GI_SHORT: usize = 8;
 /// Double guard interval, samples (16 µs, LTF1 only) [Table 23-5].
 pub const N_GI2: usize = 32;
@@ -63,7 +62,7 @@ pub const N_TONE_LTF: usize = 56;
 pub const N_TONE_SIG: usize = 52;
 pub const N_TONE_DATA: usize = 56;
 
-/// SERVICE field bits (S1G is 8, not 16!) [Table 23-5; 23.3.9.2].
+/// SERVICE field bits (8 in S1G, 16 in other OFDM PHYs) [Table 23-5; 23.3.9.2].
 pub const N_SERVICE: usize = 8;
 /// BCC tail bits [Table 23-5].
 pub const N_TAIL: usize = 6;
@@ -217,17 +216,6 @@ pub fn valid_mcs() -> impl Iterator<Item = u8> {
     MCS_TABLE.iter().map(|m| m.mcs)
 }
 
-/// Mandatory-support floor [4.3.14.1; 23.5]: single-stream MCS 0–2 for any
-/// S1G STA (0–7 for an AP). Everything else this crate implements is
-/// optional.
-pub fn mcs_is_mandatory(mcs: u8, is_ap: bool) -> bool {
-    if is_ap {
-        mcs <= 7
-    } else {
-        mcs <= 2
-    }
-}
-
 /// PHY characteristics a MAC needs [Table 23-41, 23.4.4, p3856].
 pub mod characteristics {
     /// aSIFSTime.
@@ -264,41 +252,12 @@ pub mod rf {
     /// types) [23.3.18.5.3.1, Tables 23-37/38].
     pub const ED_THRESHOLD_2MHZ_DBM: f32 = -72.0;
 
-    /// Start-of-PPDU (preamble) detection threshold for a 2 MHz
-    /// S1G_SHORT/S1G_LONG PPDU in the primary 2 MHz channel, dBm.
-    pub fn preamble_threshold_2mhz_dbm(t: CcaType) -> f32 {
-        match t {
-            CcaType::Type1 => -92.0,
-            CcaType::Type2 => -89.0,
-        }
-    }
-
     /// Mid-packet detection threshold (aCCAMidTime window), dBm.
     pub fn mid_packet_threshold_2mhz_dbm(t: CcaType) -> f32 {
         match t {
             CcaType::Type1 => -89.0,
             CcaType::Type2 => -86.0,
         }
-    }
-
-    /// Minimum input sensitivity for a 2 MHz PPDU per MCS, dBm (PER < 10 %
-    /// at 256 octets) [Table 23-35, p3831].
-    pub fn min_sensitivity_2mhz_dbm(mcs: u8) -> Option<f32> {
-        Some(match mcs {
-            0 => -92.0,
-            1 => -89.0,
-            2 => -87.0,
-            3 => -84.0,
-            4 => -80.0,
-            5 => -76.0,
-            6 => -75.0,
-            7 => -74.0,
-            8 => -69.0,
-            9 => -67.0,
-            11 => -64.0,
-            12 => -62.0,
-            _ => return None,
-        })
     }
 
     /// Receive level below which CCA is released after a SIG CRC failure:
@@ -319,11 +278,6 @@ pub mod rf {
         }
     }
 
-    /// Inverse of [`rcpi_encode`] for 1..=219 (returns `None` for the
-    /// saturated / unavailable codes).
-    pub fn rcpi_decode(rcpi: u8) -> Option<f32> {
-        (1..=219).contains(&rcpi).then(|| rcpi as f32 / 2.0 - 110.0)
-    }
 }
 
 /// Transmitter conformance limits [23.3.17].
@@ -444,8 +398,6 @@ mod tests {
         assert_eq!(rf::rcpi_encode(-60.0), 100);
         assert_eq!(rf::rcpi_encode(5.0), 220);
         assert_eq!(rf::rcpi_encode(f32::NAN), 255);
-        assert_eq!(rf::rcpi_decode(100), Some(-60.0));
-        assert_eq!(rf::rcpi_decode(255), None);
     }
 
     #[test]

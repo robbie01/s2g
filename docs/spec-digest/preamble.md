@@ -40,7 +40,7 @@ were verified against the rendered PDF pages, not just the text extraction.
 - Tone scaling factors N_Tone^Field (Table 23-8, 2 MHz column) [23.3.7, pp3764-3765]:
   STF = 12, LTF1 = 56, SIG = 52, LTF2~LTFN = 56, Data = 56. GI per field: STF none (built into
   the periodic waveform), LTF1 = T_GI2, SIG = T_GI, LTF2~N = T_GI.
-- Normalization N_Norm = N_STS,total = 1 for our case (S1G_SHORT) [23.3.7, p3765].
+- Normalization N_Norm = N_STS,total = 1 for the baseline (S1G_SHORT) [23.3.7, p3765].
 - Phase rotation Υ_k,BW: **for CBW2, Υ_k,2 = 1 for all k** (Eq 23-6) [23.3.7, p3767]. (4/8/16 MHz
   rotate per-2MHz-subchannel, Eqs 23-7…23-9 — out of scope.)
 - Cyclic shift (Table 23-10) [23.3.8.2.2.2, p3769]: T_CS(n) for N_STS,total = 1 is **0 µs**.
@@ -210,13 +210,13 @@ SIG-1 (24 bits, B0 transmitted first):
 | Bits | Width | Field | Semantics |
 |---|---|---|---|
 | B0 | 1 | Reserved | **Set to 1** on transmit |
-| B1 | 1 | STBC | 1 = all spatial streams STBC; **0 for us** |
+| B1 | 1 | STBC | 1 = all spatial streams STBC; **0 in the baseline** |
 | B2 | 1 | Uplink Indication | 1 if PPDU addressed to an AP, else 0 (TXVECTOR UPLINK_INDICATION) |
-| B3–B4 | 2 | BW | 0=CBW2, 1=CBW4, 2=CBW8, 3=CBW16 (S1G_DUP_2M: 0). **0 for us** |
-| B5–B6 | 2 | Nsts | N_STS−1 (0→1 STS … 3→4 STS). **0 for us** |
+| B3–B4 | 2 | BW | 0=CBW2, 1=CBW4, 2=CBW8, 3=CBW16 (S1G_DUP_2M: 0). **0 in the baseline** |
+| B5–B6 | 2 | Nsts | N_STS−1 (0→1 STS … 3→4 STS). **0 in the baseline** |
 | B7–B15 | 9 | ID | If Uplink Indication absent-or-1: B7–B15 = partial AID. If Uplink Indication = 0: B7–B9 = COLOR (BSS identifier), B10–B15 = partial AID |
-| B16 | 1 | Short GI | 1 = short GI used in Data field. **0 for us (LGI)** |
-| B17 | 1 | Coding | 0 = BCC, 1 = LDPC. **0 for us** |
+| B16 | 1 | Short GI | 1 = short GI used in Data field. **0 in the baseline (LGI)** |
+| B17 | 1 | Coding | 0 = BCC, 1 = LDPC. **0 in the baseline** |
 | B18 | 1 | LDPC Extra | If Coding=1: 1 iff LDPC adds extra symbol(s) (21.3.10.5.4). **If Coding=0 this bit is set to 1** |
 | B19–B22 | 4 | MCS | MCS index (LSB first like all fields) |
 | B23 | 1 | Smoothing | 1 = channel smoothing recommended |

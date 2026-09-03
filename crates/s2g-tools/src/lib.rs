@@ -1,7 +1,6 @@
 //! Shared helpers for the CLI tools: .cf32 / SigMF / ci16 file I/O (GNU
 //! Radio compatible: interleaved little-endian I,Q), rate conversion of
-//! recordings to the PHY's 2 MS/s, a PCAP writer, hex PSDU parsing, and the
-//! impairment channel used by s2g-sim.
+//! recordings to the PHY's 2 MS/s, a PCAP writer and hex PSDU parsing.
 
 pub mod nic;
 #[cfg(windows)]
@@ -83,7 +82,7 @@ pub fn read_recording(path: &Path, skip: usize, max_samples: Option<usize>) -> R
 }
 
 /// Two-channel (I, Q) WAV as written by SDR#, SDRuno, GQRX etc.: 16-bit
-/// PCM, 32-bit float or 32-bit PCM. The centre frequency is taken from a
+/// PCM, 32-bit float or 32-bit PCM. The center frequency is taken from a
 /// `baseband_<Hz>Hz_…` / `..._<Hz>Hz_…` file name when present.
 fn read_wav_iq(path: &Path, skip: usize, max_samples: Option<usize>) -> Result<Recording> {
     use std::io::{Seek, SeekFrom};
@@ -145,7 +144,7 @@ fn read_wav_iq(path: &Path, skip: usize, max_samples: Option<usize>) -> Result<R
             _ => Complex32::new(0.0, 0.0),
         })
         .collect();
-    // SDR#-style names carry the centre frequency: "..._862004550Hz_...".
+    // SDR#-style names carry the center frequency: "..._862004550Hz_...".
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
     let center = name.split('_').find_map(|part| part.strip_suffix("Hz").and_then(|d| d.parse::<f64>().ok()));
     Ok(Recording { samples, sample_rate_hz: Some(rate as f64), center_freq_hz: center })
@@ -227,8 +226,8 @@ fn read_sigmf_archive(path: &Path, skip: usize, max_samples: Option<usize>) -> R
             meta = Some(String::from_utf8_lossy(&buf).to_string());
             std::io::copy(&mut (&mut f).take((padded - size) as u64), &mut std::io::sink())?;
         } else if regular && name.ends_with(".sigmf-data") {
-            // Read only the window we need (8 bytes/sample is an upper bound
-            // for either datatype; the decoder applies the exact skip).
+            // Read only the requested window (8 bytes/sample is an upper
+            // bound for either datatype; the decoder applies the exact skip).
             let want = match max_samples {
                 Some(n) => size.min((skip + n) * 8),
                 None => size,
@@ -251,7 +250,7 @@ fn read_sigmf_archive(path: &Path, skip: usize, max_samples: Option<usize>) -> R
 }
 
 /// Bring a recording at `in_rate` to the PHY's 2 MS/s, optionally shifting
-/// a signal centred `shift_hz` away from the capture centre to baseband
+/// a signal centered `shift_hz` away from the capture center to baseband
 /// first. Uses the halfband decimator for exactly 4 MS/s, otherwise the
 /// anti-aliased arbitrary-ratio resampler.
 pub fn to_native_rate(samples: &[Complex32], in_rate: f64, shift_hz: f64) -> Vec<Complex32> {
@@ -316,86 +315,12 @@ impl PcapWriter {
 
 pub fn parse_hex_psdu(hex: &str) -> Result<Vec<u8>> {
     let clean: String = hex.chars().filter(|c| !c.is_whitespace() && *c != ':').collect();
-    if clean.len() % 2 != 0 {
+    if !clean.len().is_multiple_of(2) {
         bail!("hex PSDU has odd number of digits");
     }
     (0..clean.len() / 2)
         .map(|i| u8::from_str_radix(&clean[2 * i..2 * i + 2], 16).context("bad hex digit"))
         .collect()
-}
-
-/// Deterministic test RNG (splitmix64).
-pub struct Rng(pub u64);
-
-impl Rng {
-    pub fn next_u64(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
-    pub fn uniform(&mut self) -> f32 {
-        ((self.next_u64() >> 32) as f32 / (1u64 << 31) as f32) - 1.0
-    }
-    pub fn gauss(&mut self) -> f32 {
-        let s: f32 = (0..6).map(|_| self.uniform()).sum();
-        s / (2.0f32).sqrt()
-    }
-    pub fn bytes(&mut self, n: usize) -> Vec<u8> {
-        (0..n).map(|_| (self.next_u64() >> 40) as u8).collect()
-    }
-}
-
-/// Channel impairments for simulation.
-#[derive(Debug, Clone, Copy)]
-pub struct Impairments {
-    pub snr_db: Option<f32>,
-    pub cfo_hz: f32,
-    /// Fractional-sample delay 0..1 (linear interpolation).
-    pub frac_delay: f32,
-    pub amplitude: f32,
-    /// Sampling-clock offset between transmitter and receiver, ppm
-    /// (positive = receiver clock fast).
-    pub sfo_ppm: f64,
-    /// Static echo: (delay in samples, complex gain).
-    pub echo: Option<(usize, Complex32)>,
-}
-
-impl Default for Impairments {
-    fn default() -> Self {
-        Self { snr_db: None, cfo_hz: 0.0, frac_delay: 0.0, amplitude: 1.0, sfo_ppm: 0.0, echo: None }
-    }
-}
-
-pub fn apply_channel(sig: &[Complex32], imp: &Impairments, rng: &mut Rng) -> Vec<Complex32> {
-    let mut v: Vec<Complex32> = sig.iter().map(|&s| s * imp.amplitude).collect();
-    if let Some((delay, gain)) = imp.echo {
-        v = (0..v.len())
-            .map(|i| v[i] + if i >= delay { v[i - delay] * gain } else { Complex32::new(0.0, 0.0) })
-            .collect();
-    }
-    if imp.sfo_ppm != 0.0 {
-        v = s2g_dsp::apply_sfo_ppm(&v, imp.sfo_ppm);
-    }
-    if imp.cfo_hz != 0.0 {
-        let w = 2.0 * std::f64::consts::PI * imp.cfo_hz as f64 / 2.0e6;
-        for (i, s) in v.iter_mut().enumerate() {
-            *s *= Complex32::from_polar(1.0, (w * i as f64) as f32);
-        }
-    }
-    if imp.frac_delay > 0.0 {
-        let mu = imp.frac_delay;
-        v = (0..v.len().saturating_sub(1)).map(|i| v[i] * (1.0 - mu) + v[i + 1] * mu).collect();
-    }
-    if let Some(snr) = imp.snr_db {
-        let p: f32 = v.iter().map(|s| s.norm_sqr()).sum::<f32>() / v.len() as f32;
-        let sigma = (p / 10f32.powf(snr / 10.0) / 2.0).sqrt();
-        for s in v.iter_mut() {
-            *s += Complex32::new(rng.gauss() * sigma, rng.gauss() * sigma);
-        }
-    }
-    v
 }
 
 #[cfg(test)]

@@ -58,7 +58,7 @@ pub fn polarity(n: usize) -> f32 {
 }
 
 /// Pilot subcarrier positions for Data symbol `n` (ascending, pilot index
-/// order) — fixed, or traveling per Table 23-23.
+/// order): fixed, or traveling per Table 23-23.
 pub fn pilot_positions(n: usize, traveling: bool) -> [i32; 4] {
     if traveling {
         let m = n % N_TP_2MHZ;
@@ -112,7 +112,7 @@ mod tests {
         assert_eq!(&POLARITY[..8], &[1, 1, 1, 1, -1, -1, -1, 1]);
         assert_eq!(&POLARITY[124..], &[-1, -1, -1]);
         // p is the scrambler output for the all-ones *register* state with
-        // 1 → −1, 0 → +1; in our seed convention (first 7 output bits, LSB
+        // 1 → −1, 0 → +1; in the seed convention (first 7 output bits, LSB
         // first) that register state produces the seed-112 sequence.
         let seq = crate::scrambler::sequence(112, 127);
         for (i, &s) in seq.iter().enumerate() {

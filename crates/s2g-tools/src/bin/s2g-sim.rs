@@ -7,7 +7,8 @@ use s2g_phy::params::valid_mcs;
 use s2g_phy::rx::{Receiver, RxConfig, RxEvent};
 use s2g_phy::vector::{Coding, GuardInterval, PreambleType, TxVector};
 use s2g_phy::Transmitter;
-use s2g_tools::{apply_channel, Complex32, Impairments, Rng};
+use s2g_phy::sim::{Impairments, Rng};
+use s2g_tools::Complex32;
 
 #[derive(Parser, Debug)]
 #[command(name = "s2g-sim", about = "S1G PHY loopback simulator (PER vs SNR)")]
@@ -57,6 +58,10 @@ struct Args {
     /// RNG seed
     #[arg(long, default_value_t = 1)]
     seed: u64,
+    /// Also print, per MCS, the mean SNR the receiver reports at each point
+    /// (what rate control sees), from the PPDUs it decoded
+    #[arg(long)]
+    report_snr: bool,
 }
 
 fn main() -> Result<()> {
@@ -82,8 +87,10 @@ fn main() -> Result<()> {
 
     for mcs in mcs_list {
         let mut row = Vec::new();
+        let mut reported = Vec::new();
         for &snr in &snrs {
             let mut errors = 0usize;
+            let (mut snr_sum, mut snr_n) = (0.0f32, 0usize);
             for _ in 0..args.count {
                 let psdu = rng.bytes(args.len);
                 let txv = TxVector {
@@ -107,7 +114,7 @@ fn main() -> Result<()> {
                     sfo_ppm: args.sfo_ppm,
                     echo: (args.echo_delay > 0).then_some((args.echo_delay, Complex32::new(args.echo_gain, -0.3 * args.echo_gain))),
                 };
-                let noisy = apply_channel(&stream, &imp, &mut rng);
+                let noisy = imp.apply(&stream, &mut rng);
                 let mut rx = Receiver::new(RxConfig { emit_cca: false, ..Default::default() });
                 let mut ev = Vec::new();
                 rx.process(&noisy, &mut ev);
@@ -119,10 +126,20 @@ fn main() -> Result<()> {
                 if !ok {
                     errors += 1;
                 }
+                for e in &ev {
+                    if let RxEvent::PsduReceived { metrics, .. } = e {
+                        snr_sum += metrics.snr_db;
+                        snr_n += 1;
+                    }
+                }
             }
             row.push(format!("{:>7.3}", errors as f32 / args.count as f32));
+            reported.push(if snr_n > 0 { format!("{:>7.1}", snr_sum / snr_n as f32) } else { format!("{:>7}", "-") });
         }
         println!("{mcs:>4} | {}", row.join(" "));
+        if args.report_snr {
+            println!(" snr | {}", reported.join(" "));
+        }
     }
     Ok(())
 }

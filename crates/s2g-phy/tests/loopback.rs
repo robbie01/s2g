@@ -7,51 +7,13 @@
 use s2g_phy::params::valid_mcs;
 use s2g_phy::rx::{CcaReason, Receiver, RxConfig, RxEndStatus, RxEvent};
 use s2g_phy::sig::{self, SigASu};
+use s2g_phy::sim::{apply_cfo, awgn, echo, frac_delay, noise, Rng};
 use s2g_phy::vector::{Coding, GuardInterval, PreambleType, ResponseIndication, TxVector};
 use s2g_phy::{preamble, Complex32, Transmitter};
 
-struct Rng(u64);
-
-impl Rng {
-    fn next_u64(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
-    fn uniform(&mut self) -> f32 {
-        ((self.next_u64() >> 32) as f32 / (1u64 << 31) as f32) - 1.0
-    }
-    /// Approximately Gaussian (sum of uniforms), unit variance per call.
-    fn gauss(&mut self) -> f32 {
-        let s: f32 = (0..6).map(|_| self.uniform()).sum();
-        s / (6.0f32 / 3.0).sqrt() // var of sum = 6·(1/3) = 2 → scale to 1
-    }
-    fn bytes(&mut self, n: usize) -> Vec<u8> {
-        (0..n).map(|_| (self.next_u64() >> 40) as u8).collect()
-    }
-}
-
-fn awgn(sig: &[Complex32], snr_db: f32, rng: &mut Rng) -> Vec<Complex32> {
-    let p: f32 = sig.iter().map(|v| v.norm_sqr()).sum::<f32>() / sig.len() as f32;
-    let nv = p / 10f32.powf(snr_db / 10.0);
-    let s = (nv / 2.0).sqrt();
-    sig.iter().map(|&v| v + Complex32::new(rng.gauss() * s, rng.gauss() * s)).collect()
-}
-
-fn apply_cfo(sig: &[Complex32], cfo_hz: f32) -> Vec<Complex32> {
-    let w = 2.0 * std::f64::consts::PI * cfo_hz as f64 / 2.0e6;
-    sig.iter().enumerate().map(|(i, &v)| v * Complex32::from_polar(1.0, (w * i as f64) as f32)).collect()
-}
-
-/// Fractional delay via linear interpolation (crude but adequate for tests).
-fn frac_delay(sig: &[Complex32], mu: f32) -> Vec<Complex32> {
-    (0..sig.len().saturating_sub(1)).map(|i| sig[i] * (1.0 - mu) + sig[i + 1] * mu).collect()
-}
-
+/// Noise of RMS amplitude `amp`.
 fn lead_noise(n: usize, amp: f32, rng: &mut Rng) -> Vec<Complex32> {
-    (0..n).map(|_| Complex32::new(rng.gauss(), rng.gauss()) * amp * std::f32::consts::FRAC_1_SQRT_2).collect()
+    noise(n, amp * amp, rng)
 }
 
 fn silence(n: usize) -> Vec<Complex32> {
@@ -239,11 +201,6 @@ fn timing_and_amplitude_robustness() {
     }
 }
 
-/// Static two-path channel: direct path plus an echo `delay` samples later.
-fn two_path(sig: &[Complex32], delay: usize, gain: Complex32) -> Vec<Complex32> {
-    (0..sig.len()).map(|i| sig[i] + if i >= delay { sig[i - delay] * gain } else { Complex32::new(0.0, 0.0) }).collect()
-}
-
 #[test]
 fn sampling_clock_offset_max_length_ppdu() {
     // A 511-symbol PPDU (20.7 ms) with ±40 ppm clock mismatch (both ends at
@@ -252,7 +209,7 @@ fn sampling_clock_offset_max_length_ppdu() {
     // inside the ISI-free part of the guard interval.
     let tx = Transmitter::new();
     let mut rng = Rng(5);
-    let echo = Complex32::new(0.4, -0.2);
+    let gain = Complex32::new(0.4, -0.2);
     for coding in [Coding::Bcc, Coding::Ldpc] {
         // MCS 0: 1659 octets → 511 symbols (BCC); LDPC needs one fewer
         // to stay ≤ 511 with the extra symbol.
@@ -265,7 +222,7 @@ fn sampling_clock_offset_max_length_ppdu() {
             let mut stream = silence(400);
             stream.extend(&wave);
             stream.extend(silence(400));
-            let stretched = s2g_dsp::apply_sfo_ppm(&two_path(&stream, 4, echo), ppm);
+            let stretched = s2g_dsp::apply_sfo_ppm(&echo(&stream, 4, gain), ppm);
             let shifted = apply_cfo(&stretched, 12_000.0);
             let noisy = awgn(&shifted, 20.0, &mut rng);
             let ev = run_rx(&noisy, 4096);
@@ -294,7 +251,7 @@ fn sampling_clock_offset_max_length_ppdu() {
     let mut stream = silence(400);
     stream.extend(&wave);
     stream.extend(silence(400));
-    let stretched = s2g_dsp::apply_sfo_ppm(&two_path(&stream, 6, echo), -200.0);
+    let stretched = s2g_dsp::apply_sfo_ppm(&echo(&stream, 6, gain), -200.0);
     let noisy = awgn(&stretched, 20.0, &mut rng);
     let ev_off = run_rx_cfg(&noisy, 4096, RxConfig { timing_tracking: false, ..Default::default() });
     assert!(psdus(&ev_off).first().is_none_or(|p| !carries(p, &psdu)), "decoded without tracking?");
@@ -529,8 +486,8 @@ fn ndp_roundtrip_with_impairments() {
     assert_eq!(got, vec![body], "{ev:?}");
 }
 
-/// Build an S1G_LONG PPDU preamble (STF ‖ LTF1 ‖ SIG-A) followed by a
-/// stand-in for D-STF/D-LTF/SIG-B/Data of the signalled duration.
+/// Build an S1G_LONG PPDU preamble (STF ‖ LTF1 ‖ SIG-A) followed by noise
+/// filling the signaled duration in place of D-STF/D-LTF/SIG-B/Data.
 fn s1g_long_ppdu(fields: &SigASu, rng: &mut Rng) -> (Vec<Complex32>, usize) {
     let mut w = Vec::new();
     w.extend(preamble::stf_time());
@@ -667,7 +624,10 @@ fn rxvector_measurements() {
     assert!((r.rcpi_dbm + 48.0).abs() < 1.5, "rcpi {}", r.rcpi_dbm);
     assert_eq!(r.rcpi, s2g_phy::params::rf::rcpi_encode(r.rcpi_dbm));
     assert!(r.rssi > 200 && r.rssi < 230, "rssi code {}", r.rssi);
-    assert!((r.snr_db - 20.0).abs() < 3.0, "snr {}", r.snr_db);
+    // Noise is scaled to the mean power of the whole stream, a third of
+    // which is silence: the PPDU sits at 22 dB. The LTF estimate reads
+    // 1-3 dB high.
+    assert!((r.snr_db - 23.0).abs() < 3.0, "snr {}", r.snr_db);
     assert_eq!(r.length, 64);
 }
 
@@ -887,7 +847,7 @@ fn s1g_long_su_data_decoded_with_impairments() {
         let mut stream = lead_noise(350, 1e-4, &mut rng);
         stream.extend(&wave);
         stream.extend(lead_noise(350, 1e-4, &mut rng));
-        let stretched = s2g_dsp::apply_sfo_ppm(&two_path(&stream, 3, Complex32::new(0.25, -0.15)), ppm);
+        let stretched = s2g_dsp::apply_sfo_ppm(&echo(&stream, 3, Complex32::new(0.25, -0.15)), ppm);
         let noisy = awgn(&apply_cfo(&stretched, -9_000.0), 22.0, &mut rng);
         let ev = run_rx(&noisy, 500);
         let got = psdus(&ev);

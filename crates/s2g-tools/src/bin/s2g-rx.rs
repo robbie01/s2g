@@ -1,4 +1,4 @@
-//! Receive S1G PPDUs — from a recording (.cf32 / SigMF / ci16 at any sample
+//! Receive S1G PPDUs from a recording (.cf32 / SigMF / ci16 at any sample
 //! rate) or a PlutoSDR at 1250 MHz. Optionally parses the MAC frames and
 //! writes them to a PCAP.
 
@@ -21,8 +21,8 @@ struct Args {
     /// Sample rate of the input file, Hz (default: from SigMF metadata, else 2e6).
     /// Anything other than 2e6 / 4e6 is resampled with an anti-alias filter.
     #[arg(long)]
-    rate: Option<f64>,
-    /// Signal centre relative to the capture centre, Hz (translated to baseband first)
+    rate_hz: Option<f64>,
+    /// Signal center relative to the capture center, Hz (translated to baseband first)
     #[arg(long, default_value_t = 0.0)]
     shift_hz: f64,
     /// Skip this many seconds of the recording
@@ -43,13 +43,13 @@ struct Args {
     uri: Option<String>,
     /// RF center frequency, Hz
     #[arg(long, default_value_t = DEFAULT_CENTER_FREQ_HZ)]
-    freq: f64,
+    freq_hz: f64,
     /// RX gain: "auto" or dB value
     #[arg(long, default_value = "auto")]
-    gain: String,
+    rx_gain: String,
     /// Analog RF bandwidth hint, Hz
     #[arg(long, default_value_t = 2_200_000.0)]
-    rf_bandwidth: f64,
+    rf_bandwidth_hz: f64,
 
     /// Exit after N PSDUs (0 = run forever / until file end)
     #[arg(long, default_value_t = 0)]
@@ -216,16 +216,16 @@ impl Printer {
                     metrics.ldpc_failures
                 );
                 if self.mac || self.pcap.is_some() {
-                    let mpdus: Vec<Vec<u8>> = if rxvector.aggregation {
+                    let mpdus: Vec<&[u8]> = if rxvector.aggregation {
                         s2g_mac::ampdu::deaggregate(psdu)
                     } else {
                         let located = s2g_mac::frame::locate_mpdu(psdu);
                         if located.is_some_and(|m| m.len() < psdu.len()) {
                             self.stats.padded += 1;
                         }
-                        vec![located.unwrap_or(psdu).to_vec()]
+                        vec![located.unwrap_or(psdu)]
                     };
-                    for m in &mpdus {
+                    for &m in &mpdus {
                         self.stats.mpdus += 1;
                         let ok = s2g_mac::fcs::check_and_strip(m).is_some();
                         if ok {
@@ -320,7 +320,7 @@ fn main() -> Result<()> {
     if let Some(path) = &args.r#in {
         // Rate: CLI > SigMF metadata > 2 MS/s.
         let probe = read_recording(path, 0, Some(0))?;
-        let rate = args.rate.or(probe.sample_rate_hz).unwrap_or(2.0e6);
+        let rate = args.rate_hz.or(probe.sample_rate_hz).unwrap_or(2.0e6);
         let skip = (args.skip_sec * rate) as usize;
         let max = args.duration_sec.map(|d| (d * rate) as usize);
         let rec = read_recording(path, skip, max)?;
@@ -329,7 +329,7 @@ fn main() -> Result<()> {
             rec.samples.len(),
             path.display(),
             rate,
-            rec.center_freq_hz.map(|f| format!(", centre {f} Hz")).unwrap_or_default(),
+            rec.center_freq_hz.map(|f| format!(", center {f} Hz")).unwrap_or_default(),
             if args.shift_hz != 0.0 { format!(", shifting {:+} Hz", args.shift_hz) } else { String::new() }
         );
         if rate < 1.9e6 {
@@ -364,15 +364,15 @@ fn main() -> Result<()> {
 fn receive_pluto(args: &Args, rx: &mut Receiver, printer: &mut Printer) -> Result<()> {
     use s2g_sdr::{RxGain, SdrDevice, SdrRx, StreamConfig};
     let uri = args.uri.as_deref().unwrap_or("192.168.2.1");
-    let gain = if args.gain == "auto" {
+    let gain = if args.rx_gain == "auto" {
         RxGain::Auto
     } else {
-        RxGain::Manual(args.gain.parse().map_err(|_| anyhow::anyhow!("--gain must be 'auto' or a dB value"))?)
+        RxGain::Manual(args.rx_gain.parse().map_err(|_| anyhow::anyhow!("--rx-gain must be 'auto' or a dB value"))?)
     };
     let mut pluto = s2g_sdr_pluto::Pluto::open(uri).map_err(|e| anyhow::anyhow!("pluto: {e}"))?;
-    let cfg = StreamConfig { center_freq_hz: args.freq, sample_rate_hz: DEFAULT_DEVICE_RATE_HZ, rf_bandwidth_hz: args.rf_bandwidth };
+    let cfg = StreamConfig { center_freq_hz: args.freq_hz, sample_rate_hz: DEFAULT_DEVICE_RATE_HZ, rf_bandwidth_hz: args.rf_bandwidth_hz };
     let mut stream = pluto.open_rx(&cfg, gain).map_err(|e| anyhow::anyhow!("pluto rx: {e}"))?;
-    eprintln!("Pluto RX @ {} Hz, {} S/s (decimating to 2 MS/s)", args.freq, DEFAULT_DEVICE_RATE_HZ);
+    eprintln!("Pluto RX @ {} Hz, {} S/s (decimating to 2 MS/s)", args.freq_hz, DEFAULT_DEVICE_RATE_HZ);
     let mut dec = s2g_dsp::HalfbandDecim2::new();
     let mut dev_buf = vec![Complex32::new(0.0, 0.0); 16384];
     let mut native = Vec::with_capacity(8192);

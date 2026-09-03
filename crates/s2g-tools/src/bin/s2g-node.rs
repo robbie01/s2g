@@ -47,9 +47,13 @@ struct Args {
     /// Protect unicast MPDUs longer than this with RTS / NDP CTS
     #[arg(long)]
     rts_threshold: Option<usize>,
-    /// Response timeout in ms (SDR buffering makes SIFS-scale impossible)
+    /// Longest response wait in ms (SDR buffering makes SIFS-scale impossible);
+    /// the MAC shrinks it to what responses actually take
     #[arg(long, default_value_t = 150)]
     ack_timeout_ms: u64,
+    /// Keep --ack-timeout-ms fixed instead of learning the response delay
+    #[arg(long)]
+    fixed_ack_timeout: bool,
     #[arg(long, default_value_t = 3)]
     retries: u32,
     /// Send every unicast frame at --mcs instead of adapting the MCS per peer
@@ -61,8 +65,8 @@ struct Args {
     /// Highest MCS rate control probes
     #[arg(long, default_value_t = 8)]
     max_mcs: u8,
-    /// Most Ethernet frames packed into one A-MPDU (1 = no aggregation)
-    #[arg(long, default_value_t = 8)]
+    /// Most Ethernet frames packed into one A-MPDU (1 = no aggregation, 16 = the NDP BlockAck bitmap)
+    #[arg(long, default_value_t = 16)]
     ampdu: usize,
     /// Amateur call sign: transmitted in the clear before the first frame, every
     /// --id-interval-min while sending, and at the end of a communication
@@ -74,7 +78,7 @@ struct Args {
     /// Minutes between identifications while transmitting
     #[arg(long, default_value_t = 10)]
     id_interval_min: u64,
-    /// Disable the good-neighbour filter entirely
+    /// Disable the good-neighbor filter entirely
     #[arg(long)]
     no_filter: bool,
     /// Filter only frames leaving for the air, deliver everything received
@@ -101,7 +105,7 @@ struct Args {
     /// Let mDNS/LLMNR/SSDP/WS-Discovery/NetBIOS/SMB through
     #[arg(long)]
     allow_discovery: bool,
-    /// Let every ESP packet through, not only those recognised as ESP-NULL
+    /// Let every ESP packet through, not only those recognized as ESP-NULL
     #[arg(long)]
     allow_esp: bool,
     /// Let IPv6 destinations outside link-local/multicast/ULA through (tunnels always may)
@@ -113,19 +117,20 @@ struct Args {
     uri: String,
     /// RF center frequency, Hz
     #[arg(long, default_value_t = DEFAULT_CENTER_FREQ_HZ)]
-    freq: f64,
+    freq_hz: f64,
     /// Pluto oscillator trim (ad9361-phy xo_correction, Hz, nominal 40000000):
     /// scale it by (1 + ppm/1e6) to pull the peer offset the node reports to zero
     #[arg(long)]
     xo_correction: Option<u64>,
     /// RX gain: "auto" or dB
     #[arg(long, default_value = "auto")]
-    gain: String,
+    rx_gain: String,
     /// TX gain (attenuation), dB ≤ 0
     #[arg(long, default_value_t = -10.0)]
-    tx_gain: f64,
+    tx_gain_db: f64,
+    /// Analog RF bandwidth hint, Hz
     #[arg(long, default_value_t = 2_200_000.0)]
-    rf_bandwidth: f64,
+    rf_bandwidth_hz: f64,
     /// Receiver calibration: dBm = dBFS + this offset (RCPI, CCA thresholds)
     #[arg(long)]
     cal_offset_db: Option<f32>,
@@ -203,6 +208,7 @@ fn main() -> Result<()> {
     cfg.ndp_ack = !args.no_ndp_ack;
     cfg.rts_threshold = args.rts_threshold;
     cfg.ack_timeout_us = args.ack_timeout_ms * 1000;
+    cfg.ack_timeout_adaptive = !args.fixed_ack_timeout;
     cfg.max_retries = args.retries;
     cfg.rate = RateConfig {
         enabled: !args.fixed_mcs,
@@ -232,7 +238,7 @@ fn main() -> Result<()> {
         f.blocked_ports.retain(|p| !args.allow_port.contains(p));
         f
     };
-    eprintln!("good-neighbour filter: {}", cfg.filter.describe());
+    eprintln!("good-neighbor filter: {}", cfg.filter.describe());
     cfg.ident = IdentConfig {
         callsign: args.callsign.clone(),
         info: args.id_info.clone(),
@@ -259,7 +265,7 @@ fn main() -> Result<()> {
     run_radio(&args, Mac::new(cfg), nic)
 }
 
-/// Rate-limited log of what the good-neighbour filter dropped: the first
+/// Rate-limited log of what the good-neighbor filter dropped: the first
 /// frame of each (direction, reason) at once, then a count every 30 s.
 #[derive(Default)]
 struct FilterLog {
@@ -295,20 +301,20 @@ fn run_radio(args: &Args, mut mac: Mac, nic: Box<dyn Nic>) -> Result<()> {
         Eth(Vec<u8>),
     }
 
-    let gain = if args.gain == "auto" {
+    let gain = if args.rx_gain == "auto" {
         RxGain::Auto
     } else {
-        RxGain::Manual(args.gain.parse().map_err(|_| anyhow::anyhow!("--gain must be 'auto' or dB"))?)
+        RxGain::Manual(args.rx_gain.parse().map_err(|_| anyhow::anyhow!("--rx-gain must be 'auto' or dB"))?)
     };
     let mut pluto = s2g_sdr_pluto::Pluto::open(&args.uri).map_err(|e| anyhow::anyhow!("pluto: {e}"))?;
     let scfg = StreamConfig {
-        center_freq_hz: args.freq,
+        center_freq_hz: args.freq_hz,
         sample_rate_hz: DEFAULT_DEVICE_RATE_HZ,
-        rf_bandwidth_hz: args.rf_bandwidth,
+        rf_bandwidth_hz: args.rf_bandwidth_hz,
     };
     let mut sdr_rx = pluto.open_rx(&scfg, gain).map_err(|e| anyhow::anyhow!("pluto rx: {e}"))?;
-    let mut sdr_tx = pluto.open_tx(&scfg, args.tx_gain).map_err(|e| anyhow::anyhow!("pluto tx: {e}"))?;
-    eprintln!("radio: {} @ {} Hz, {} S/s device rate", args.uri, args.freq, DEFAULT_DEVICE_RATE_HZ);
+    let mut sdr_tx = pluto.open_tx(&scfg, args.tx_gain_db).map_err(|e| anyhow::anyhow!("pluto tx: {e}"))?;
+    eprintln!("radio: {} @ {} Hz, {} S/s device rate", args.uri, args.freq_hz, DEFAULT_DEVICE_RATE_HZ);
     if let Some(xo) = args.xo_correction {
         pluto.set_xo_correction(xo).map_err(|e| anyhow::anyhow!("pluto xo_correction: {e}"))?;
     }
@@ -436,9 +442,13 @@ fn run_radio(args: &Args, mut mac: Mac, nic: Box<dyn Nic>) -> Result<()> {
                             let cfo = mac
                                 .rate_control()
                                 .peer_cfo_hz(&dest)
-                                .map(|c| format!(" | peer carrier offset {c:+.0} Hz ({:+.1} ppm)", c as f64 / args.freq * 1e6))
+                                .map(|c| format!(" | peer carrier offset {c:+.0} Hz ({:+.1} ppm)", c as f64 / args.freq_hz * 1e6))
                                 .unwrap_or_default();
-                            eprintln!("rate → {}: MCS {now_mcs}{cfo}", fmt_mac(&dest));
+                            let resp = mac
+                                .response_delay_us()
+                                .map(|(srtt, wait)| format!(" | responses take {} ms, waiting up to {} ms", srtt / 1000, wait / 1000))
+                                .unwrap_or_default();
+                            eprintln!("rate → {}: MCS {now_mcs}{cfo}{resp}", fmt_mac(&dest));
                         }
                     }
                 }
@@ -476,7 +486,7 @@ fn run_radio(args: &Args, mut mac: Mac, nic: Box<dyn Nic>) -> Result<()> {
         if let Some(wave) = wave {
             let mut up = Vec::with_capacity(wave.len() * 2 + 64);
             interp.process(&wave, &mut up);
-            interp.process(&vec![C32::new(0.0, 0.0); 32], &mut up);
+            interp.process(&[C32::new(0.0, 0.0); 32], &mut up);
             if let Err(e) = sdr_tx.send(&up) {
                 eprintln!("radio tx error: {e}");
             }
@@ -486,5 +496,5 @@ fn run_radio(args: &Args, mut mac: Mac, nic: Box<dyn Nic>) -> Result<()> {
 
 #[cfg(not(feature = "pluto"))]
 fn run_radio(_args: &Args, _mac: Mac, _nic: Box<dyn Nic>) -> Result<()> {
-    bail!("s2g-node requires the 'pluto' feature (default) — rebuild without --no-default-features")
+    bail!("s2g-node requires the 'pluto' feature (default); rebuild without --no-default-features")
 }

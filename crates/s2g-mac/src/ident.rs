@@ -11,9 +11,9 @@
 //! ```
 //!
 //! Plain 7-bit ASCII in a publicly documented frame is a "digital code"
-//! any monitor-mode capture decodes at a glance, which is the point. The
-//! frame goes out at MCS 0 so it is readable at the edge of range, and it
-//! is never acknowledged, aggregated or encrypted. Nothing else in this
+//! readable in any monitor-mode capture, by design. The frame goes out at
+//! MCS 0 so it is readable at the edge of range, and it is never
+//! acknowledged, aggregated or encrypted. Nothing else in this
 //! MAC obscures the meaning of a transmission either: s2g does not
 //! encrypt, and a station operating under Part 97 must not run an
 //! encrypting upper layer over it (97.113(a)(4)).
@@ -67,11 +67,6 @@ pub fn parse_body(body: &[u8]) -> Option<String> {
     text.starts_with("DE ").then_some(text)
 }
 
-/// Call sign announced in an identification text ("DE W1AW …" → "W1AW").
-pub fn callsign_of(text: &str) -> Option<&str> {
-    text.strip_prefix("DE ")?.split_whitespace().next()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -81,7 +76,6 @@ mod tests {
         let b = body("w1aw", "FN31 s2g node");
         let text = parse_body(&b).unwrap();
         assert_eq!(text, "DE W1AW FN31 s2g node");
-        assert_eq!(callsign_of(&text), Some("W1AW"));
         // Not an identification frame: ordinary IP payload.
         assert!(parse_body(&eth::to_body(0x0800, b"ip")).is_none());
         // Control characters and non-ASCII are dropped.

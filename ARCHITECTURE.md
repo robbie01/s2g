@@ -1,4 +1,4 @@
-# s2g — IEEE 802.11ah (S1G) PHY in Rust
+# s2g: IEEE 802.11ah (S1G) PHY in Rust
 
 A modular implementation of the IEEE 802.11-2024 Clause 23 S1G PHY, targeting the
 ADALM-Pluto SDR at a **nonstandard carrier of 1250 MHz**.
@@ -19,7 +19,7 @@ ADALM-Pluto SDR at a **nonstandard carrier of 1250 MHz**.
 | RX tracking | Pilot CPE loop, sampling-clock-drift tracking with FFT-window stepping, channel smoothing when the SIG recommends it | ±20 ppm per end (23.3.17.3) handled with margin |
 | TX conformance | `conformance` module: spectral flatness (Table 23-33), EVM vs Table 23-34, 2 MHz spectral mask (Fig 23-40), DC leakage | Measurements on baseband streams; the mask test runs on the 8 MS/s interpolated waveform |
 | Host attachment | TAP on Unix (tappers), tap-windows6 on Windows, Ethernet-over-UDP anywhere; virtual Pluto for hardware-free two-node runs | `s2g-tools/src/nic.rs`, `wintap.rs`, `bin/s2g-virtual-pluto.rs` |
-| MAC | OCB (no BSS); A-MPDU packing of QoS Data MPDUs with NDP BlockAck selective retransmission, NDP Ack / NDP CTS responses, RTS protection, RID, NAV, PHY-driven CCA, station identification frames (EtherType 0x88B5), stateless good-neighbour frame filter, per-peer rate control (`rate.rs`: EWMA success per MCS, one-step probing with back-off, retry step-down, SNR-bounded) | The only OCB liberty in the NDP path is the 9-bit partial AID derived from the MAC address; rate adaptation is implementation-defined in 802.11 |
+| MAC | OCB (no BSS); A-MPDU packing of QoS Data MPDUs with NDP BlockAck selective retransmission, NDP Ack / NDP CTS responses, RTS protection, RID, NAV, PHY-driven CCA, station identification frames (EtherType 0x88B5), stateless good-neighbor frame filter, per-peer rate control (`rate.rs`: EWMA success per MCS, one-step probing with back-off, retry step-down, SNR-bounded) | The only OCB liberty in the NDP path is the 9-bit partial AID derived from the MAC address; rate adaptation is implementation-defined in 802.11 |
 
 ## Crate layout
 
@@ -35,7 +35,7 @@ crates/
                  # arbitrary-ratio resampler (sampling-clock-offset simulation).
   s2g-sdr        # hardware abstraction: SdrTx / SdrRx / SdrDevice traits. No hardware deps.
   s2g-sdr-pluto  # PlutoSDR backend: pure-Rust iiod network-protocol client (TCP 30431,
-                 # docs/iiod-protocol.md) — no native libiio dependency. Optional feature of s2g-tools.
+                 # docs/iiod-protocol.md); no native libiio dependency. Optional feature of s2g-tools.
   s2g-tools      # binaries: s2g-tx, s2g-rx, s2g-sim (loopback with impairments incl. SFO/echo),
                  # s2g-node (NIC <-> MAC <-> PHY <-> Pluto), file I/O (.cf32),
                  # Nic trait: TAP via tappers (unix, feature "tap") or Ethernet-over-UDP.
@@ -47,7 +47,7 @@ Dependency direction (arrows = "depends on"):
 s2g-tools -> s2g-phy, s2g-mac, s2g-dsp, s2g-sdr, [s2g-sdr-pluto]
 s2g-mac -> s2g-phy
 s2g-sdr-pluto -> s2g-sdr
-s2g-phy -> (num-complex, rustfft only; s2g-dsp as a dev-dependency for tests)
+s2g-phy -> s2g-dsp (plus num-complex, rustfft)
 ```
 
 A future RX-only system on a different SDR = `s2g-phy` + `s2g-sdr` + a new backend crate.

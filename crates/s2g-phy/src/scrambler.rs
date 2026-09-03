@@ -4,11 +4,11 @@
 //! thereafter s[i] = s[i-4] ^ s[i-7]. Scrambling and descrambling are the
 //! same XOR. Because the S1G SERVICE field's first 7 bits are transmitted as
 //! zero [23.3.9.2], the first 7 *scrambled* bits on air are exactly the
-//! sequence bits — that is how a receiver recovers the seed.
+//! sequence bits; that is how a receiver recovers the seed.
 
 /// Generate `len` bits of the scrambling sequence for `seed` (1..=127; only
 /// the low 7 bits are used). A zero seed is forbidden on transmit
-/// [17.3.5.5], but some chips do send it; it simply yields the all-zero
+/// [17.3.5.5], but some chips send it; it yields the all-zero
 /// sequence (no scrambling), which is what a receiver must apply.
 pub fn sequence(seed: u8, len: usize) -> Vec<u8> {
     let mut s = Vec::with_capacity(len.max(7));

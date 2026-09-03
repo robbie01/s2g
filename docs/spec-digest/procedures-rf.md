@@ -112,7 +112,7 @@ States and transitions (SU, FORMAT=S1G, S1G_SHORT_PREAMBLE, NDP_INDICATION=0 pat
 - **Initialize / Set TX parameters** — on `PHY-TXSTART.request(TXVECTOR)`. Branch on
   FORMAT/PREAMBLE_TYPE/NDP_INDICATION (S1G_DUP_1M/2M branches "not explained"; S1G_LONG,
   S1G_1M, and NDP branches exist).
-- **TX PREAMBLE** — for our branch: TX STF → TX LTF1 → TX SIG (QBPSK) → TX Training Symbols
+- **TX PREAMBLE**, for the baseline branch: TX STF → TX LTF1 → TX SIG (QBPSK) → TX Training Symbols
   (none for SISO).
 - **TX DATA (setup)** — "Use MCS and number of space-time streams set by TXVECTOR. 8-bit SERVICE
   field prepended, padding and tail bits (BCC only) appended to PSDU."
@@ -486,7 +486,7 @@ otherwise). (Optional feature; low priority for SDR.)
 
 ## 5. S1G receiver specification [23.3.18, pp3831–3838]
 
-All of 23.3.18.1–23.3.18.3 apply exactly to our scope: **non-STBC, 8 µs GI, BCC, S1G PPDU**
+All of 23.3.18.1–23.3.18.3 apply to the baseline scope: **non-STBC, 8 µs GI, BCC, S1G PPDU**
 [pp3831–3832].
 
 ### 5.1 Minimum input sensitivity — 2 MHz PPDU [Table 23-35, p3831; verified against PDF]
@@ -520,7 +520,7 @@ progression of every other table (23-34, 23-36, MCS tables) the final row is the
 
 Method: desired signal at **sensitivity + 3 dB**; raise a conformant, unsynchronized S1G
 interferer (≥50% duty cycle) of the same width W until PER = 10% @ 256-octet PSDU. Adjacent:
-interferer center **W MHz** away (W = 2 for us). Nonadjacent: **≥ 2·W MHz** away. Rejection =
+interferer center **W MHz** away (W = 2 here). Nonadjacent: **≥ 2·W MHz** away. Rejection =
 interferer power − desired power. 2/4/8/16 MHz measurement required only where the regulatory
 domain permits that band plan [p3832].
 
@@ -569,7 +569,7 @@ energy detection windows), **aCCAMidTime = 212 µs** (mid-PPDU detection window)
 While these hold, do not issue BUSY for {primary2/secondary*} until the PPDU-indicated duration
 ends or the conditions clear.
 
-#### 5.4.2 BUSY(primary2) — 2 MHz operating width (our case) [23.3.18.5.3.1 + Tables 23-37/38, pp3834–3836]
+#### 5.4.2 BUSY(primary2) — 2 MHz operating width (the baseline) [23.3.18.5.3.1 + Tables 23-37/38, pp3834–3836]
 
 Issued when the primary1 conditions are absent and, in an otherwise idle operating channel:
 

@@ -1,5 +1,5 @@
-//! Minimal client for the iiod network protocol (legacy text mode).
-//! Verified against libiio `iiod-client.c` / `iiod/parser.y`; see
+//! Minimal client for the iiod network protocol (legacy text mode), as
+//! libiio's `iiod-client.c` / `iiod/parser.y` implement it; see
 //! docs/iiod-protocol.md at the workspace root.
 
 use s2g_sdr::SdrError;
@@ -102,17 +102,25 @@ impl Client {
             .map_err(|_| SdrError::Backend(format!("iiod {what}: unparseable retcode {line:?}")))
     }
 
-    fn read_exact_n(&mut self, n: usize) -> Result<Vec<u8>, SdrError> {
-        let mut out = Vec::with_capacity(n);
-        while out.len() < n {
+    /// Append the next `n` bytes of the stream to `out`.
+    fn read_into(&mut self, n: usize, out: &mut Vec<u8>) -> Result<(), SdrError> {
+        let mut left = n;
+        while left > 0 {
             if self.pos < self.rd.len() {
-                let take = (self.rd.len() - self.pos).min(n - out.len());
+                let take = (self.rd.len() - self.pos).min(left);
                 out.extend_from_slice(&self.rd[self.pos..self.pos + take]);
                 self.pos += take;
+                left -= take;
             } else {
                 self.fill()?;
             }
         }
+        Ok(())
+    }
+
+    fn read_exact_n(&mut self, n: usize) -> Result<Vec<u8>, SdrError> {
+        let mut out = Vec::with_capacity(n);
+        self.read_into(n, &mut out)?;
         Ok(out)
     }
 
@@ -220,7 +228,7 @@ impl Client {
                 let _mask = self.read_line()?;
                 self.mask_pending = false;
             }
-            out.extend(self.read_exact_n(n as usize)?);
+            self.read_into(n as usize, &mut out)?;
             if out.len() >= nbytes {
                 break;
             }
@@ -245,7 +253,7 @@ impl Client {
 }
 
 /// Map iio device names to ids from the context XML (e.g. "ad9361-phy" →
-/// "iio:device1"). Tiny string scan — the XML is machine-generated.
+/// "iio:device1"). A string scan suffices: the XML is machine-generated.
 pub fn device_id_by_name(xml: &str, name: &str) -> Option<String> {
     let needle = format!("name=\"{name}\"");
     for seg in xml.split("<device ") {

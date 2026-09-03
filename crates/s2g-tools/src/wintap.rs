@@ -1,8 +1,8 @@
 //! Windows L2 TAP backend for `s2g-node` on top of the OpenVPN
-//! **tap-windows6** driver (`tap0901`), the only widely deployed Ethernet
-//! TAP on Windows. Install it from the OpenVPN installer (select "TAP
-//! Virtual Ethernet Adapter") or the standalone tap-windows package; the
-//! adapter shows up as "TAP-Windows Adapter V9" in Network Connections.
+//! tap-windows6 driver (`tap0901`). Install it from the OpenVPN installer
+//! (select "TAP Virtual Ethernet Adapter") or the standalone tap-windows
+//! package; the adapter shows up as "TAP-Windows Adapter V9" in Network
+//! Connections.
 //!
 //! The driver is driven the way OpenVPN drives it: enumerate adapters in
 //! the network-class registry key by `ComponentId == tap0901`, open
@@ -10,11 +10,12 @@
 //! the cable is plugged in (`TAP_WIN_IOCTL_SET_MEDIA_STATUS`), then read and
 //! write raw Ethernet frames with `ReadFile` / `WriteFile`. Assign an
 //! address to the adapter with `netsh interface ip set address "TAP-Windows
-//! Adapter V9" static 10.44.0.1 255.255.255.0` (or DHCP masquerade is left
-//! off on purpose). Opening the device usually needs an elevated prompt.
+//! Adapter V9" static 10.44.0.1 255.255.255.0`; the driver's DHCP
+//! masquerade is left off. Opening the device usually needs an elevated
+//! prompt.
 //!
-//! Wintun (WireGuard's driver) is *not* usable here: it is a layer-3 TUN
-//! and this MAC carries Ethernet frames.
+//! Wintun (WireGuard's driver) is not usable here: it is a layer-3 TUN and
+//! this MAC carries Ethernet frames.
 
 use anyhow::{anyhow, bail, Context, Result};
 use std::ffi::c_void;
@@ -339,7 +340,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn enumeration_and_open_error_are_sane() {
+    fn enumeration_and_open_error() {
         // Registry enumeration must not panic, and opening a nonexistent
         // adapter must explain itself instead of crashing.
         let adapters = list_tap_adapters();

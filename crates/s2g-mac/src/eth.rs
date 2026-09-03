@@ -38,14 +38,12 @@ pub fn split_body(body: &[u8]) -> Option<(u16, &[u8])> {
 
 /// Rebuild an Ethernet frame from a received 802.11 Data body.
 pub fn body_to_ethernet(dest: MacAddr, src: MacAddr, body: &[u8]) -> Option<Vec<u8>> {
-    if body.len() < 8 || body[..6] != LLC_SNAP {
-        return None;
-    }
-    let mut f = Vec::with_capacity(ETH_HDR_LEN + body.len() - 8);
+    let (ethertype, payload) = split_body(body)?;
+    let mut f = Vec::with_capacity(ETH_HDR_LEN + payload.len());
     f.extend_from_slice(&dest);
     f.extend_from_slice(&src);
-    f.extend_from_slice(&body[6..8]); // EtherType, already big-endian
-    f.extend_from_slice(&body[8..]);
+    f.extend_from_slice(&ethertype.to_be_bytes());
+    f.extend_from_slice(payload);
     Some(f)
 }
 

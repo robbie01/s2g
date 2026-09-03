@@ -1,11 +1,12 @@
-//! Transmit S1G PPDUs — to a .cf32 file or a PlutoSDR at 1250 MHz.
+//! Transmit S1G PPDUs to a .cf32 file or a PlutoSDR at 1250 MHz.
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use s2g_phy::params::SAMPLE_RATE_HZ;
+use s2g_phy::sim::Rng;
 use s2g_phy::vector::{Coding, GuardInterval, PreambleType, TxVector};
 use s2g_phy::Transmitter;
-use s2g_tools::{parse_hex_psdu, write_cf32, Complex32, Rng, DEFAULT_CENTER_FREQ_HZ, DEFAULT_DEVICE_RATE_HZ};
+use s2g_tools::{parse_hex_psdu, write_cf32, Complex32, DEFAULT_CENTER_FREQ_HZ, DEFAULT_DEVICE_RATE_HZ};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -57,22 +58,22 @@ struct Args {
     /// Write the waveform to a .cf32 file instead of transmitting
     #[arg(long, conflicts_with = "uri")]
     out: Option<PathBuf>,
-    /// Sample rate of the output: 2e6 (native) or 4e6 (×2 interpolated)
+    /// Sample rate of the output, Hz: 2e6 (native) or 4e6 (×2 interpolated)
     #[arg(long, default_value_t = SAMPLE_RATE_HZ)]
-    out_rate: f64,
+    out_rate_hz: f64,
 
     /// Pluto iiod address, e.g. 192.168.2.1[:30431]
     #[arg(long)]
     uri: Option<String>,
     /// RF center frequency, Hz
     #[arg(long, default_value_t = DEFAULT_CENTER_FREQ_HZ)]
-    freq: f64,
+    freq_hz: f64,
     /// TX gain (attenuation), dB ≤ 0
     #[arg(long, default_value_t = -10.0)]
-    tx_gain: f64,
+    tx_gain_db: f64,
     /// Analog RF bandwidth hint, Hz
     #[arg(long, default_value_t = 2_200_000.0)]
-    rf_bandwidth: f64,
+    rf_bandwidth_hz: f64,
 }
 
 fn interpolate_2x(wave: &[Complex32]) -> Vec<Complex32> {
@@ -80,8 +81,7 @@ fn interpolate_2x(wave: &[Complex32]) -> Vec<Complex32> {
     let mut it = s2g_dsp::HalfbandInterp2::new();
     it.process(wave, &mut up);
     // Flush the filter tail.
-    let tail = vec![Complex32::new(0.0, 0.0); 32];
-    it.process(&tail, &mut up);
+    it.process(&[Complex32::new(0.0, 0.0); 32], &mut up);
     up
 }
 
@@ -137,33 +137,29 @@ fn main() -> Result<()> {
             stream.extend_from_slice(&wave);
             stream.extend_from_slice(&gap);
         }
-        let stream = if (args.out_rate - 4e6).abs() < 1.0 {
+        let stream = if (args.out_rate_hz - 4e6).abs() < 1.0 {
             interpolate_2x(&stream)
-        } else if (args.out_rate - SAMPLE_RATE_HZ).abs() < 1.0 {
+        } else if (args.out_rate_hz - SAMPLE_RATE_HZ).abs() < 1.0 {
             stream
         } else {
-            bail!("--out-rate must be 2e6 or 4e6");
+            bail!("--out-rate-hz must be 2e6 or 4e6");
         };
         write_cf32(out, &stream)?;
-        eprintln!("wrote {} samples @ {} S/s to {}", stream.len(), args.out_rate, out.display());
+        eprintln!("wrote {} samples @ {} S/s to {}", stream.len(), args.out_rate_hz, out.display());
         return Ok(());
     }
 
-    let uri = args.uri.as_deref().unwrap_or(s2g_tools_default_uri());
+    let uri = args.uri.as_deref().unwrap_or("192.168.2.1");
     transmit_pluto(&args, uri, &wave)
-}
-
-fn s2g_tools_default_uri() -> &'static str {
-    "192.168.2.1"
 }
 
 #[cfg(feature = "pluto")]
 fn transmit_pluto(args: &Args, uri: &str, wave: &[Complex32]) -> Result<()> {
     use s2g_sdr::{SdrDevice, SdrTx, StreamConfig};
     let mut pluto = s2g_sdr_pluto::Pluto::open(uri).map_err(|e| anyhow::anyhow!("pluto: {e}"))?;
-    let cfg = StreamConfig { center_freq_hz: args.freq, sample_rate_hz: DEFAULT_DEVICE_RATE_HZ, rf_bandwidth_hz: args.rf_bandwidth };
-    let mut tx = pluto.open_tx(&cfg, args.tx_gain).map_err(|e| anyhow::anyhow!("pluto tx: {e}"))?;
-    eprintln!("Pluto @ {} Hz, {} S/s, gain {} dB", args.freq, DEFAULT_DEVICE_RATE_HZ, args.tx_gain);
+    let cfg = StreamConfig { center_freq_hz: args.freq_hz, sample_rate_hz: DEFAULT_DEVICE_RATE_HZ, rf_bandwidth_hz: args.rf_bandwidth_hz };
+    let mut tx = pluto.open_tx(&cfg, args.tx_gain_db).map_err(|e| anyhow::anyhow!("pluto tx: {e}"))?;
+    eprintln!("Pluto @ {} Hz, {} S/s, gain {} dB", args.freq_hz, DEFAULT_DEVICE_RATE_HZ, args.tx_gain_db);
     let up = interpolate_2x(wave);
     for i in 0..args.count {
         tx.send(&up).map_err(|e| anyhow::anyhow!("send: {e}"))?;

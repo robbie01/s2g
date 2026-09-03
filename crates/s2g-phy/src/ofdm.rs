@@ -6,7 +6,7 @@
 //! per field: x[n] = scale · Σ_k X_k e^{j2πkn/64} with scale = 1/√N_Tone
 //! [Eq 23-4], giving unit average power when the occupied tones have unit
 //! magnitude. RX `fft_symbol` normalizes by 1/64 so it returns scale · X_k
-//! for a clean TX symbol — constant factors are absorbed by the channel
+//! for a clean TX symbol; constant factors are absorbed by the channel
 //! estimate (both LTF and Data use 1/√56; the SIG field's 1/√52 makes its
 //! equalized amplitude √(56/52) ≈ 1.04, harmless for BPSK decisions).
 //!
@@ -21,7 +21,7 @@ use std::sync::{Arc, OnceLock};
 /// The 52 Data-field subcarrier indices with fixed pilots, ascending
 /// (±1..±28 minus pilots at ±7, ±21). Ascending order matches M'_2(k)
 /// [Eq 23-30]: data symbol i goes on the i-th of these tones. With traveling
-/// pilots the set varies per symbol — see `pilots::data_subcarriers`.
+/// pilots the set varies per symbol; see `pilots::data_subcarriers`.
 pub const DATA_SUBCARRIER_INDICES: [i32; 52] = data_indices();
 
 const fn data_indices() -> [i32; 52] {
@@ -161,9 +161,9 @@ pub fn fft_symbol(time: &[Complex32]) -> FreqSymbol {
     let mut buf: [Complex32; 64] = core::array::from_fn(|i| time[i]);
     fft64().process(&mut buf);
     let mut out = [Complex32::new(0.0, 0.0); 64];
-    for a in 0..64usize {
+    for (a, o) in out.iter_mut().enumerate() {
         let k = a as i32 - 32;
-        out[a] = buf[((k + 64) % 64) as usize] / 64.0;
+        *o = buf[((k + 64) % 64) as usize] / 64.0;
     }
     out
 }

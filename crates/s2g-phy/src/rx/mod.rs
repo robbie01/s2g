@@ -1,5 +1,5 @@
-//! Streaming S1G receiver: push samples in, get events out — the PHY
-//! receive procedure of 23.3.20 (Figure 23-53) for a 2 MHz STA.
+//! Streaming S1G receiver: samples in, events out. The PHY receive
+//! procedure of 23.3.20 (Figure 23-53) for a 2 MHz STA.
 //!
 //! Pipeline: energy detect (CCA) → STF autocorrelation detect (coarse CFO)
 //! → LTF cross-correlation timing (fine CFO) → LTF channel estimate, RSSI,
@@ -9,17 +9,17 @@
 //! emits `RxEnd` with the spec status, holds CCA BUSY for the predicted PPDU
 //! duration when one is known, and re-arms the detector.
 //!
-//! All FFT windows back off [`BACKOFF`] samples into the preceding GI
-//! (ISI-safe; the common linear phase is absorbed by the channel estimate
-//! since every window uses the same offset — short-GI symbols back off
-//! less and the difference is compensated as a known timing offset), and
-//! the window position is advanced/retarded as pilot phase slopes reveal
-//! sampling-clock drift.
+//! All FFT windows back off [`BACKOFF`] samples into the preceding GI. The
+//! common linear phase is absorbed by the channel estimate because every
+//! window uses the same offset; short-GI symbols back off less, and the
+//! difference is compensated as a known timing offset. The window position
+//! is advanced or retarded as pilot phase slopes reveal sampling-clock
+//! drift.
 //!
 //! S1G_LONG SU PPDUs (1 STS) continue after SIG-A through the
 //! beam-changeable portion: the D-STF is skipped, D-LTF1 and SIG-B (a
 //! repeat of D-LTF1 for SU) re-estimate the channel, and the Data field is
-//! decoded exactly like an S1G_SHORT one [23.3.8.2.3.3; Eq 23-56].
+//! decoded like an S1G_SHORT one [23.3.8.2.3.3; Eq 23-56].
 
 pub mod chanest;
 pub mod decode;
@@ -44,8 +44,7 @@ pub struct RxConfig {
     /// CCA channel classification (type 2 = 3 dB higher thresholds).
     pub cca_type: rf::CcaType,
     /// Calibration: dBm = dBFS + `cal_offset_db`. With the default 0.0 the
-    /// dBm thresholds below act directly on dBFS values, which is the only
-    /// sane behaviour for an uncalibrated SDR front end.
+    /// dBm thresholds below act directly on dBFS values.
     pub cal_offset_db: f32,
     /// Derive the calibration offset from the measured noise floor instead
     /// of `cal_offset_db`: the quietest 20 ms block of the last second is
@@ -91,8 +90,8 @@ pub struct RxMetrics {
     pub cfo_hz: f32,
     pub evm_db: f32,
     pub rssi_dbfs: f32,
-    /// Sampling-clock drift accumulated over the PPDU, samples (positive =
-    /// the transmitter's clock is slower than ours).
+    /// Sampling-clock drift accumulated over the PPDU, samples (positive:
+    /// the transmitter's clock is slower than the receiver's).
     pub timing_drift_samples: f32,
     /// LDPC codewords that failed to converge (0 for BCC).
     pub ldpc_failures: usize,
@@ -140,8 +139,8 @@ pub enum RxEvent {
     RxStart { sample_index: u64, rxvector: RxVector },
     /// NDP CMAC PPDU received (37-bit body, LSB = B0) [23.3.11].
     NdpReceived { sample_index: u64, body: u64, metrics: RxMetrics },
-    /// Full PSDU decoded (bit errors possible — the MAC FCS is the final
-    /// arbiter). Followed by `RxEnd(NoError)`.
+    /// Full PSDU decoded (bit errors possible; the MAC FCS decides).
+    /// Followed by `RxEnd(NoError)`.
     PsduReceived { sample_index: u64, rxvector: RxVector, psdu: Vec<u8>, metrics: RxMetrics },
     /// PHY-RXEND.indication.
     RxEnd { sample_index: u64, status: RxEndStatus },
@@ -231,9 +230,9 @@ impl TimingTracker {
     /// symbol; the window shift for later symbols is in `shift`.
     ///
     /// Slow drift is low-pass filtered; a sudden discontinuity (a dropped
-    /// sample in an SDR stream, seen on RTL-SDR captures) is detected as a
-    /// measurement far from the filter and is applied immediately, and the
-    /// filter snaps once two consecutive measurements agree on it.
+    /// sample in an SDR stream) is detected as a measurement far from the
+    /// filter and is applied immediately, and the filter snaps once two
+    /// consecutive measurements agree on it.
     fn update(&mut self, offset: f32) -> f32 {
         const ALPHA: f32 = 1.0 / 12.0;
         const STEP_AT: f32 = 0.7;
@@ -455,18 +454,28 @@ impl Receiver {
     }
 
     fn fft_window_backoff(&self, payload_abs: u64, backoff: u64, cfo: f32, ref_abs: u64) -> Option<ofdm::FreqSymbol> {
-        let t = self.extract(payload_abs - backoff, 64, cfo, ref_abs)?;
+        let abs = payload_abs - backoff;
+        if abs < self.buf_abs || abs + 64 > self.end_abs() {
+            return None;
+        }
+        let start = self.rel(abs);
+        let w = -2.0 * std::f64::consts::PI * cfo as f64 / SAMPLE_RATE_HZ;
+        let mut t = [Complex32::new(0.0, 0.0); 64];
+        for (i, (o, &v)) in t.iter_mut().zip(&self.buf[start..start + 64]).enumerate() {
+            let dt = (abs + i as u64) as i64 - ref_abs as i64;
+            *o = v * Complex32::from_polar(1.0, (w * dt as f64) as f32);
+        }
         Some(ofdm::fft_symbol(&t))
     }
 
+    /// Mean power of the buffered samples [from_abs, from_abs + len), dBFS.
     fn power_dbfs(&self, from_abs: u64, len: usize) -> f32 {
-        match self.extract(from_abs, len, 0.0, from_abs) {
-            Some(s) => {
-                let p: f32 = s.iter().map(|v| v.norm_sqr()).sum::<f32>() / len as f32;
-                10.0 * p.max(1e-12).log10()
-            }
-            None => -100.0,
+        if from_abs < self.buf_abs || from_abs + len as u64 > self.end_abs() {
+            return -100.0;
         }
+        let start = self.rel(from_abs);
+        let p: f32 = self.buf[start..start + len].iter().map(|v| v.norm_sqr()).sum::<f32>() / len as f32;
+        10.0 * p.max(1e-12).log10()
     }
 
     fn dbm(&self, dbfs: f32) -> f32 {
@@ -666,7 +675,7 @@ impl Receiver {
                 true
             }
             None => {
-                // Remember how far we scanned (minus overlap), trim, stop.
+                // Record the scanned position (minus overlap), trim, stop.
                 // Keep an aCCAMidTime window of history for mid-packet CCA.
                 let scanned_to = self.end_abs().saturating_sub(SCAN_OVERLAP);
                 if scanned_to > self.scan_abs {
@@ -973,10 +982,8 @@ impl Receiver {
 }
 
 impl Receiver {
-    /// Predicted PPDU-end sample for a detected PPDU starting at LTS
-    /// `anchor` (exposed for tests).
-    #[doc(hidden)]
-    pub fn ppdu_end_sample(anchor: u64, rxv: &RxVector) -> u64 {
+    /// Predicted PPDU-end sample for a PPDU whose LTS starts at `anchor`.
+    fn ppdu_end_sample(anchor: u64, rxv: &RxVector) -> u64 {
         anchor - 192 + rxv.ppdu_duration_us() as u64 * SAMPLES_PER_US
     }
 }

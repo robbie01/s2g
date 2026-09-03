@@ -43,25 +43,25 @@ def fcs_ok(fr):
 
 
 truth = read_pcap(sys.argv[1] if len(sys.argv) > 1 else "802_11_ah.pcap")
-ours = read_pcap(sys.argv[2] if len(sys.argv) > 2 else "s2g.pcap")
+s2g_frames = read_pcap(sys.argv[2] if len(sys.argv) > 2 else "s2g.pcap")
 bad = [(t, p) for t, p, _ in truth if not fcs_ok(p)]
 valid = [(t, p) for t, p, _ in truth if fcs_ok(p)]
 print(f"ground truth: {len(truth)} frames ({len(valid)} FCS-valid, {len(bad)} flagged bad FCS, "
-      f"{sum(1 for _, _, fl in truth if fl is not None and fl & 0x80)} from short-GI PPDUs) | s2g: {len(ours)} frames")
+      f"{sum(1 for _, _, fl in truth if fl is not None and fl & 0x80)} from short-GI PPDUs) | s2g: {len(s2g_frames)} frames")
 tc = collections.Counter(kind(p) for _, p in valid)
-oc = collections.Counter(kind(p) for _, p, _ in ours)
+oc = collections.Counter(kind(p) for _, p, _ in s2g_frames)
 print(f"{'type':12s} {'valid':>6s} {'s2g':>6s} {'exact':>6s} {'missing':>8s} {'extra':>6s}")
 for k in sorted(set(tc) | set(oc)):
     tb = collections.Counter(p for _, p in valid if kind(p) == k)
-    ob = collections.Counter(p for _, p, _ in ours if kind(p) == k)
+    ob = collections.Counter(p for _, p, _ in s2g_frames if kind(p) == k)
     missing = sum((tb - ob).values())
     extra = sum((ob - tb).values())
     print(f"{k:12s} {tc.get(k, 0):6d} {oc.get(k, 0):6d} {tc.get(k, 0) - missing:6d} {missing:8d} {extra:6d}")
 
 truth_bytes = collections.Counter(p for _, p in valid)
-our_bytes = collections.Counter(p for _, p, _ in ours)
-missing = truth_bytes - our_bytes
-extra = our_bytes - truth_bytes
+s2g_bytes = collections.Counter(p for _, p, _ in s2g_frames)
+missing = truth_bytes - s2g_bytes
+extra = s2g_bytes - truth_bytes
 n_truth = sum(truth_bytes.values())
 print(f"\nFCS-valid frames in truth: {n_truth}; byte-exact matches: {n_truth - sum(missing.values())}; "
       f"missing: {sum(missing.values())}; extra (in s2g only): {sum(extra.values())}")

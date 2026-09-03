@@ -9,7 +9,4 @@ license.workspace = true
 num-complex.workspace = true
 rustfft.workspace = true
 thiserror.workspace = true
-
-[dev-dependencies]
-rand.workspace = true
 s2g-dsp.workspace = true

@@ -1,5 +1,5 @@
 //! ADALM-Pluto (AD9363) backend implementing the `s2g-sdr` traits via a
-//! pure-Rust client for the iiod network protocol (TCP port 30431) — the
+//! pure-Rust client for the iiod network protocol (TCP port 30431), the
 //! same path libiio's `ip:` backend uses. No native dependencies.
 //!
 //! Protocol and device/attribute reference: `docs/iiod-protocol.md`.
@@ -15,7 +15,6 @@ use std::time::Duration;
 pub type Complex32 = num_complex::Complex<f32>;
 
 pub const IIOD_PORT: u16 = 30431;
-pub const DEFAULT_HOST: &str = "192.168.2.1";
 
 const PHY: &str = "ad9361-phy";
 const RX_DEV: &str = "cf-ad9361-lpc";
@@ -51,7 +50,7 @@ impl Pluto {
         let mut ctl = Client::connect(&h, port, Duration::from_secs(5))?;
         let xml = ctl.ctx_xml()?;
         let phy_id = iiod::device_id_by_name(&xml, PHY)
-            .ok_or_else(|| SdrError::NotFound(format!("device '{PHY}' not in context — not a Pluto?")))?;
+            .ok_or_else(|| SdrError::NotFound(format!("device '{PHY}' not in context (not a Pluto?)")))?;
         let rx_id = iiod::device_id_by_name(&xml, RX_DEV)
             .ok_or_else(|| SdrError::NotFound(format!("device '{RX_DEV}' not in context")))?;
         let tx_id = iiod::device_id_by_name(&xml, TX_DEV)
@@ -68,6 +67,21 @@ impl Pluto {
         self.ctl.attr_write(&self.phy_id, Some((dir, "voltage0")), "sampling_frequency", &rate)?;
         self.ctl.attr_write(&self.phy_id, Some((dir, "voltage0")), "rf_bandwidth", &bw)?;
         Ok(())
+    }
+
+    /// Trim the AD936x reference oscillator: `xo_correction` is the crystal
+    /// frequency the firmware assumes, in Hz (nominally 40 000 000). A peer
+    /// seen at +f Hz carrier offset at center frequency F is pulled onto
+    /// frequency by scaling this value by (1 + f/F) on one side or the
+    /// other; the node reports every peer offset in ppm for that.
+    pub fn set_xo_correction(&mut self, xo_hz: u64) -> Result<(), SdrError> {
+        self.ctl.attr_write(&self.phy_id, None, "xo_correction", &xo_hz.to_string())
+    }
+
+    /// The oscillator trim currently in effect, Hz.
+    pub fn xo_correction(&mut self) -> Result<u64, SdrError> {
+        let v = self.ctl.attr_read(&self.phy_id, None, "xo_correction")?;
+        v.trim().parse().map_err(|_| SdrError::Backend(format!("xo_correction = {v:?}")))
     }
 }
 
@@ -256,11 +270,11 @@ mod tests {
                                 write!(w, "{}\n{}", XML.len(), XML).unwrap();
                             }
                             "TIMEOUT" | "CLOSE" | "SET" => {
-                                write!(w, "0\n").unwrap();
+                                writeln!(w, "0").unwrap();
                             }
                             "OPEN" => {
                                 new_client = true;
-                                write!(w, "0\n").unwrap();
+                                writeln!(w, "0").unwrap();
                             }
                             "READ" => {
                                 // READ dev [DIR chan] attr → value "42"
@@ -276,7 +290,7 @@ mod tests {
                                     tok[1..tok.len() - 1].join(" "),
                                     String::from_utf8_lossy(&payload)
                                 ));
-                                write!(w, "{len}\n").unwrap();
+                                writeln!(w, "{len}").unwrap();
                             }
                             "READBUF" => {
                                 let want: usize = tok[2].parse().unwrap();
@@ -293,25 +307,25 @@ mod tests {
                                 // first chunk after OPEN, no trailing 0 when all
                                 // requested bytes were delivered.
                                 let half = want / 2;
-                                write!(w, "{half}\n").unwrap();
+                                writeln!(w, "{half}").unwrap();
                                 if new_client {
-                                    write!(w, "00000003\n").unwrap();
+                                    writeln!(w, "00000003").unwrap();
                                     new_client = false;
                                 }
                                 w.write_all(&data[..half]).unwrap();
-                                write!(w, "{}\n", want - half).unwrap();
+                                writeln!(w, "{}", want - half).unwrap();
                                 w.write_all(&data[half..]).unwrap();
                             }
                             "WRITEBUF" => {
                                 let len: usize = tok[2].parse().unwrap();
-                                write!(w, "0\n").unwrap();
+                                writeln!(w, "0").unwrap();
                                 let mut payload = vec![0u8; len];
                                 r.read_exact(&mut payload).unwrap();
                                 written.lock().unwrap().extend_from_slice(&payload);
-                                write!(w, "{len}\n").unwrap();
+                                writeln!(w, "{len}").unwrap();
                             }
                             _ => {
-                                write!(w, "-22\n").unwrap();
+                                writeln!(w, "-22").unwrap();
                             }
                         }
                         w.flush().unwrap();
@@ -397,22 +411,5 @@ mod tests {
     fn host_port_split() {
         assert_eq!(split_host("192.168.2.1"), ("192.168.2.1".into(), IIOD_PORT));
         assert_eq!(split_host("pluto.local:1234"), ("pluto.local".into(), 1234));
-    }
-}
-
-impl Pluto {
-    /// Trim the AD936x reference oscillator: `xo_correction` is the crystal
-    /// frequency the firmware assumes, in Hz (nominally 40 000 000). A peer
-    /// seen at +f Hz carrier offset at centre frequency F is pulled onto
-    /// frequency by scaling this value by (1 + f/F) on one side or the
-    /// other; the node reports every peer offset in ppm for that.
-    pub fn set_xo_correction(&mut self, xo_hz: u64) -> Result<(), SdrError> {
-        self.ctl.attr_write(&self.phy_id, None, "xo_correction", &xo_hz.to_string())
-    }
-
-    /// The oscillator trim currently in effect, Hz.
-    pub fn xo_correction(&mut self) -> Result<u64, SdrError> {
-        let v = self.ctl.attr_read(&self.phy_id, None, "xo_correction")?;
-        v.trim().parse().map_err(|_| SdrError::Backend(format!("xo_correction = {v:?}")))
     }
 }

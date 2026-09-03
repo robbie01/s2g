@@ -20,7 +20,7 @@ pub fn bytes_to_bits(bytes: &[u8]) -> Vec<u8> {
 /// Pack bits (LSB-first per byte) back into bytes. `bits.len()` must be a
 /// multiple of 8.
 pub fn bits_to_bytes(bits: &[u8]) -> Vec<u8> {
-    debug_assert!(bits.len() % 8 == 0);
+    debug_assert!(bits.len().is_multiple_of(8));
     bits.chunks(8)
         .map(|c| c.iter().enumerate().fold(0u8, |acc, (i, &b)| acc | ((b & 1) << i)))
         .collect()

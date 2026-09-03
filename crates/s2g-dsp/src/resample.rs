@@ -77,7 +77,7 @@ pub fn resample_lowpass(sig: &[C32], step: f64, cutoff: f64, half_taps: usize) -
         let t = n as f64 * step;
         let i0 = t.floor() as i64;
         let frac = t - i0 as f64;
-        // Windowed sinc centred at `frac`, cutoff `cutoff` (Hann window).
+        // Windowed sinc centered at `frac`, cutoff `cutoff` (Hann window).
         let mut sum = 0.0f64;
         for (i, slot) in k.iter_mut().enumerate() {
             let tt = i as f64 - (half_taps as f64 - 1.0) - frac;
@@ -102,7 +102,7 @@ pub fn resample_lowpass(sig: &[C32], step: f64, cutoff: f64, half_taps: usize) -
 }
 
 /// Frequency-translate a signal by `shift_hz` at `sample_rate_hz`
-/// (multiplies by e^{−j2π·shift·t}, so a signal centred at +shift moves to
+/// (multiplies by e^{−j2π·shift·t}, so a signal centered at +shift moves to
 /// baseband).
 pub fn frequency_shift(sig: &[C32], shift_hz: f64, sample_rate_hz: f64) -> Vec<C32> {
     let w = -2.0 * std::f64::consts::PI * shift_hz / sample_rate_hz;

@@ -63,16 +63,16 @@ fn axis_llrs(y: f32, m_axis: usize, k_mod: f32, out: &mut [f32]) {
         let level = (2 * n as i32 - (levels as i32 - 1)) as f32 * k_mod;
         let d2 = (y - level) * (y - level);
         let pat = gray(n);
-        for bit in 0..m_axis {
+        for (bit, b) in best.iter_mut().enumerate().take(m_axis) {
             // bit 0 = earliest = MSB of the pattern
             let v = ((pat >> (m_axis - 1 - bit)) & 1) as usize;
-            if d2 < best[bit][v] {
-                best[bit][v] = d2;
+            if d2 < b[v] {
+                b[v] = d2;
             }
         }
     }
-    for bit in 0..m_axis {
-        out[bit] = best[bit][1] - best[bit][0]; // >0 ⇒ bit 0 closer
+    for (o, b) in out.iter_mut().zip(&best).take(m_axis) {
+        *o = b[1] - b[0]; // >0 ⇒ bit 0 closer
     }
 }
 

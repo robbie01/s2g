@@ -209,15 +209,6 @@ impl Default for RxVector {
 }
 
 impl RxVector {
-    /// Number of spatial streams (N_STS halved under STBC).
-    pub fn num_ss(&self) -> u8 {
-        if self.stbc {
-            (self.num_sts / 2).max(1)
-        } else {
-            self.num_sts.max(1)
-        }
-    }
-
     /// Duration of everything before the Data field, µs: STF + LTF1 + SIG
     /// (+ LTF2..N for S1G_SHORT; + D-STF + D-LTFs + SIG-B for S1G_LONG)
     /// [Figure 23-5; Table 23-5].
@@ -248,12 +239,6 @@ impl RxVector {
     /// Total PPDU duration (TXTIME of the received PPDU), µs.
     pub fn ppdu_duration_us(&self) -> u32 {
         self.preamble_duration_us() + self.data_duration_us()
-    }
-
-    /// RXTIME as literally defined by Eq 23-69 (S1G_SHORT) / Eq 23-70
-    /// (S1G_LONG): the duration after SIG/SIG-A plus one 40 µs margin.
-    pub fn rxtime_us(&self) -> u32 {
-        self.ppdu_duration_us() - T_PREAMBLE_US + T_DSTF_US - if self.preamble_type == PreambleType::S1gLong { T_DSTF_US } else { 0 }
     }
 }
 
@@ -317,8 +302,7 @@ mod tests {
     fn short_preamble_durations() {
         let r = RxVector { n_sym: 32, ..Default::default() };
         assert_eq!(r.preamble_duration_us(), 240);
-        assert_eq!(r.ppdu_duration_us(), 240 + 32 * 40); // 1520 [digest sanity]
-        assert_eq!(r.rxtime_us(), 40 + 32 * 40);
+        assert_eq!(r.ppdu_duration_us(), 240 + 32 * 40);
         let sgi = RxVector { n_sym: 32, gi: GuardInterval::Short, ..Default::default() };
         assert_eq!(sgi.data_duration_us(), 40 + 31 * 36);
         let two_sts = RxVector { n_sym: 10, num_sts: 2, ..Default::default() };
@@ -331,8 +315,6 @@ mod tests {
         // STF 80 + LTF1 80 + SIG-A 80 + D-STF 40 + D-LTF 40 + SIG-B 40 = 360.
         assert_eq!(r.preamble_duration_us(), 360);
         assert_eq!(r.ppdu_duration_us(), 360 + 200);
-        // Eq 23-70: T_DSTF + N_LTF·T_DLTF + T_SIG-B + N_SYM·T_SYML.
-        assert_eq!(r.rxtime_us(), 40 + 40 + 40 + 200);
         let r3 = RxVector { preamble_type: PreambleType::S1gLong, n_sym: 5, num_sts: 3, ..Default::default() };
         assert_eq!(r3.preamble_duration_us(), 240 + 40 + 4 * 40 + 40);
     }

@@ -16,10 +16,9 @@ fn data_perm(n_bpscs: usize) -> Vec<usize> {
     let n_cbps = n_col * n_row;
     let s = 1.max(n_bpscs / 2);
     let mut perm = vec![0usize; n_cbps];
-    for k in 0..n_cbps {
+    for (k, p) in perm.iter_mut().enumerate() {
         let i = n_row * (k % n_col) + k / n_col; // Eq 21-76
-        let j = s * (i / s) + (i + n_cbps - (n_col * i) / n_cbps) % s; // Eq 21-77
-        perm[k] = j;
+        *p = s * (i / s) + (i + n_cbps - (n_col * i) / n_cbps) % s; // Eq 21-77
     }
     perm
 }
@@ -129,7 +128,7 @@ mod tests {
     #[test]
     fn adjacent_coded_bits_spread_in_frequency() {
         // First permutation guarantees adjacent input bits land ~N_ROW apart
-        // (different columns) — spot-check for QPSK.
+        // (different columns); spot-check for QPSK.
         let perm = data_perm(2);
         // Consecutive k map to output positions differing by N_ROW = 8 until wrap.
         assert_eq!(perm[1] as i64 - perm[0] as i64, 8);
