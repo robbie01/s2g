@@ -534,21 +534,15 @@ impl Mac {
             RxEvent::RxEnd { .. } => {}
             RxEvent::PsduReceived { rxvector, psdu, metrics, .. } => {
                 self.rx_cfo_hz = metrics.cfo_hz;
-                let (mpdus, s_mpdu): (Vec<&[u8]>, bool) = if rxvector.aggregation {
-                    let with_eof = ampdu::deaggregate_with_eof(psdu);
-                    let s = with_eof.len() == 1 && with_eof[0].1;
-                    (with_eof.into_iter().map(|(m, _)| m).collect(), s)
-                } else {
-                    // Some chips pad the PSDU after the FCS.
-                    (vec![frame::locate_mpdu(psdu).unwrap_or(psdu)], false)
-                };
+                let mpdus = ampdu::split_psdu(psdu, rxvector.aggregation);
+                let s_mpdu = rxvector.aggregation && mpdus.len() == 1 && mpdus[0].1;
                 // An S-MPDU follows non-aggregated rules [10.12.8]: it is
                 // acknowledged with an (NDP) Ack, not a BlockAck. A genuine
                 // A-MPDU gets one NDP BlockAck covering every MPDU received.
                 let block_ack = rxvector.aggregation && !s_mpdu;
                 let mut ba_src = None;
                 let mut ba_seqs = Vec::new();
-                for mpdu in mpdus {
+                for (mpdu, _) in mpdus {
                     if let Some((src, seq)) = self.on_mpdu(mpdu, rxvector, block_ack, now_us, out) {
                         ba_src = Some(src);
                         ba_seqs.push(seq);

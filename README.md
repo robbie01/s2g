@@ -58,7 +58,8 @@ the Pluto at its usual USB-network address `192.168.2.1`.
 ## Validation on real captures
 
 `s2g-rx` replays SigMF / ci16 / cf32 recordings at any sample rate (`--rate-hz`, `--shift-hz`),
-parses the MAC frames (`--mac`) and writes them to a PCAP (`--pcap`). Run against
+parses the MAC frames (`--mac`) and writes them to a radiotap PCAP (`--pcap`; bad FCS
+flagged). Run against
 [Daniel Estévez's 35 s baby-monitor capture](https://destevez.net/2025/01/decoding-ieee-802-11ah/)
 (a commercial HaLow chip at 866 MHz, 2 MHz channel, Pluto at 3.84 MS/s):
 
@@ -357,6 +358,35 @@ target\release\s2g-node.exe --udp 127.0.0.1:5001 --uri 192.168.2.1
 The `Nic` trait in `s2g-tools` keeps the attachment point pluggable; TAP is via the
 cross-platform `tappers` crate (Linux/macOS/FreeBSD/OpenBSD/NetBSD). Two nodes need distinct `--mac` addresses (default is randomized).
 
+### Frames in Wireshark
+
+`--pcap PATH` records every MPDU the PHY decodes (bad FCS flagged) and every MPDU the
+node transmits behind a radiotap header: the S1G field (PPDU format, guard interval, MCS,
+response indication, RSSI), the TX flags field on transmitted frames, one reference
+number shared by the subframes of an A-MPDU. PATH is a file, `-` (standard output; node
+messages go to stderr), a Windows named pipe `\\.\pipe\NAME` or an existing FIFO.
+Wireshark reads a pipe live and can detach and attach again at any time; start the node
+first.
+
+```sh
+# Windows
+target\release\s2g-node.exe --udp 127.0.0.1:5001 --uri 192.168.2.1 --pcap \\.\pipe\s2g
+"C:\Program Files\Wireshark\Wireshark.exe" -k -i \\.\pipe\s2g
+# Unix
+mkfifo /tmp/s2g.pcap
+sudo target/release/s2g-node --tap s2g0 --uri 192.168.2.1 --pcap /tmp/s2g.pcap &
+wireshark -k -i /tmp/s2g.pcap
+# any platform, through standard output
+target/release/s2g-node --udp 127.0.0.1:5001 --uri 192.168.2.1 --pcap - | wireshark -k -i -
+```
+
+NDP CMAC PPDUs (NDP Ack, NDP BlockAck, NDP CTS) carry no MPDU and do not appear;
+`--verbose` prints them. Display filters: `radiotap.txflags` for transmitted frames,
+`radiotap.flags.badfcs == 1` for failed FCS (Wireshark's own FCS column stays
+"unverified" unless its 802.11 preference "Validate the FCS checksum" is on). `s2g-rx
+--pcap` writes the same format, so a recording or a receive-only Pluto shows in Wireshark
+the same way.
+
 ## Status / roadmap
 
 - [x] TX chain: preamble (STF/LTF1), SIG (CRC-4, QBPSK), scrambler, BCC + puncturing,
@@ -386,3 +416,7 @@ cross-platform `tappers` crate (Linux/macOS/FreeBSD/OpenBSD/NetBSD). Two nodes n
       STA; validated on the baby-monitor capture); also available on TX via `TxVector`
 - [ ] Other NDP CMAC types (PS-Poll, Paging, Probe Request), 1/4/8/16 MHz, multi-stream/STBC:
       all optional (or 1 MHz: skipped by choice); module boundaries chosen so they slot in
+
+## License
+
+AGPL-3.0-or-later (see `LICENSE`). Copyright (C) 2026 Robert B. Langer.

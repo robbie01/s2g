@@ -1,10 +1,10 @@
-"""Compare the frames s2g-rx decoded (s2g.pcap, link type 105) with Daniel
-Estévez's ground truth (802_11_ah.pcap, radiotap), per frame type and
-byte-exact (FCS included in both).
+"""Compare the frames s2g-rx decoded (s2g.pcap) with Daniel Estévez's ground
+truth (802_11_ah.pcap), both radiotap, per frame type and byte-exact (FCS
+included in both).
 
-The reference PCAP also contains frames whose FCS failed (radiotap Flags
-bit 0x40); s2g only emits FCS-valid MPDUs, so those are reported separately
-and excluded from the match statistics. Flags bit 0x80 marks short-GI PPDUs."""
+Both files contain frames whose FCS failed (radiotap Flags bit 0x40); those
+are reported separately and excluded from the match statistics. Flags bit
+0x80 marks short-GI PPDUs."""
 import collections
 import struct
 import sys
@@ -43,11 +43,13 @@ def fcs_ok(fr):
 
 
 truth = read_pcap(sys.argv[1] if len(sys.argv) > 1 else "802_11_ah.pcap")
-s2g_frames = read_pcap(sys.argv[2] if len(sys.argv) > 2 else "s2g.pcap")
+s2g_all = read_pcap(sys.argv[2] if len(sys.argv) > 2 else "s2g.pcap")
+s2g_frames = [f for f in s2g_all if fcs_ok(f[1])]
 bad = [(t, p) for t, p, _ in truth if not fcs_ok(p)]
 valid = [(t, p) for t, p, _ in truth if fcs_ok(p)]
 print(f"ground truth: {len(truth)} frames ({len(valid)} FCS-valid, {len(bad)} flagged bad FCS, "
-      f"{sum(1 for _, _, fl in truth if fl is not None and fl & 0x80)} from short-GI PPDUs) | s2g: {len(s2g_frames)} frames")
+      f"{sum(1 for _, _, fl in truth if fl is not None and fl & 0x80)} from short-GI PPDUs) | "
+      f"s2g: {len(s2g_frames)} FCS-valid frames of {len(s2g_all)}")
 tc = collections.Counter(kind(p) for _, p in valid)
 oc = collections.Counter(kind(p) for _, p, _ in s2g_frames)
 print(f"{'type':12s} {'valid':>6s} {'s2g':>6s} {'exact':>6s} {'missing':>8s} {'extra':>6s}")

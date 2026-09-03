@@ -10,7 +10,9 @@ use clap::Parser;
 use s2g_mac::{FilterConfig, IdentConfig, Mac, MacAction, MacConfig, MacError, MacEvent, RateConfig};
 use s2g_phy::vector::Coding;
 use s2g_tools::nic::Nic;
+use s2g_tools::pcap::{unix_time_us, PcapWriter, Radiotap};
 use s2g_tools::DEFAULT_CENTER_FREQ_HZ;
+use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
 #[command(name = "s2g-node", about = "S1G OCB network node (NIC ↔ MAC ↔ PHY ↔ Pluto)")]
@@ -140,6 +142,11 @@ struct Args {
     /// Verbose per-frame logging
     #[arg(long)]
     verbose: bool,
+    /// Every MPDU received (bad FCS flagged) and transmitted, behind a radiotap
+    /// header, to a PCAP file, - (standard output), a Windows named pipe
+    /// \\.\pipe\NAME or an existing FIFO; Wireshark reads a pipe live
+    #[arg(long)]
+    pcap: Option<PathBuf>,
 }
 
 fn parse_mac(s: &str) -> Result<[u8; 6]> {
@@ -396,6 +403,7 @@ fn run_radio(args: &Args, mut mac: Mac, nic: Box<dyn Nic>) -> Result<()> {
 
     // Main loop: MAC engine + transmit path.
     let phy_tx = Transmitter::new();
+    let mut pcap = args.pcap.as_deref().map(PcapWriter::open).transpose()?;
     let t0 = Instant::now();
     let mut interp = s2g_dsp::HalfbandInterp2::new();
     let mut mac_events: Vec<MacEvent> = Vec::new();
@@ -416,6 +424,11 @@ fn run_radio(args: &Args, mut mac: Mac, nic: Box<dyn Nic>) -> Result<()> {
                             eprintln!("rx: S1G_LONG PPDU ({} µs)", rxvector.ppdu_duration_us())
                         }
                         _ => {}
+                    }
+                }
+                if let (Some(p), RxEvent::PsduReceived { rxvector, psdu, .. }) = (pcap.as_mut(), &ev) {
+                    if let Err(e) = p.write_psdu(unix_time_us(), Radiotap::rx(rxvector, Some(args.freq_hz)), rxvector.aggregation, psdu) {
+                        eprintln!("pcap: {e}");
                     }
                 }
                 mac.on_phy_event(&ev, now_us, &mut mac_events);
@@ -467,13 +480,20 @@ fn run_radio(args: &Args, mut mac: Mac, nic: Box<dyn Nic>) -> Result<()> {
         }
         let now_us = t0.elapsed().as_micros() as u64;
         let wave = match mac.poll(now_us, &mut mac_events) {
-            Some(MacAction::Transmit { txv, psdu }) => match phy_tx.generate(&txv, &psdu) {
-                Ok(w) => Some(w),
-                Err(e) => {
-                    eprintln!("phy tx error: {e}");
-                    None
+            Some(MacAction::Transmit { txv, psdu }) => {
+                if let Some(p) = pcap.as_mut() {
+                    if let Err(e) = p.write_psdu(unix_time_us(), Radiotap::tx(&txv, Some(args.freq_hz)), txv.aggregation, &psdu) {
+                        eprintln!("pcap: {e}");
+                    }
                 }
-            },
+                match phy_tx.generate(&txv, &psdu) {
+                    Ok(w) => Some(w),
+                    Err(e) => {
+                        eprintln!("phy tx error: {e}");
+                        None
+                    }
+                }
+            }
             Some(MacAction::TransmitNdp { body }) => match phy_tx.generate_ndp(body) {
                 Ok(w) => Some(w),
                 Err(e) => {

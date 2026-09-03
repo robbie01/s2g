@@ -38,7 +38,8 @@ crates/
                  # docs/iiod-protocol.md); no native libiio dependency. Optional feature of s2g-tools.
   s2g-tools      # binaries: s2g-tx, s2g-rx, s2g-sim (loopback with impairments incl. SFO/echo),
                  # s2g-node (NIC <-> MAC <-> PHY <-> Pluto), file I/O (.cf32),
-                 # Nic trait: TAP via tappers (unix, feature "tap") or Ethernet-over-UDP.
+                 # Nic trait: TAP via tappers (unix, feature "tap") or Ethernet-over-UDP,
+                 # pcap.rs: radiotap PCAP to a file, stdout or a pipe Wireshark reads live.
 ```
 
 Dependency direction (arrows = "depends on"):

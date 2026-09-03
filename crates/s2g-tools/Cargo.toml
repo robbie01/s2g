@@ -18,13 +18,14 @@ clap.workspace = true
 workspace = true
 optional = true
 
-# TAP devices via tappers (Linux, macOS, *BSD).
+# TAP devices via tappers (Linux, macOS, *BSD); libc polls the FIFO in src/pcap.rs.
 [target.'cfg(unix)'.dependencies]
 tappers = { version = "0.4", optional = true }
+libc = "0.2"
 
-# Windows L2 TAP via the OpenVPN tap-windows6 driver (src/wintap.rs).
+# Windows L2 TAP via the OpenVPN tap-windows6 driver (src/wintap.rs); named pipes in src/pcap.rs.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Threading", "Win32_System_Registry"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Pipes", "Win32_System_Threading", "Win32_System_Registry"] }
 
 [features]
 default = ["pluto"]

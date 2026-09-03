@@ -7,7 +7,8 @@ use clap::Parser;
 use s2g_mac::frame::ParsedFrame;
 use s2g_phy::rx::{Receiver, RxConfig, RxEndStatus, RxEvent};
 use s2g_phy::vector::PreambleType;
-use s2g_tools::{read_recording, to_native_rate, Complex32, PcapWriter, DEFAULT_CENTER_FREQ_HZ, DEFAULT_DEVICE_RATE_HZ};
+use s2g_tools::pcap::{unix_time_us, PcapWriter, Radiotap};
+use s2g_tools::{read_recording, to_native_rate, Complex32, DEFAULT_CENTER_FREQ_HZ, DEFAULT_DEVICE_RATE_HZ};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -34,7 +35,8 @@ struct Args {
     /// Parse MAC frames (A-MPDU deaggregation, FCS, frame type / addresses)
     #[arg(long)]
     mac: bool,
-    /// Write FCS-valid MAC frames to a PCAP (link type 802.11)
+    /// Every MPDU (bad FCS flagged) behind a radiotap header, to a PCAP file,
+    /// a Windows named pipe \\.\pipe\NAME or an existing FIFO (Wireshark reads pipes live)
     #[arg(long)]
     pcap: Option<PathBuf>,
 
@@ -94,6 +96,10 @@ struct Printer {
     psdus: usize,
     stats: Stats,
     pcap: Option<PcapWriter>,
+    /// PCAP time of sample 0.
+    start_us: u64,
+    /// Channel center for the PCAP, when known.
+    freq_hz: Option<f64>,
 }
 
 fn frame_type_name(fc0: u8) -> String {
@@ -216,24 +222,21 @@ impl Printer {
                     metrics.ldpc_failures
                 );
                 if self.mac || self.pcap.is_some() {
-                    let mpdus: Vec<&[u8]> = if rxvector.aggregation {
-                        s2g_mac::ampdu::deaggregate(psdu)
-                    } else {
-                        let located = s2g_mac::frame::locate_mpdu(psdu);
-                        if located.is_some_and(|m| m.len() < psdu.len()) {
-                            self.stats.padded += 1;
+                    let mpdus = s2g_mac::ampdu::split_psdu(psdu, rxvector.aggregation);
+                    if !rxvector.aggregation && mpdus[0].0.len() < psdu.len() {
+                        self.stats.padded += 1;
+                    }
+                    if let Some(p) = self.pcap.as_mut() {
+                        if let Err(e) = p.write_psdu(self.start_us + sample_index / 2, Radiotap::rx(rxvector, self.freq_hz), rxvector.aggregation, psdu) {
+                            eprintln!("pcap: {e}");
                         }
-                        vec![located.unwrap_or(psdu)]
-                    };
-                    for &m in &mpdus {
+                    }
+                    for (m, _) in mpdus {
                         self.stats.mpdus += 1;
                         let ok = s2g_mac::fcs::check_and_strip(m).is_some();
                         if ok {
                             self.stats.fcs_ok += 1;
                             *self.stats.frame_types.entry(frame_type_name(m[0])).or_default() += 1;
-                            if let Some(p) = self.pcap.as_mut() {
-                                let _ = p.write(sample_index / 2, m);
-                            }
                         }
                         if self.mac {
                             let desc = match s2g_mac::frame::parse(m) {
@@ -311,10 +314,11 @@ fn main() -> Result<()> {
         ..Default::default()
     });
     let pcap = match &args.pcap {
-        Some(p) => Some(PcapWriter::create(p)?),
+        Some(p) if p.as_os_str() == "-" => bail!("PSDU lines go to standard output; write the PCAP to a file or a pipe"),
+        Some(p) => Some(PcapWriter::open(p)?),
         None => None,
     };
-    let mut printer = Printer { quiet: args.quiet, mac: args.mac, psdus: 0, stats: Stats::default(), pcap };
+    let mut printer = Printer { quiet: args.quiet, mac: args.mac, psdus: 0, stats: Stats::default(), pcap, start_us: unix_time_us(), freq_hz: None };
     let mut events: Vec<RxEvent> = Vec::new();
 
     if let Some(path) = &args.r#in {
@@ -335,6 +339,7 @@ fn main() -> Result<()> {
         if rate < 1.9e6 {
             bail!("input rate {rate} S/s is below the 2 MHz channel bandwidth");
         }
+        printer.freq_hz = rec.center_freq_hz.map(|f| f + args.shift_hz);
         let native = to_native_rate(&rec.samples, rate, args.shift_hz);
         eprintln!("{} samples @ 2 MS/s ({:.1} s)", native.len(), native.len() as f64 / 2e6);
         for chunk in native.chunks(65536) {
@@ -357,6 +362,7 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    printer.freq_hz = Some(args.freq_hz);
     receive_pluto(&args, &mut rx, &mut printer)
 }
 

@@ -1,8 +1,10 @@
 //! Shared helpers for the CLI tools: .cf32 / SigMF / ci16 file I/O (GNU
 //! Radio compatible: interleaved little-endian I,Q), rate conversion of
-//! recordings to the PHY's 2 MS/s, a PCAP writer and hex PSDU parsing.
+//! recordings to the PHY's 2 MS/s and hex PSDU parsing; `pcap` writes
+//! radiotap PCAPs.
 
 pub mod nic;
+pub mod pcap;
 #[cfg(windows)]
 pub mod wintap;
 
@@ -278,39 +280,6 @@ pub fn to_native_rate(samples: &[Complex32], in_rate: f64, shift_hz: f64) -> Vec
     let cutoff = (0.95e6 / in_rate).min(0.5 / step * 0.98);
     let half_taps = ((48.0 * step / 1.92).ceil() as usize).clamp(48, 512);
     s2g_dsp::resample_lowpass(src, step, cutoff, half_taps)
-}
-
-/// Minimal PCAP writer for 802.11 frames (link type 105, no radiotap).
-pub struct PcapWriter {
-    f: std::fs::File,
-}
-
-impl PcapWriter {
-    pub fn create(path: &Path) -> Result<Self> {
-        let mut f = std::fs::File::create(path).with_context(|| format!("create {}", path.display()))?;
-        let mut hdr = Vec::with_capacity(24);
-        hdr.extend_from_slice(&0xa1b2c3d4u32.to_le_bytes());
-        hdr.extend_from_slice(&2u16.to_le_bytes());
-        hdr.extend_from_slice(&4u16.to_le_bytes());
-        hdr.extend_from_slice(&0i32.to_le_bytes());
-        hdr.extend_from_slice(&0u32.to_le_bytes());
-        hdr.extend_from_slice(&65535u32.to_le_bytes());
-        hdr.extend_from_slice(&105u32.to_le_bytes()); // LINKTYPE_IEEE802_11
-        f.write_all(&hdr)?;
-        Ok(Self { f })
-    }
-
-    /// Write one frame (with FCS) at time `t_us` since the epoch.
-    pub fn write(&mut self, t_us: u64, frame: &[u8]) -> Result<()> {
-        let mut rec = Vec::with_capacity(16 + frame.len());
-        rec.extend_from_slice(&((t_us / 1_000_000) as u32).to_le_bytes());
-        rec.extend_from_slice(&((t_us % 1_000_000) as u32).to_le_bytes());
-        rec.extend_from_slice(&(frame.len() as u32).to_le_bytes());
-        rec.extend_from_slice(&(frame.len() as u32).to_le_bytes());
-        rec.extend_from_slice(frame);
-        self.f.write_all(&rec)?;
-        Ok(())
-    }
 }
 
 pub fn parse_hex_psdu(hex: &str) -> Result<Vec<u8>> {

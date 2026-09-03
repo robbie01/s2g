@@ -147,6 +147,17 @@ pub fn deaggregate(psdu: &[u8]) -> Vec<&[u8]> {
     deaggregate_with_eof(psdu).into_iter().map(|(m, _)| m).collect()
 }
 
+/// MPDUs of a received PSDU with the EOF flag of each delimiter. A
+/// non-aggregated PSDU holds one MPDU (EOF false), without the padding
+/// some chips add after its FCS.
+pub fn split_psdu(psdu: &[u8], aggregation: bool) -> Vec<(&[u8], bool)> {
+    if aggregation {
+        deaggregate_with_eof(psdu)
+    } else {
+        vec![(crate::frame::locate_mpdu(psdu).unwrap_or(psdu), false)]
+    }
+}
+
 /// True when the PSDU is an S-MPDU: exactly one MPDU, with EOF set.
 pub fn is_s_mpdu(psdu: &[u8]) -> bool {
     let m = deaggregate_with_eof(psdu);
