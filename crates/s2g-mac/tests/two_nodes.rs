@@ -5,10 +5,10 @@
 
 use num_complex::Complex;
 use s2g_mac::ndp::NdpFrame;
-use s2g_mac::{Mac, MacAction, MacConfig, MacEvent, RateConfig};
+use s2g_mac::{Adapt, Mac, MacAction, MacConfig, MacEvent, RateConfig};
 use s2g_phy::rx::{Receiver, RxConfig, RxEvent};
 use s2g_phy::sim::{apply_cfo, awgn, Rng};
-use s2g_phy::vector::Coding;
+use s2g_phy::vector::{Coding, GuardInterval};
 use s2g_phy::Transmitter;
 
 type C32 = Complex<f32>;
@@ -241,7 +241,8 @@ fn lost_ndp_ack_retried_and_deduplicated() {
 fn rate_control_climbs_on_a_clean_link_and_settles_on_a_noisy_one() {
     for (snr, lo, hi) in [(30.0f32, 6u8, 8u8), (11.0, 0, 3)] {
         let mut cfg_a = Node::config(A, 0, true);
-        cfg_a.rate = RateConfig { enabled: true, ..Default::default() };
+        // MCS only: the settling points are the BCC table's.
+        cfg_a.rate = RateConfig { enabled: true, gi: Adapt::Fixed(GuardInterval::Long), fec_coding: Adapt::Fixed(Coding::Bcc), ..Default::default() };
         let mut a = Node::new(cfg_a);
         let mut b = Node::new(Node::config(B, 0, true));
         let frames: Vec<Vec<u8>> = (0..40).map(|i| eth(B, A, 120 + i)).collect();
@@ -254,7 +255,7 @@ fn rate_control_climbs_on_a_clean_link_and_settles_on_a_noisy_one() {
         for (g, f) in got.iter().zip(&frames) {
             assert_eq!(*g, f);
         }
-        let mcs = a.mac.peer_mcs(&B).expect("peer known");
+        let mcs = a.mac.peer_rate(&B).expect("peer known").mcs;
         assert!((lo..=hi).contains(&mcs), "snr {snr}: settled at MCS {mcs}: {:?}", a.mac.rate_control().info(&B));
         // The controller only ever moved one step at a time from MCS 0.
         let used: Vec<u8> = a
@@ -268,6 +269,28 @@ fn rate_control_climbs_on_a_clean_link_and_settles_on_a_noisy_one() {
         assert!(!used.is_empty());
         assert!(used.iter().all(|&m| m <= hi), "snr {snr}: used {used:?}");
     }
+}
+
+#[test]
+fn rate_control_adopts_ldpc_and_the_short_gi_on_a_clean_link() {
+    let mut cfg_a = Node::config(A, 0, true);
+    cfg_a.rate = RateConfig { enabled: true, ..Default::default() };
+    cfg_a.ampdu_max_mpdus = 1;
+    let mut a = Node::new(cfg_a);
+    let mut b = Node::new(Node::config(B, 0, true));
+    let frames: Vec<Vec<u8>> = (0..60).map(|i| eth(B, A, 60 + i)).collect();
+    for f in &frames {
+        a.mac.enqueue_eth(f).unwrap();
+    }
+    run_snr(&mut a, &mut b, 6000, 30.0, |_| false);
+    let got = delivered(&b);
+    assert_eq!(got.len(), frames.len(), "{} delivered; A events: {:?}", got.len(), a.events.len());
+    let info = a.mac.rate_control().info(&B).expect("peer known");
+    assert_eq!((info.rate.gi, info.rate.fec_coding), (GuardInterval::Short, Coding::Ldpc), "{info:?}");
+    assert!(info.rate.mcs >= 6, "{info:?}");
+    // The reverse channel of the simulated air reads flat.
+    let spread = info.delay_spread_us.expect("delay spread heard");
+    assert!(spread < a.mac.config().rate.sgi_max_delay_spread_us, "delay spread {spread} µs");
 }
 
 #[test]

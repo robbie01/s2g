@@ -83,15 +83,10 @@ pub fn n_sym(mcs: u8, psdu_len: usize, aggregation: bool) -> Result<usize, PhyEr
     Ok(data_geometry(mcs, psdu_len, aggregation, Coding::Bcc)?.n_sym)
 }
 
-/// PPDU airtime in µs for a BCC S1G_SHORT / long-GI PPDU [Eq 23-74
-/// specialized: 240 + 40·N_SYM].
-pub fn txtime_us(mcs: u8, psdu_len: usize, aggregation: bool) -> Result<u32, PhyError> {
-    txtime_us_coded(mcs, psdu_len, aggregation, Coding::Bcc)
-}
-
-/// PPDU airtime in µs for either coding (S1G_SHORT, long GI).
-pub fn txtime_us_coded(mcs: u8, psdu_len: usize, aggregation: bool, coding: Coding) -> Result<u32, PhyError> {
-    Ok(params::T_PREAMBLE_US + params::T_SYML_US * data_geometry(mcs, psdu_len, aggregation, coding)?.n_sym as u32)
+/// PPDU airtime in µs of `psdu_len` octets sent with `txv` [Eq 23-73/23-74].
+pub fn txtime_us(txv: &TxVector, psdu_len: usize) -> Result<u32, PhyError> {
+    let g = data_geometry(txv.mcs, psdu_len, txv.aggregation, txv.fec_coding)?;
+    Ok(crate::vector::ppdu_duration_us(txv.preamble_type, txv.gi, g.n_sym))
 }
 
 /// PSDU capacity in octets of an aggregated PPDU that must carry at least
@@ -241,7 +236,10 @@ mod tests {
         // MCS 0, 100 octets: ceil(814/26) = 32; TXTIME 240+1280 = 1520 µs
         // [vectors-format sanity #8].
         assert_eq!(n_sym(0, 100, false).unwrap(), 32);
-        assert_eq!(txtime_us(0, 100, false).unwrap(), 1520);
+        assert_eq!(txtime_us(&TxVector::default(), 100).unwrap(), 1520);
+        // Short GI keeps the first Data symbol long: 240 + 40 + 31·36.
+        let sgi = TxVector { gi: crate::vector::GuardInterval::Short, ..Default::default() };
+        assert_eq!(txtime_us(&sgi, 100).unwrap(), 240 + 40 + 31 * 36);
     }
 
     #[test]
@@ -255,7 +253,7 @@ mod tests {
         assert_eq!(g.length_field, 100);
         let ga = data_geometry(0, 100, true, Coding::Ldpc).unwrap();
         assert_eq!(ga.length_field, 33);
-        assert_eq!(txtime_us_coded(0, 100, false, Coding::Ldpc).unwrap(), 240 + 33 * 40);
+        assert_eq!(txtime_us(&TxVector { fec_coding: Coding::Ldpc, ..Default::default() }, 100).unwrap(), 240 + 33 * 40);
         // Capacity for the MAC: N_SYM,init·N_DBPS − 8 bits.
         assert_eq!(aggregated_capacity(0, 100, Coding::Ldpc).unwrap(), (32 * 26 - 8) / 8);
         assert_eq!(aggregated_capacity(0, 100, Coding::Bcc).unwrap(), (32 * 26 - 14) / 8);

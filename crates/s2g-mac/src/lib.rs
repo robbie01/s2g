@@ -40,6 +40,6 @@ pub mod rate;
 pub use engine::{Mac, MacAction, MacConfig, MacError, MacEvent};
 pub use filter::{FilterConfig, Verdict};
 pub use ident::IdentConfig;
-pub use rate::{PeerRateInfo, RateConfig, RateControl};
+pub use rate::{Adapt, PeerRateInfo, RateConfig, RateControl, TxChoice};
 pub use frame::MacAddr;
 pub use ndp::NdpFrame;

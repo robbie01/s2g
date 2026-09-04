@@ -196,25 +196,42 @@ hardware timestamping. The engine is IO-free and clock-injected: unit-tested plu
 two-node over-the-air simulation tests (NDP Ack, NDP BlockAck, RTS/NDP CTS, retries,
 rate control).
 
-**Per-peer rate control** (`s2g_mac::rate`, on by default in `s2g-node`; `--fixed-mcs`
-turns it off, `--min-mcs`/`--max-mcs` bound it): every unicast destination gets its own
-MCS. The controller keeps a smoothed success probability per MCS from the
-acknowledgments (an attempt counts when it delivered at least what one PPDU at the
-next-lower rate would have carried, so a lone frame must get through while a big A-MPDU
-may lose an MPDU or two), uses the highest MCS still above a reliability floor, probes one
-step up every few frames (with exponential back-off after failed probes, re-armed when the
-peer's SNR clearly rises), steps down on retries from the rate that failed, and bounds
-probing with the SNR the PHY measures on whatever it hears from that peer (frames, NDP
-Acks, NDP CTS) against a table of what this PHY was measured to need per MCS in the
-receiver's own units (`s2g-sim --report-snr`). A rate that has been flawless may still
-probe above that bound, rarely, when the airtime the next rate would save outweighs one
-failure, which big A-MPDUs can and single small frames cannot. Broadcasts stay at
-`--mcs`. 802.11 leaves rate adaptation to the implementation, so nothing here is
+**Per-peer rate control** (`s2g_mac::rate`, on by default in `s2g-node`; `--fixed-rate`
+turns it off, `--min-mcs`/`--max-mcs` bound it, `--gi long|short` pins the guard
+interval; `--fec` defaults to `ldpc` for every data frame, `bcc` pins BCC and `auto`
+probes LDPC per peer): every unicast destination gets its own MCS, guard interval and,
+with `--fec auto`, FEC coding. The controller keeps a smoothed success probability per MCS and
+guard interval from the acknowledgments (an attempt counts when it delivered, per unit of
+airtime plus response turnaround, at least what one PPDU at the next-lower rate would
+have, so a lone frame must get through while a big A-MPDU may lose an MPDU or two; a
+short-GI attempt has to beat the long GI at its own MCS), uses the highest MCS still
+above a reliability floor (a fixed minimum, or more when the failures a rate may add
+cost more in response timeouts than the airtime it saves for the batches at hand, so
+single small frames only ride flawless rates), probes one step up every few frames (with
+exponential back-off after failed probes, re-armed when the peer's SNR clearly rises; a
+rate that a lucky probe promoted and that fails at once counts as a failed probe), probes
+the short GI the same way and keeps it while it holds its own floor,
+probes LDPC once per peer and keeps it once the peer has acknowledged an LDPC frame (OCB
+has no capability exchange, so an acknowledgment is the only evidence of a decoder),
+walks down the ladder on consecutive attempts that fell short of their rate (long GI
+first, then one MCS per retry, BCC after a failed LDPC probe), and bounds probing with
+what the PHY measures on whatever it hears from that peer (frames, NDP Acks, NDP CTS):
+the SNR against a table of what this PHY was measured to need per MCS in the receiver's
+own units (`s2g-sim --report-snr`, 1.8 dB less with LDPC), and the RMS delay spread of
+the channel estimate against the 0.9 µs reading past which this PHY loses short-GI PPDUs
+(`s2g-sim --sgi --echo-delay`). A rate that has been flawless may still probe above the
+SNR bound, rarely, when the airtime the next rate would save outweighs one failure,
+which big A-MPDUs can and single small frames cannot, and a rate that works below what
+the table demands shows the table is pessimistic for that link, so probing goes on. The
+SIG smoothing bit stays set: the receiver's [1 2 1]/4 smoothing helped at every echo
+delay and SNR measured, so there is nothing to adapt. Broadcasts stay at `--mcs`, long
+GI, BCC. 802.11 leaves rate adaptation to the implementation, so nothing here is
 spec-constrained. The constants come from `crates/s2g-mac/tests/rate_sim.rs`, a
-link-level simulation over static, shadowed, fading and stepped channels with the PHY's
-own PER curves and this link's turnaround and timeout costs: the defaults reach 99 % of
-the best fixed rate on average and 80 % in the worst scenario, where the previous
-constants gave 96 % and 72 %
+link-level simulation over static, shadowed, fading and stepped channels, with and
+without delay spread and LDPC-capable peers, with the PHY's own PER curves and this
+link's turnaround and timeout costs: the defaults reach 97 % of the best fixed MCS,
+guard interval and coding on average and 81 % in the worst scenario, where adapting the
+MCS alone (long GI, BCC) reaches 90 % and 35 %
 (`cargo test -p s2g-mac --release --test rate_sim -- --nocapture`; `sweep` is the ignored
 test behind the numbers).
 
@@ -348,7 +365,7 @@ station would not, so only the RA field of s2g's NDP CTS frames is affected.
 ```sh
 # Linux / macOS / *BSD: a real L2 TAP interface (build with the tap feature)
 cargo build --release --features tap
-sudo target/release/s2g-node --tap s2g0 --uri 192.168.2.1 --mcs 2 --ldpc --rts-threshold 300
+sudo target/release/s2g-node --tap s2g0 --uri 192.168.2.1 --mcs 2 --rts-threshold 300
 # then: ip addr add 10.99.0.1/24 dev s2g0   (etc. on each node)
 
 # Windows: tap-windows6 from an elevated prompt (see above), or the Ethernet-over-UDP NIC

@@ -6,9 +6,9 @@
 //! datagrams instead.
 
 use anyhow::{bail, Result};
-use clap::Parser;
-use s2g_mac::{FilterConfig, IdentConfig, Mac, MacAction, MacConfig, MacError, MacEvent, RateConfig};
-use s2g_phy::vector::Coding;
+use clap::{Parser, ValueEnum};
+use s2g_mac::{Adapt, FilterConfig, IdentConfig, Mac, MacAction, MacConfig, MacError, MacEvent, RateConfig, TxChoice};
+use s2g_phy::vector::{Coding, GuardInterval};
 use s2g_tools::nic::Nic;
 use s2g_tools::pcap::{unix_time_us, PcapWriter, Radiotap};
 use s2g_tools::DEFAULT_CENTER_FREQ_HZ;
@@ -31,12 +31,16 @@ struct Args {
     /// Our MAC address (default: locally-administered random)
     #[arg(long)]
     mac: Option<String>,
-    /// Data MCS (0-8 or 11)
+    /// Data MCS (0-8 or 11): the broadcast rate and the opening rate per peer
     #[arg(long, default_value_t = 2)]
     mcs: u8,
-    /// LDPC coding for data frames (optional feature; peer must support it)
-    #[arg(long)]
-    ldpc: bool,
+    /// FEC coding of data frames: ldpc or bcc for every frame, auto = LDPC to
+    /// peers that acknowledge it
+    #[arg(long, value_enum, default_value = "ldpc")]
+    fec: FecArg,
+    /// Guard interval of data frames: the short GI where it holds up, or fixed
+    #[arg(long, value_enum, default_value = "auto")]
+    gi: GiArg,
     /// Traveling pilots on data frames (optional feature; peer must support it)
     #[arg(long)]
     traveling_pilots: bool,
@@ -58,9 +62,9 @@ struct Args {
     fixed_ack_timeout: bool,
     #[arg(long, default_value_t = 3)]
     retries: u32,
-    /// Send every unicast frame at --mcs instead of adapting the MCS per peer
+    /// Send every unicast frame at --mcs, --gi and --fec instead of adapting per peer
     #[arg(long)]
-    fixed_mcs: bool,
+    fixed_rate: bool,
     /// Lowest MCS rate control falls back to
     #[arg(long, default_value_t = 0)]
     min_mcs: u8,
@@ -149,6 +153,20 @@ struct Args {
     pcap: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum FecArg {
+    Auto,
+    Bcc,
+    Ldpc,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum GiArg {
+    Auto,
+    Long,
+    Short,
+}
+
 fn parse_mac(s: &str) -> Result<[u8; 6]> {
     let parts: Vec<&str> = s.split([':', '-']).collect();
     if parts.len() != 6 {
@@ -209,7 +227,8 @@ fn main() -> Result<()> {
     };
     let mut cfg = MacConfig::new(addr);
     cfg.mcs = args.mcs;
-    cfg.fec_coding = if args.ldpc { Coding::Ldpc } else { Coding::Bcc };
+    cfg.fec_coding = if args.fec == FecArg::Ldpc { Coding::Ldpc } else { Coding::Bcc };
+    cfg.gi = if args.gi == GiArg::Short { GuardInterval::Short } else { GuardInterval::Long };
     cfg.traveling_pilots = args.traveling_pilots;
     cfg.ack_enabled = !args.no_ack;
     cfg.ndp_ack = !args.no_ndp_ack;
@@ -218,10 +237,12 @@ fn main() -> Result<()> {
     cfg.ack_timeout_adaptive = !args.fixed_ack_timeout;
     cfg.max_retries = args.retries;
     cfg.rate = RateConfig {
-        enabled: !args.fixed_mcs,
+        enabled: !args.fixed_rate,
         start_mcs: args.mcs,
         min_mcs: args.min_mcs,
         max_mcs: args.max_mcs,
+        gi: if args.gi == GiArg::Auto { Adapt::Auto } else { Adapt::Fixed(cfg.gi) },
+        fec_coding: if args.fec == FecArg::Auto { Adapt::Auto } else { Adapt::Fixed(cfg.fec_coding) },
         ..Default::default()
     };
     cfg.ampdu_max_mpdus = args.ampdu;
@@ -258,10 +279,11 @@ fn main() -> Result<()> {
     }
     let nic = make_nic(&args)?;
     eprintln!(
-        "s2g-node: mac {} | mcs {} {:?}{} | rate control {} | ack {} ({}) | rts {:?} | nic {}",
+        "s2g-node: mac {} | mcs {} | gi {:?} | fec {:?}{} | rate control {} | ack {} ({}) | rts {:?} | nic {}",
         fmt_mac(&addr),
         args.mcs,
-        cfg.fec_coding,
+        args.gi,
+        args.fec,
         if args.traveling_pilots { " + traveling pilots" } else { "" },
         if cfg.rate.enabled { format!("on ({}..={}, start {})", cfg.rate.min_mcs, cfg.rate.max_mcs, cfg.rate.start_mcs) } else { "off".to_string() },
         cfg.ack_enabled,
@@ -407,7 +429,7 @@ fn run_radio(args: &Args, mut mac: Mac, nic: Box<dyn Nic>) -> Result<()> {
     let t0 = Instant::now();
     let mut interp = s2g_dsp::HalfbandInterp2::new();
     let mut mac_events: Vec<MacEvent> = Vec::new();
-    let mut rate_seen: std::collections::HashMap<[u8; 6], u8> = std::collections::HashMap::new();
+    let mut rate_seen: std::collections::HashMap<[u8; 6], TxChoice> = std::collections::HashMap::new();
     let mut filter_log = FilterLog::default();
     loop {
         let now_us = t0.elapsed().as_micros() as u64;
@@ -450,18 +472,21 @@ fn run_radio(args: &Args, mut mac: Mac, nic: Box<dyn Nic>) -> Result<()> {
                     if args.verbose {
                         eprintln!("tx done → {} acked={acked} retries={retries} mcs={mcs}", fmt_mac(&dest));
                     }
-                    if let Some(now_mcs) = mac.peer_mcs(&dest) {
-                        if rate_seen.insert(dest, now_mcs) != Some(now_mcs) {
-                            let cfo = mac
-                                .rate_control()
-                                .peer_cfo_hz(&dest)
+                    if let Some(now) = mac.peer_rate(&dest) {
+                        if rate_seen.insert(dest, now) != Some(now) {
+                            let info = mac.rate_control().info(&dest);
+                            let cfo = info
+                                .as_ref()
+                                .and_then(|i| i.cfo_hz)
                                 .map(|c| format!(" | peer carrier offset {c:+.0} Hz ({:+.1} ppm)", c as f64 / args.freq_hz * 1e6))
                                 .unwrap_or_default();
+                            let spread = info.as_ref().and_then(|i| i.delay_spread_us).map(|d| format!(" | delay spread {d:.2} µs")).unwrap_or_default();
                             let resp = mac
                                 .response_delay_us()
                                 .map(|(srtt, wait)| format!(" | responses take {} ms, waiting up to {} ms", srtt / 1000, wait / 1000))
                                 .unwrap_or_default();
-                            eprintln!("rate → {}: MCS {now_mcs}{cfo}{resp}", fmt_mac(&dest));
+                            let gi = if now.gi == GuardInterval::Short { "short GI" } else { "long GI" };
+                            eprintln!("rate → {}: MCS {} {gi} {:?}{cfo}{spread}{resp}", fmt_mac(&dest), now.mcs, now.fec_coding);
                         }
                     }
                 }

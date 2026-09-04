@@ -67,6 +67,40 @@ impl ChannelEstimate {
             .fold((0.0f32, 0usize), |(s, n), a| (s + 10.0 * (self.h[a].norm_sqr() / nv).max(1e-12).log10(), n + 1));
         sum / n.max(1) as f32
     }
+
+    /// RMS delay spread of the channel, samples: the second moment of the
+    /// power delay profile (IDFT of the estimate over the used tones, Hann
+    /// weighted against leakage from the unused ones) within ±16 taps of
+    /// its peak, above the noise floor read off the taps farthest from the
+    /// peak. A flat channel reads about 0.6, the window's own width.
+    pub fn rms_delay_spread_samples(&self) -> f32 {
+        let ltf = preamble::ltf_freq();
+        let mut weighted = [Complex32::new(0.0, 0.0); 64];
+        for (a, w) in weighted.iter_mut().enumerate() {
+            if ltf[a].norm_sqr() > 0.0 {
+                let k = a as f32 - 32.0;
+                *w = self.h[a] * 0.5 * (1.0 - (2.0 * core::f32::consts::PI * (k + 28.5) / 57.0).cos());
+            }
+        }
+        let taps = ofdm::idft(&weighted, 1.0);
+        let pdp: Vec<f32> = taps.iter().map(|t| t.norm_sqr()).collect();
+        let peak = (0..64).max_by(|&a, &b| pdp[a].total_cmp(&pdp[b])).unwrap_or(0);
+        let mut far: Vec<f32> = (16..48).map(|i| pdp[(peak + i) % 64]).collect();
+        far.sort_by(f32::total_cmp);
+        let floor = far[far.len() / 2];
+        let (mut m0, mut m1, mut m2) = (0.0f32, 0.0f32, 0.0f32);
+        for d in -16i32..16 {
+            let p = (pdp[(peak as i32 + d).rem_euclid(64) as usize] - floor).max(0.0);
+            m0 += p;
+            m1 += p * d as f32;
+            m2 += p * (d * d) as f32;
+        }
+        if m0 <= 0.0 {
+            return 0.0;
+        }
+        let mean = m1 / m0;
+        (m2 / m0 - mean * mean).max(0.0).sqrt()
+    }
 }
 
 /// Estimate the channel from the two repeated LTS periods (freq domain,

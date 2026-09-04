@@ -31,6 +31,9 @@ struct Args {
     /// Send as A-MPDU (aggregation bit)
     #[arg(long)]
     aggregation: bool,
+    /// Clear the SIG Smoothing bit (the receiver then skips channel smoothing)
+    #[arg(long)]
+    no_smoothing: bool,
     /// SNR points in dB, comma separated
     #[arg(long, default_value = "5,10,15,20,25,30,40")]
     snr_db: String,
@@ -58,8 +61,8 @@ struct Args {
     /// RNG seed
     #[arg(long, default_value_t = 1)]
     seed: u64,
-    /// Also print, per MCS, the mean SNR the receiver reports at each point
-    /// (what rate control sees), from the PPDUs it decoded
+    /// Also print, per MCS, the mean SNR and RMS delay spread the receiver
+    /// reports at each point (what rate control sees), from the PPDUs it decoded
     #[arg(long)]
     report_snr: bool,
 }
@@ -88,9 +91,10 @@ fn main() -> Result<()> {
     for mcs in mcs_list {
         let mut row = Vec::new();
         let mut reported = Vec::new();
+        let mut spread = Vec::new();
         for &snr in &snrs {
             let mut errors = 0usize;
-            let (mut snr_sum, mut snr_n) = (0.0f32, 0usize);
+            let (mut snr_sum, mut ds_sum, mut snr_n) = (0.0f32, 0.0f32, 0usize);
             for _ in 0..args.count {
                 let psdu = rng.bytes(args.len);
                 let txv = TxVector {
@@ -100,6 +104,7 @@ fn main() -> Result<()> {
                     aggregation: args.aggregation,
                     gi: if args.sgi { GuardInterval::Short } else { GuardInterval::Long },
                     preamble_type: if args.long_preamble { PreambleType::S1gLong } else { PreambleType::S1gShort },
+                    smoothing: !args.no_smoothing,
                     ..Default::default()
                 };
                 let wave = tx.generate(&txv, &psdu).expect("tx");
@@ -129,16 +134,19 @@ fn main() -> Result<()> {
                 for e in &ev {
                     if let RxEvent::PsduReceived { metrics, .. } = e {
                         snr_sum += metrics.snr_db;
+                        ds_sum += metrics.delay_spread_us;
                         snr_n += 1;
                     }
                 }
             }
             row.push(format!("{:>7.3}", errors as f32 / args.count as f32));
             reported.push(if snr_n > 0 { format!("{:>7.1}", snr_sum / snr_n as f32) } else { format!("{:>7}", "-") });
+            spread.push(if snr_n > 0 { format!("{:>7.2}", ds_sum / snr_n as f32) } else { format!("{:>7}", "-") });
         }
         println!("{mcs:>4} | {}", row.join(" "));
         if args.report_snr {
             println!(" snr | {}", reported.join(" "));
+            println!("  ds | {}", spread.join(" "));
         }
     }
     Ok(())

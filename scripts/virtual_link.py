@@ -97,7 +97,7 @@ def main():
     ap.add_argument("--path-loss-db", type=float, default=30.0)
     ap.add_argument("--mcs", type=int, default=2)
     ap.add_argument("--max-median-ms", type=float, default=150.0, help="fail if the median one-way latency exceeds this")
-    ap.add_argument("--node-args", default="", help="extra arguments for both s2g-nodes, e.g. \"--ampdu 1 --fixed-mcs\"")
+    ap.add_argument("--node-args", default="", help="extra arguments for both s2g-nodes, e.g. \"--ampdu 1 --fixed-rate\"")
     ap.add_argument("--no-build", action="store_true")
     ap.add_argument("--log", help="write every line the three processes printed to this file")
     args = ap.parse_args()

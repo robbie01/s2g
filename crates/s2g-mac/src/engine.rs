@@ -42,11 +42,11 @@ use crate::filter::{self, FilterConfig, Verdict};
 use crate::frame::{self, MacAddr, ParsedFrame, Pv1Addr};
 use crate::ident::{self, IdentConfig};
 use crate::ndp::{self, NdpAck, NdpBlockAck, NdpCts, NdpFrame};
-use crate::rate::{self, RateConfig, RateControl};
+use crate::rate::{self, RateConfig, RateControl, TxChoice};
 use crate::{ampdu, eth};
 use s2g_phy::params::{characteristics::*, T_PREAMBLE_US};
 use s2g_phy::rx::{RxEndStatus, RxEvent};
-use s2g_phy::vector::{Coding, ResponseIndication, RxVector, TxVector};
+use s2g_phy::vector::{Coding, GuardInterval, ResponseIndication, RxVector, TxVector};
 use std::collections::{HashMap, VecDeque};
 use thiserror::Error;
 
@@ -75,8 +75,12 @@ pub struct MacConfig {
     /// MCS for broadcast data frames, and for unicast when rate control is
     /// off (control responses and identification frames always go at MCS 0).
     pub mcs: u8,
-    /// FEC for data frames (BCC or LDPC).
+    /// FEC coding for broadcast data frames, and for unicast when rate
+    /// control is off (identification frames always go BCC).
     pub fec_coding: Coding,
+    /// Guard interval for broadcast data frames, and for unicast when rate
+    /// control is off (identification frames always go long-GI).
+    pub gi: GuardInterval,
     /// Traveling pilots on data frames (only if the peer supports them).
     pub traveling_pilots: bool,
     /// ACK + retry for unicast data.
@@ -124,6 +128,7 @@ impl MacConfig {
             addr,
             mcs: 0,
             fec_coding: Coding::Bcc,
+            gi: GuardInterval::Long,
             traveling_pilots: false,
             ack_enabled: true,
             ndp_ack: true,
@@ -207,15 +212,18 @@ struct CurrentTx {
     mpdus: Vec<PendingMpdu>,
     /// Indices into `mpdus` of the attempt on the air.
     in_flight: Vec<usize>,
-    /// Failed attempts so far (drives CW doubling and rate step-down).
+    /// Attempts with an unacknowledged MPDU so far (drive CW doubling).
     attempts: u32,
+    /// Consecutive attempts that delivered less than one PPDU at the
+    /// next-lower rate would have (drive the rate step-down).
+    rate_failures: u32,
     /// RTS/CTS handshake completed for this attempt.
     cts_ok: bool,
-    /// MCS of the attempt in flight (rate-control bookkeeping).
-    mcs: u8,
-    /// Octets one PPDU at the next-lower rate would have carried of this
-    /// batch: what the attempt in flight must deliver to count as a
-    /// success for its rate.
+    /// What the attempt in flight went out with (rate-control bookkeeping).
+    choice: TxChoice,
+    /// Octets the attempt in flight must deliver to count as a success for
+    /// its rate: what one PPDU at the next-lower rate would have carried
+    /// of this batch, scaled by the airtime ratio.
     lower_octets: usize,
     /// The batch started with several MPDUs: they travel as QoS Data.
     qos: bool,
@@ -267,6 +275,8 @@ pub struct Mac {
     last_data_tx_us: u64,
     /// CFO the PHY measured on the PSDU being processed, Hz.
     rx_cfo_hz: f32,
+    /// RMS delay spread of the latest reception, µs (rate-control hint).
+    rx_delay_spread_us: f32,
     /// Frames the filter dropped on the way to the air / from the air.
     filtered_egress: u64,
     filtered_ingress: u64,
@@ -295,7 +305,7 @@ fn is_group(addr: &MacAddr) -> bool {
 
 /// TXTIME of an MCS 0 control frame of `octets` [Table 10-3 NormalTxTime].
 fn normal_tx_time_us(octets: usize) -> u64 {
-    s2g_phy::tx::txtime_us(0, octets, false).unwrap_or(1000) as u64
+    s2g_phy::tx::txtime_us(&TxVector::default(), octets).unwrap_or(1000) as u64
 }
 
 impl Mac {
@@ -325,6 +335,7 @@ impl Mac {
             sent_since_ident: false,
             last_data_tx_us: 0,
             rx_cfo_hz: 0.0,
+            rx_delay_spread_us: 0.0,
             filtered_egress: 0,
             filtered_ingress: 0,
             resp_srtt_us: None,
@@ -402,10 +413,15 @@ impl Mac {
         A_SIFS_TIME_US as u64 + NDP_TX_TIME_US as u64 + self.cfg.difs_us
     }
 
-    /// MCS the rate controller currently uses for `peer` (`None`: unknown
-    /// peer, or rate control disabled).
-    pub fn peer_mcs(&self, peer: &MacAddr) -> Option<u8> {
+    /// MCS, guard interval and coding the rate controller currently uses
+    /// for `peer` (`None`: unknown peer, or rate control disabled).
+    pub fn peer_rate(&self, peer: &MacAddr) -> Option<TxChoice> {
         self.cfg.rate.enabled.then(|| self.rate.current(peer)).flatten()
+    }
+
+    /// What data frames go out with when rate control does not decide.
+    fn fixed_choice(&self) -> TxChoice {
+        TxChoice { mcs: self.cfg.mcs, gi: self.cfg.gi, fec_coding: self.cfg.fec_coding }
     }
 
     /// The per-peer rate controller (statistics, SNR hints).
@@ -524,6 +540,7 @@ impl Mac {
             RxEvent::NdpReceived { body, metrics, .. } => {
                 let f = NdpFrame::parse(*body);
                 self.rx_cfo_hz = metrics.cfo_hz;
+                self.rx_delay_spread_us = metrics.delay_spread_us;
                 self.on_ndp(&f, metrics.snr_db, now_us, out);
                 out.push(MacEvent::NdpReceived { frame: f });
             }
@@ -534,6 +551,7 @@ impl Mac {
             RxEvent::RxEnd { .. } => {}
             RxEvent::PsduReceived { rxvector, psdu, metrics, .. } => {
                 self.rx_cfo_hz = metrics.cfo_hz;
+                self.rx_delay_spread_us = metrics.delay_spread_us;
                 let mpdus = ampdu::split_psdu(psdu, rxvector.aggregation);
                 let s_mpdu = rxvector.aggregation && mpdus.len() == 1 && mpdus[0].1;
                 // An S-MPDU follows non-aggregated rules [10.12.8]: it is
@@ -585,6 +603,7 @@ impl Mac {
                     if let Some(c) = &self.cur {
                         self.rate.observe_snr(&c.dest, snr_db);
                         self.rate.observe_cfo(&c.dest, self.rx_cfo_hz);
+                        self.rate.observe_delay_spread(&c.dest, self.rx_delay_spread_us);
                     }
                     self.resolve_attempt(|_| true, now_us, out);
                 } else if matches!(&self.late_expect, Some((Expect::NdpAck { ack_id }, _)) if *ack_id == a.ack_id) {
@@ -646,7 +665,7 @@ impl Mac {
     fn resolve_attempt(&mut self, acked: impl Fn(u16) -> bool, now_us: u64, out: &mut Vec<MacEvent>) {
         let max_retries = self.cfg.max_retries;
         let Some(cur) = self.cur.as_mut() else { return };
-        let (dest, mcs) = (cur.dest, cur.mcs);
+        let (dest, choice) = (cur.dest, cur.choice);
         let in_flight = std::mem::take(&mut cur.in_flight);
         let hdr = if cur.qos { frame::QOS_DATA_HDR_LEN } else { frame::DATA_HDR_LEN };
         let lower_octets = cur.lower_octets;
@@ -658,7 +677,7 @@ impl Mac {
             if flown && acked(m.seq) {
                 n_acked += 1;
                 delivered += hdr + m.body.len() + 4;
-                out.push(MacEvent::TxComplete { dest, acked: true, retries: m.retries, mcs });
+                out.push(MacEvent::TxComplete { dest, acked: true, retries: m.retries, mcs: choice.mcs });
                 continue;
             }
             if flown {
@@ -678,7 +697,8 @@ impl Mac {
         // one PPDU at the next-lower rate would have carried: a lone frame
         // must get through; a big A-MPDU may lose an MPDU or two and still
         // beat the rate below it.
-        self.rate.report(&dest, mcs, delivered > 0 && delivered >= lower_octets);
+        let success = delivered > 0 && delivered >= lower_octets;
+        self.rate.report(&dest, choice, success);
         let all_done = self.cur.as_ref().is_some_and(|c| c.mpdus.is_empty());
         if all_done {
             self.cur = None;
@@ -688,6 +708,8 @@ impl Mac {
         }
         let cur = self.cur.as_mut().expect("batch continues");
         cur.cts_ok = false;
+        // Consecutive: a success at the stepped-down rate ends the walk.
+        cur.rate_failures = if success { 0 } else { cur.rate_failures + 1 };
         if failed {
             cur.attempts += 1;
             self.cw_exp = (self.cw_exp + 1).min(self.cfg.cw_max_exp);
@@ -779,6 +801,7 @@ impl Mac {
         }
         self.rate.observe_snr(&src, rxv.snr_db);
         self.rate.observe_cfo(&src, self.rx_cfo_hz);
+        self.rate.observe_delay_spread(&src, self.rx_delay_spread_us);
         let for_us = dest == self.cfg.addr;
         if !for_us && !is_group(&dest) {
             if duration_us > 0 {
@@ -887,8 +910,7 @@ impl Mac {
     /// Choose which outstanding MPDUs go into the next attempt at `mcs`
     /// and build the PSDU: a plain MPDU, an S-MPDU, or an A-MPDU of as many
     /// MPDUs as the PPDU can carry.
-    fn plan_attempt(&self, cur: &CurrentTx, mcs: u8, duration_us: u16) -> Result<Attempt, MacError> {
-        let coding = self.cfg.fec_coding;
+    fn plan_attempt(&self, cur: &CurrentTx, mcs: u8, coding: Coding, duration_us: u16) -> Result<Attempt, MacError> {
         let mut chosen: Vec<usize> = Vec::new();
         let mut built: Vec<Vec<u8>> = Vec::new();
         let mut lens: Vec<usize> = Vec::new();
@@ -1008,8 +1030,9 @@ impl Mac {
                     mpdus: vec![PendingMpdu { seq, body, retries: 0 }],
                     in_flight: Vec::new(),
                     attempts: 0,
+                    rate_failures: 0,
                     cts_ok: false,
-                    mcs: 0,
+                    choice: TxChoice { mcs: 0, gi: GuardInterval::Long, fec_coding: Coding::Bcc },
                     lower_octets: 0,
                     qos: false,
                     ident: true,
@@ -1026,7 +1049,7 @@ impl Mac {
                     mpdus.push(PendingMpdu { seq, body, retries: 0 });
                 }
                 let qos = mpdus.len() > 1;
-                self.cur = Some(CurrentTx { dest, src, mpdus, in_flight: Vec::new(), attempts: 0, cts_ok: false, mcs: self.cfg.mcs, lower_octets: 0, qos, ident: false });
+                self.cur = Some(CurrentTx { dest, src, mpdus, in_flight: Vec::new(), attempts: 0, rate_failures: 0, cts_ok: false, choice: self.fixed_choice(), lower_octets: 0, qos, ident: false });
                 self.start_backoff(now_us);
             }
         }
@@ -1052,33 +1075,34 @@ impl Mac {
             if need_rts {
                 // Duration covers CTS + data + response [9.2.5.2], at the
                 // rate the data is expected to go out with.
-                let est_mcs = if self.cfg.rate.enabled { self.rate.current(&cur.dest).unwrap_or(self.cfg.mcs) } else { self.cfg.mcs };
-                let data_time = s2g_phy::tx::txtime_us_coded(est_mcs, total_len.min(511), total_len > 511, self.cfg.fec_coding).unwrap_or(10_000) as u64;
+                let est = if self.cfg.rate.enabled { self.rate.current(&cur.dest).unwrap_or_else(|| self.fixed_choice()) } else { self.fixed_choice() };
+                let est_txv = TxVector { mcs: est.mcs, gi: est.gi, fec_coding: est.fec_coding, aggregation: total_len > 511, ..Default::default() };
+                let data_time = s2g_phy::tx::txtime_us(&est_txv, total_len.min(511)).unwrap_or(10_000) as u64;
                 let duration = sifs + NDP_TX_TIME_US as u64 + sifs + data_time + sifs + resp_time;
                 let psdu = frame::build_rts(cur.dest, cur.src, duration.min(0x7fff) as u16);
                 let seed = self.pick_seed();
                 let txv = TxVector { mcs: 0, response_indication: ResponseIndication::Ndp, scrambler_seed: Some(seed), ..Default::default() };
-                let airtime = s2g_phy::tx::txtime_us(0, psdu.len(), false).unwrap_or(1000) as u64;
+                let airtime = s2g_phy::tx::txtime_us(&txv, psdu.len()).unwrap_or(1000) as u64;
                 let partial_aid = self.cfg.partial_aid();
                 let timeout = self.response_timeout_us();
                 self.sent_end_us = now_us + airtime;
                 self.state = TxState::AwaitResponse { deadline_us: now_us + airtime + timeout, expect: Expect::NdpCts { partial_aid } };
                 return Some(MacAction::Transmit { txv, psdu });
             }
-            // Rate control picks the MCS of this attempt (failed attempts
-            // step down); broadcast, identification and unacknowledged
-            // frames use the fixed rates.
-            let mcs = if cur.ident {
-                0
+            // Rate control picks the MCS, guard interval and coding of this
+            // attempt (failed attempts walk down); broadcast, identification
+            // and unacknowledged frames use the fixed settings.
+            let choice = if cur.ident {
+                TxChoice { mcs: 0, gi: GuardInterval::Long, fec_coding: Coding::Bcc }
             } else if want_ack && self.cfg.rate.enabled {
-                self.rate.select(&cur.dest, cur.attempts, total_len)
+                self.rate.select(&cur.dest, cur.rate_failures, total_len)
             } else {
-                self.cfg.mcs
+                self.fixed_choice()
             };
-            self.cur.as_mut().expect("Backoff implies cur").mcs = mcs;
+            self.cur.as_mut().expect("Backoff implies cur").choice = choice;
             let cur = self.cur.as_ref().expect("Backoff implies cur");
             let duration = if want_ack { (sifs + resp_time).min(0x7fff) as u16 } else { 0 };
-            let mut attempt = match self.plan_attempt(cur, mcs, duration) {
+            let mut attempt = match self.plan_attempt(cur, choice.mcs, choice.fec_coding, duration) {
                 Ok(a) => a,
                 Err(_) => {
                     let cur = self.cur.take().unwrap();
@@ -1089,14 +1113,32 @@ impl Mac {
                     return None;
                 }
             };
-            // What one PPDU at the next-lower rate would carry of this
-            // batch: the bar this attempt must clear for its rate.
-            let lower_mcs = rate::next_lower(mcs).max(self.cfg.rate.min_mcs);
+            // The bar this attempt must clear for its rate: the octets one
+            // PPDU at the next-lower rate would have carried of this batch,
+            // scaled by the ratio of the two attempts' airtime plus
+            // response turnaround, so the attempt has to deliver at least
+            // as much per unit of time (with this link's turnaround of tens
+            // of ms, close to everything). A short-GI attempt's next-lower
+            // rate is the long GI at the same MCS, which carries the same
+            // MPDUs; the bottom of the ladder has to deliver everything.
+            let airtime_of = |mcs: u8, gi: GuardInterval, a: &Attempt| {
+                let txv = TxVector { mcs, gi, fec_coding: choice.fec_coding, aggregation: a.aggregated, ..Default::default() };
+                s2g_phy::tx::txtime_us(&txv, a.psdu.len()).unwrap_or(10_000) as u64
+            };
             let octets_of = |a: &Attempt| a.in_flight.iter().map(|&i| hdr + cur.mpdus[i].body.len() + 4).sum::<usize>();
-            let lower_octets = if lower_mcs == mcs {
-                octets_of(&attempt)
+            let turnaround = self.resp_srtt_us.unwrap_or(self.cfg.ack_timeout_us);
+            let bar = |lower_octets: usize, lower_airtime: u64, airtime: u64| (lower_octets as f64 * (airtime + turnaround) as f64 / (lower_airtime + turnaround) as f64).ceil() as usize;
+            let airtime = airtime_of(choice.mcs, choice.gi, &attempt);
+            let carried = octets_of(&attempt);
+            let lower_mcs = rate::next_lower(choice.mcs).max(self.cfg.rate.min_mcs);
+            let lower_octets = if choice.gi == GuardInterval::Short {
+                bar(carried, airtime_of(choice.mcs, GuardInterval::Long, &attempt), airtime)
+            } else if lower_mcs == choice.mcs {
+                carried
             } else {
-                self.plan_attempt(cur, lower_mcs, duration).map(|a| octets_of(&a)).unwrap_or_else(|_| octets_of(&attempt))
+                self.plan_attempt(cur, lower_mcs, choice.fec_coding, duration)
+                    .map(|a| bar(octets_of(&a), airtime_of(lower_mcs, choice.gi, &a), airtime))
+                    .unwrap_or(carried)
             };
             let seed = self.pick_seed();
             let response_indication = match (want_ack, self.cfg.ndp_ack) {
@@ -1105,19 +1147,19 @@ impl Mac {
                 (true, false) => ResponseIndication::Normal,
             };
             let txv = TxVector {
-                mcs,
-                fec_coding: self.cfg.fec_coding,
+                mcs: choice.mcs,
+                gi: choice.gi,
+                fec_coding: choice.fec_coding,
                 traveling_pilots: self.cfg.traveling_pilots,
                 aggregation: attempt.aggregated,
                 response_indication,
                 scrambler_seed: Some(seed),
                 ..Default::default()
             };
-            let airtime = s2g_phy::tx::txtime_us_coded(mcs, attempt.psdu.len(), attempt.aggregated, self.cfg.fec_coding).unwrap_or(10_000) as u64;
             let timeout = self.response_timeout_us();
             let cur = self.cur.as_mut().expect("Backoff implies cur");
             cur.in_flight = std::mem::take(&mut attempt.in_flight);
-            cur.lower_octets = lower_octets;
+            cur.lower_octets = lower_octets.min(carried);
             if want_ack {
                 // A single MPDU or S-MPDU is acknowledged like a single MPDU
                 // [10.12.8]; a multi-MPDU A-MPDU gets an NDP BlockAck.
@@ -1139,7 +1181,7 @@ impl Mac {
                     self.sent_since_ident = false;
                 } else {
                     for m in &cur.mpdus {
-                        out.push(MacEvent::TxComplete { dest: cur.dest, acked: false, retries: m.retries, mcs });
+                        out.push(MacEvent::TxComplete { dest: cur.dest, acked: false, retries: m.retries, mcs: choice.mcs });
                     }
                     self.sent_since_ident = true;
                     self.last_data_tx_us = now_us;
@@ -1182,7 +1224,7 @@ mod tests {
     }
 
     fn metrics() -> RxMetrics {
-        RxMetrics { snr_db: 30.0, cfo_hz: 0.0, evm_db: -30.0, rssi_dbfs: -30.0, timing_drift_samples: 0.0, ldpc_failures: 0 }
+        RxMetrics { snr_db: 30.0, cfo_hz: 0.0, evm_db: -30.0, rssi_dbfs: -30.0, timing_drift_samples: 0.0, ldpc_failures: 0, delay_spread_us: 0.3 }
     }
 
     fn psdu_event(txv: &TxVector, psdu: &[u8]) -> RxEvent {
@@ -1272,7 +1314,7 @@ mod tests {
     fn send_one(mac: &mut Mac, now: &mut u64, out: &mut Vec<MacEvent>) -> (u64, NdpFrame) {
         mac.enqueue_eth(&eth_frame(B, A, 100)).unwrap();
         let Some(MacAction::Transmit { txv, psdu }) = drain_tx(mac, now, out) else { panic!("no transmission") };
-        let airtime = s2g_phy::tx::txtime_us(txv.mcs, psdu.len(), false).unwrap() as u64;
+        let airtime = s2g_phy::tx::txtime_us(&txv, psdu.len()).unwrap() as u64;
         let ack_id = ndp::ack_id_for_mpdu(txv.scrambler_seed.unwrap(), &psdu);
         (*now + airtime, NdpFrame::Ack(NdpAck { ack_id, more_data: false, idle_indication: false, duration: 0, relayed_frame: false }))
     }

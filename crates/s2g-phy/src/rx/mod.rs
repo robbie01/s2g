@@ -95,6 +95,9 @@ pub struct RxMetrics {
     pub timing_drift_samples: f32,
     /// LDPC codewords that failed to converge (0 for BCC).
     pub ldpc_failures: usize,
+    /// RMS delay spread of the LTF channel estimate, µs; a flat channel
+    /// reads about 0.3, the estimate's own resolution.
+    pub delay_spread_us: f32,
 }
 
 /// Why CCA reports BUSY [23.3.18.5].
@@ -761,6 +764,7 @@ impl Receiver {
                     rssi_dbfs: rssi,
                     timing_drift_samples: 0.0,
                     ldpc_failures: 0,
+                    delay_spread_us: eq.estimate().rms_delay_spread_samples() / SAMPLES_PER_US as f32,
                 };
                 events.push(RxEvent::NdpReceived { sample_index: sig_end, body, metrics });
                 self.rearm(sig_end, sig_end, None, events);
@@ -971,6 +975,7 @@ impl Receiver {
                     rssi_dbfs: ds.rssi,
                     timing_drift_samples: ds.timing.drift(),
                     ldpc_failures: r.ldpc_failures,
+                    delay_spread_us: ds.eq.estimate().rms_delay_spread_samples() / SAMPLES_PER_US as f32,
                 };
                 events.push(RxEvent::PsduReceived { sample_index: end, rxvector: rxv, psdu: r.psdu, metrics });
                 events.push(RxEvent::RxEnd { sample_index: end, status: RxEndStatus::NoError });

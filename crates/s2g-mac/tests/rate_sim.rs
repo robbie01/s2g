@@ -2,37 +2,44 @@
 //!
 //! What it models, per attempt, the way `engine.rs` does it:
 //! * batch → PPDU packing (`plan_attempt`: as many MPDUs as fit), airtime
-//!   from the PHY's TXTIME, DIFS + binary-exponential backoff;
+//!   from the PHY's TXTIME for the MCS, guard interval and coding in use,
+//!   DIFS + binary-exponential backoff;
 //! * a lost PPDU (preamble/SIG not decoded, or every MPDU failing its FCS)
 //!   costs the response timeout; anything acknowledged costs the response
 //!   turnaround (about 45 ms through two SDR pipelines, measured on the
 //!   virtual link); unacknowledged MPDUs are retried, then dropped;
 //! * per-MPDU FCS failure from a PER-vs-SNR model fitted to the PHY's own
-//!   loopback (`s2g-sim --report-snr`), in the receiver's reported-SNR units;
-//! * the SNR hint the controller gets from acknowledgments: the forward
-//!   SNR plus a link asymmetry and estimation noise.
+//!   loopback (`s2g-sim --report-snr`), in the receiver's reported-SNR
+//!   units; LDPC as a fixed SNR gain; a short-GI or long-GI PPDU lost
+//!   outright once the channel's delay spread passes what the PHY tolerates
+//!   (`s2g-sim --echo-delay`); an LDPC PPDU lost outright at a peer that
+//!   cannot decode it;
+//! * the hints the controller gets from acknowledgments: the forward SNR
+//!   plus a link asymmetry and estimation noise, and the delay spread plus
+//!   estimation noise.
 //!
 //! Channels: static, log-normal shadowing (AR(1) in dB), Rician / Rayleigh
-//! fading (sum of sinusoids with a Jakes-like Doppler spread), a step.
+//! fading (sum of sinusoids with a Jakes-like Doppler spread), a step; each
+//! with a delay spread and a peer that does or does not decode LDPC.
 //! Traffic: a saturated queue of frames of one size, in batches.
 //!
 //! A configuration's score in a scenario is its goodput relative to the
-//! best fixed MCS for that scenario, a reference that knows the channel in
-//! advance, so an adaptive controller only beats it on a changing channel.
-//! The defaults in `RateConfig` came out of `sweep`:
+//! best fixed MCS, guard interval and coding for that scenario, a
+//! reference that knows the channel and the peer in advance, so an
+//! adaptive controller only beats it on a changing channel. The defaults
+//! in `RateConfig` came out of `sweep`:
 //!
 //!     cargo test -p s2g-mac --release --test rate_sim -- --nocapture
 //!     cargo test -p s2g-mac --release --test rate_sim sweep -- --ignored --nocapture
 
-use s2g_mac::rate::{RateConfig, RateControl, LADDER};
+use s2g_mac::rate::{Adapt, RateConfig, RateControl, TxChoice, LADDER};
 use s2g_mac::{ampdu, frame};
 use s2g_phy::sim::Rng;
-use s2g_phy::tx::{aggregated_capacity, txtime_us_coded};
-use s2g_phy::vector::Coding;
+use s2g_phy::tx::{aggregated_capacity, txtime_us};
+use s2g_phy::vector::{Coding, GuardInterval, TxVector};
 use std::f32::consts::PI;
 
 const PEER: [u8; 6] = [2, 0, 0, 0, 0, 0xB];
-const CODING: Coding = Coding::Bcc;
 
 /// Per LADDER entry: reported SNR at which half of the 100-octet PSDUs are
 /// lost, the shift of that point per decade of PSDU length, and the
@@ -51,12 +58,43 @@ const PER_MODEL: [(f32, f32, f32); 10] = [
     (27.8, 1.6, 1.5),
 ];
 
-/// Probability that a PSDU of `len` octets at `LADDER[idx]` is lost at a
-/// reported SNR of `snr_db`.
+/// LDPC's gain over BCC in reported SNR at every MCS above 0
+/// (`s2g-sim --ldpc --report-snr`, 1000 octets), dB.
+const LDPC_GAIN_DB: f32 = 1.8;
+
+/// Reported RMS delay spread (µs) past which this PHY loses short-GI and
+/// long-GI PPDUs at high MCS (`s2g-sim --sgi --echo-delay` against the
+/// `--report-snr` reading of the same channel).
+const SGI_SPREAD_LIMIT_US: f32 = 0.95;
+const LGI_SPREAD_LIMIT_US: f32 = 1.3;
+
+/// Probability that a BCC long-GI PSDU of `len` octets at `LADDER[idx]` is
+/// lost at a reported SNR of `snr_db`.
 fn per(idx: usize, snr_db: f32, len: usize) -> f32 {
     let (s50, per_decade, k) = PER_MODEL[idx];
     let s = s50 + per_decade * (len as f32 / 100.0).log10();
     1.0 / (1.0 + (k * (snr_db - s)).exp())
+}
+
+fn ladder_index(mcs: u8) -> usize {
+    LADDER.iter().position(|&m| m == mcs).expect("ladder MCS")
+}
+
+/// Probability that a PSDU of `len` octets sent with `choice` is lost at
+/// `snr_db` over a channel of `spread_us` RMS delay spread, to a peer that
+/// decodes LDPC or not.
+fn loss(choice: TxChoice, snr_db: f32, spread_us: f32, len: usize, peer_ldpc: bool) -> f32 {
+    let idx = ladder_index(choice.mcs);
+    let ldpc = choice.fec_coding == Coding::Ldpc;
+    if ldpc && !peer_ldpc {
+        return 1.0;
+    }
+    let limit = if choice.gi == GuardInterval::Short { SGI_SPREAD_LIMIT_US } else { LGI_SPREAD_LIMIT_US };
+    if spread_us > limit {
+        return 1.0;
+    }
+    let gain = if ldpc && idx > 0 { LDPC_GAIN_DB } else { 0.0 };
+    per(idx, snr_db + gain, len)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -140,10 +178,27 @@ struct Link {
     asym_db: f32,
     /// Standard deviation of one frame's SNR estimate, dB.
     est_noise_db: f32,
+    /// RMS delay spread of the channel as the PHY reports it, µs (both
+    /// directions).
+    spread_us: f32,
+    /// Standard deviation of one frame's delay-spread reading, µs.
+    spread_noise_us: f32,
+    /// The peer decodes LDPC.
+    peer_ldpc: bool,
 }
 
 fn link(timeout_ms: u64) -> Link {
-    Link { rtt_us: 45_000, timeout_us: timeout_ms * 1000, max_retries: 3, loss_floor: 0.0, asym_db: 0.0, est_noise_db: 0.7 }
+    Link {
+        rtt_us: 45_000,
+        timeout_us: timeout_ms * 1000,
+        max_retries: 3,
+        loss_floor: 0.0,
+        asym_db: 0.0,
+        est_noise_db: 0.7,
+        spread_us: 0.4,
+        spread_noise_us: 0.1,
+        peer_ldpc: true,
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -173,18 +228,18 @@ impl Outcome {
 
 enum Policy {
     Adaptive(RateConfig),
-    Fixed(u8),
+    Fixed(TxChoice),
 }
 
-/// `plan_attempt` for `n` outstanding MPDUs of `mpdu_len` octets at `mcs`:
-/// how many fit one PPDU, the PSDU length, aggregated or not.
-fn plan(mcs: u8, mpdu_len: usize, n: usize) -> (usize, usize, bool) {
+/// `plan_attempt` for `n` outstanding MPDUs of `mpdu_len` octets at `mcs`
+/// with `coding`: how many fit one PPDU, the PSDU length, aggregated or not.
+fn plan(mcs: u8, coding: Coding, mpdu_len: usize, n: usize) -> (usize, usize, bool) {
     let mut fit = 0;
     for i in 0..n.min(16) {
         let ok = if i == 0 {
-            mpdu_len <= 511 || aggregated_capacity(mcs, ampdu::pre_eof_len(mpdu_len), CODING).is_ok()
+            mpdu_len <= 511 || aggregated_capacity(mcs, ampdu::pre_eof_len(mpdu_len), coding).is_ok()
         } else {
-            aggregated_capacity(mcs, ampdu::pre_eof_len_many(&vec![mpdu_len; i + 1]), CODING).is_ok()
+            aggregated_capacity(mcs, ampdu::pre_eof_len_many(&vec![mpdu_len; i + 1]), coding).is_ok()
         };
         if !ok {
             break;
@@ -196,10 +251,38 @@ fn plan(mcs: u8, mpdu_len: usize, n: usize) -> (usize, usize, bool) {
         return (1, mpdu_len, false);
     }
     let pre = if fit == 1 { ampdu::pre_eof_len(mpdu_len) } else { ampdu::pre_eof_len_many(&vec![mpdu_len; fit]) };
-    (fit, aggregated_capacity(mcs, pre, CODING).expect("fits"), true)
+    (fit, aggregated_capacity(mcs, pre, coding).expect("fits"), true)
 }
 
-fn run(policy: &Policy, link: &Link, traffic: &Traffic, channel: &Channel, duration_us: u64, seed: u64) -> Outcome {
+const GIS: [GuardInterval; 2] = [GuardInterval::Long, GuardInterval::Short];
+const CODINGS: [Coding; 2] = [Coding::Bcc, Coding::Ldpc];
+
+/// (MPDUs that fit, airtime µs) per ladder index, guard interval, coding
+/// and outstanding count.
+type Plans = Vec<[[Vec<(usize, u64)>; 2]; 2]>;
+
+fn plans(mpdu_len: usize, per_batch: usize) -> Plans {
+    LADDER
+        .iter()
+        .map(|&m| {
+            let table = |gi: GuardInterval, coding: Coding| -> Vec<(usize, u64)> {
+                (0..=per_batch)
+                    .map(|n| {
+                        if n == 0 {
+                            return (0, 0);
+                        }
+                        let (fit, psdu_len, aggregation) = plan(m, coding, mpdu_len, n);
+                        let txv = TxVector { mcs: m, gi, fec_coding: coding, aggregation, ..Default::default() };
+                        (fit, txtime_us(&txv, psdu_len).expect("txtime") as u64)
+                    })
+                    .collect()
+            };
+            [[table(GIS[0], CODINGS[0]), table(GIS[0], CODINGS[1])], [table(GIS[1], CODINGS[0]), table(GIS[1], CODINGS[1])]]
+        })
+        .collect()
+}
+
+fn run(policy: &Policy, link: &Link, traffic: &Traffic, channel: &Channel, duration_us: u64, seed: u64, mut trace: Option<&mut Vec<String>>) -> Outcome {
     let mut rng = Rng(seed);
     let mut ch = ChannelState::new(channel, &mut rng);
     let mut ctl = match policy {
@@ -208,21 +291,7 @@ fn run(policy: &Policy, link: &Link, traffic: &Traffic, channel: &Channel, durat
     };
     let hdr = if traffic.per_batch > 1 { frame::QOS_DATA_HDR_LEN } else { frame::DATA_HDR_LEN };
     let mpdu_len = hdr + traffic.body_len + 4;
-    // (fit, airtime µs) per ladder index and outstanding count.
-    let plans: Vec<Vec<(usize, u64)>> = LADDER
-        .iter()
-        .map(|&m| {
-            (0..=traffic.per_batch)
-                .map(|n| {
-                    if n == 0 {
-                        return (0, 0);
-                    }
-                    let (fit, psdu_len, agg) = plan(m, mpdu_len, n);
-                    (fit, txtime_us_coded(m, psdu_len, agg, CODING).expect("txtime") as u64)
-                })
-                .collect()
-        })
-        .collect();
+    let plans = plans(mpdu_len, traffic.per_batch);
     let mut out = Outcome::default();
     let mut t = 0u64;
     while t < duration_us {
@@ -232,16 +301,17 @@ fn run(policy: &Policy, link: &Link, traffic: &Traffic, channel: &Channel, durat
         let mut cw_exp = 4u32;
         while !pending.is_empty() && t < duration_us {
             let offered = pending.len() * mpdu_len;
-            let mcs = match policy {
+            let choice = match policy {
                 Policy::Adaptive(_) => ctl.as_mut().expect("controller").select(&PEER, failures, offered),
-                Policy::Fixed(m) => *m,
+                Policy::Fixed(c) => *c,
             };
-            let idx = LADDER.iter().position(|&m| m == mcs).expect("ladder MCS");
-            let (n_fit, airtime) = plans[idx][pending.len()];
+            let idx = ladder_index(choice.mcs);
+            let (g, c) = ((choice.gi == GuardInterval::Short) as usize, (choice.fec_coding == Coding::Ldpc) as usize);
+            let (n_fit, airtime) = plans[idx][g][c][pending.len()];
             t += 264 + (rng.next_u64() % (1u64 << cw_exp)) * 52;
             let snr = ch.snr_at(channel, t + airtime / 2, &mut rng);
             let ppdu_lost = rng.uniform() < link.loss_floor || rng.uniform() < per(0, snr, 10);
-            let p_fail = per(idx, snr, mpdu_len);
+            let p_fail = loss(choice, snr, link.spread_us, mpdu_len, link.peer_ldpc);
             let mut n_ok = 0usize;
             let mut kept = Vec::with_capacity(pending.len());
             for (i, &r) in pending.iter().enumerate() {
@@ -263,26 +333,45 @@ fn run(policy: &Policy, link: &Link, traffic: &Traffic, channel: &Channel, durat
                 out.timeout_us += link.timeout_us;
             } else {
                 t += airtime + link.rtt_us;
-                if let Some(c) = ctl.as_mut() {
-                    c.observe_snr(&PEER, snr + link.asym_db + link.est_noise_db * rng.gauss());
+                if let Some(ctl) = ctl.as_mut() {
+                    ctl.observe_snr(&PEER, snr + link.asym_db + link.est_noise_db * rng.gauss());
+                    ctl.observe_delay_spread(&PEER, link.spread_us + link.spread_noise_us * rng.gauss());
                 }
             }
-            if let Some(c) = ctl.as_mut() {
-                // As the engine judges it: at least what one PPDU at the
-                // next-lower rate would have carried of this batch (all it
-                // carried itself, at the bottom of the ladder).
-                let lower = idx.saturating_sub(1);
-                let must = if lower == idx { n_fit } else { plans[lower][pending.len()].0 };
-                c.report(&PEER, mcs, n_ok > 0 && n_ok >= must);
+            // As the engine judges it: the attempt succeeded for its rate
+            // when it delivered at least what one PPDU at the next-lower
+            // rate (the long GI at the same MCS for a short-GI attempt)
+            // would have carried of this batch, scaled by the ratio of
+            // airtime plus turnaround; the bottom of the ladder has to
+            // deliver everything. Only consecutive such failures step the
+            // rate down; any unacknowledged MPDU doubles the contention
+            // window.
+            let bar = |(fit, lower_airtime): (usize, u64)| (fit as f64 * (airtime + link.rtt_us) as f64 / (lower_airtime + link.rtt_us) as f64).ceil() as usize;
+            let must = if g == 1 {
+                bar(plans[idx][0][c][pending.len()])
+            } else if idx == 0 {
+                n_fit
+            } else {
+                bar(plans[idx - 1][0][c][pending.len()])
+            };
+            let success = n_ok > 0 && n_ok >= must.min(n_fit);
+            if let Some(tr) = &mut trace {
+                tr.push(format!("t {:>6.2} s {} fit {:>2} ok {:>2} snr {:>5.1}{}", t as f64 / 1e6, short(&choice), n_fit, n_ok, snr, if success { "" } else { " FAIL" }));
             }
+            if let Some(ctl) = ctl.as_mut() {
+                ctl.report(&PEER, choice, success);
+            }
+            failures = if success { 0 } else { failures + 1 };
             if n_ok < n_fit {
-                failures += 1;
                 cw_exp = (cw_exp + 1).min(10);
             } else {
                 cw_exp = 4;
             }
             pending = kept;
         }
+    }
+    if let (Some(tr), Some(ctl)) = (&mut trace, &ctl) {
+        tr.push(format!("{:?}", ctl.info(&PEER)));
     }
     out.time_us = t;
     out
@@ -313,20 +402,32 @@ fn scenarios() -> Vec<Scenario> {
         add("static 20 dB, hint +3 dB", Channel::Static(20.0), Link { asym_db: 3.0, ..link(150) });
         add("shadow 18±4 dB, 65 ms timeout", Channel::Shadow { mean: 18.0, sigma: 4.0, tau_s: 3.0 }, link(65));
         add("rician K3 20 dB, 65 ms timeout", Channel::Fading { mean: 20.0, doppler_hz: 5.0, k: 3.0 }, link(65));
+        add("static 20 dB, spread 0.8 µs", Channel::Static(20.0), Link { spread_us: 0.8, ..link(150) });
+        add("static 20 dB, spread 1.1 µs", Channel::Static(20.0), Link { spread_us: 1.1, ..link(150) });
+        add("static 25 dB, BCC-only peer", Channel::Static(25.0), Link { peer_ldpc: false, ..link(150) });
+        add("shadow 18±4 dB, BCC-only peer", Channel::Shadow { mean: 18.0, sigma: 4.0, tau_s: 3.0 }, Link { peer_ldpc: false, ..link(150) });
     }
     v
 }
 
 const DURATION_US: u64 = 90_000_000;
 
-/// Goodput of the best fixed MCS in a scenario (and which one).
-fn best_fixed(s: &Scenario, seed: u64) -> (f32, u8) {
-    LADDER
-        .iter()
-        .filter(|&&m| m <= 8)
-        .map(|&m| (run(&Policy::Fixed(m), &s.link, &s.traffic, &s.channel, DURATION_US, seed).goodput_kbps(), m))
-        .max_by(|a, b| a.0.total_cmp(&b.0))
-        .expect("ladder")
+/// Goodput of the best fixed MCS, guard interval and coding in a scenario
+/// (and which).
+fn best_fixed(s: &Scenario, seed: u64) -> (f32, TxChoice) {
+    let mut best: Option<(f32, TxChoice)> = None;
+    for &mcs in LADDER.iter().filter(|&&m| m <= 8) {
+        for gi in GIS {
+            for fec_coding in CODINGS {
+                let choice = TxChoice { mcs, gi, fec_coding };
+                let goodput = run(&Policy::Fixed(choice), &s.link, &s.traffic, &s.channel, DURATION_US, seed, None).goodput_kbps();
+                if best.is_none_or(|(g, _)| goodput > g) {
+                    best = Some((goodput, choice));
+                }
+            }
+        }
+    }
+    best.expect("ladder")
 }
 
 struct Score {
@@ -346,14 +447,14 @@ impl Score {
     }
 }
 
-fn evaluate(cfg: &RateConfig, scenarios: &[Scenario], references: &[(f32, u8)], seed: u64) -> Score {
+fn evaluate(cfg: &RateConfig, scenarios: &[Scenario], references: &[(f32, TxChoice)], seed: u64) -> Score {
     let per_scenario = scenarios
         .iter()
         .zip(references)
         .map(|(s, r)| {
             // As the engine does: a lost attempt costs the response timeout.
             let policy = Policy::Adaptive(RateConfig { enabled: true, fail_cost_us: s.link.timeout_us, ..cfg.clone() });
-            let o = run(&policy, &s.link, &s.traffic, &s.channel, DURATION_US, seed);
+            let o = run(&policy, &s.link, &s.traffic, &s.channel, DURATION_US, seed, None);
             (o.goodput_kbps() / r.0.max(1e-3), o.timeout_share(), o.drops)
         })
         .collect();
@@ -362,9 +463,13 @@ fn evaluate(cfg: &RateConfig, scenarios: &[Scenario], references: &[(f32, u8)], 
 
 fn describe(cfg: &RateConfig) -> String {
     format!(
-        "p_min {:.2} alpha {:.2} interval {:>2} cap {:>4} margin {:.0} rearm {:.0}",
-        cfg.p_min, cfg.alpha, cfg.probe_interval, cfg.probe_backoff_max, cfg.snr_margin_db, cfg.probe_rearm_snr_db
+        "p_min {:.2} alpha {:.2} interval {:>2} cap {:>4} margin {:.0} rearm {:.0} sgi<{:.2}µs",
+        cfg.p_min, cfg.alpha, cfg.probe_interval, cfg.probe_backoff_max, cfg.snr_margin_db, cfg.probe_rearm_snr_db, cfg.sgi_max_delay_spread_us
     )
+}
+
+fn short(c: &TxChoice) -> String {
+    format!("{:>2}{}{}", c.mcs, if c.gi == GuardInterval::Short { "S" } else { "L" }, if c.fec_coding == Coding::Ldpc { "ldpc" } else { "bcc " })
 }
 
 /// The PER model reproduces the loopback: 10 % loss of 1000-octet PSDUs
@@ -386,17 +491,40 @@ fn per_model_matches_the_controllers_table() {
 #[test]
 fn defaults_hold_up_across_the_scenarios() {
     let scenarios = scenarios();
-    let refs: Vec<(f32, u8)> = scenarios.iter().map(|s| best_fixed(s, 1)).collect();
+    let refs: Vec<(f32, TxChoice)> = scenarios.iter().map(|s| best_fixed(s, 1)).collect();
     let cfg = RateConfig::default();
     let score = evaluate(&cfg, &scenarios, &refs, 1);
     println!("{}", describe(&cfg));
-    println!("{:<44} {:>6} {:>8} {:>7} {:>5}", "scenario", "best", "adaptive", "timeout", "drops");
+    println!("{:<44} {:>8} {:>8} {:>7} {:>5}", "scenario", "best", "adaptive", "timeout", "drops");
     for ((s, r), (eff, to, drops)) in scenarios.iter().zip(&refs).zip(&score.per_scenario) {
-        println!("{:<44} MCS {:>2} {:>7.0} % {:>6.1} % {:>5}", s.name, r.1, eff * 100.0, to * 100.0, drops);
+        println!("{:<44} {} {:>7.0} % {:>6.1} % {:>5}", s.name, short(&r.1), eff * 100.0, to * 100.0, drops);
     }
     println!("mean {:.3}, min {:.3}, timeout share {:.3}", score.mean(), score.min(), score.timeout_share());
     assert!(score.mean() >= 0.93, "mean efficiency {:.3}", score.mean());
     assert!(score.min() >= 0.75, "worst scenario {:.3}", score.min());
+}
+
+/// Attempt-by-attempt trace of the defaults in the scenarios whose names
+/// start with the `S2G_TRACE` environment variable (default: the 8 dB
+/// batches); run with --ignored --nocapture.
+#[test]
+#[ignore]
+fn trace() {
+    let prefix = std::env::var("S2G_TRACE").unwrap_or_else(|_| "static 8 dB, 16x".into());
+    for s in scenarios().iter().filter(|s| s.name.starts_with(&prefix)) {
+        let policy = Policy::Adaptive(RateConfig { enabled: true, fail_cost_us: s.link.timeout_us, ..Default::default() });
+        let mut lines = Vec::new();
+        let o = run(&policy, &s.link, &s.traffic, &s.channel, 20_000_000, 1, Some(&mut lines));
+        println!("\n{}: {:.0} kbit/s, {} attempts, {} timeouts", s.name, o.goodput_kbps(), o.attempts, o.timeouts);
+        let n = lines.len();
+        for (i, l) in lines.iter().enumerate() {
+            if i < 50 || i + 40 >= n {
+                println!("{l}");
+            } else if i == 50 {
+                println!("...");
+            }
+        }
+    }
 }
 
 /// Parameter sweep behind the defaults. Prints the best configurations by
@@ -405,7 +533,7 @@ fn defaults_hold_up_across_the_scenarios() {
 #[ignore]
 fn sweep() {
     let scenarios = scenarios();
-    let refs: Vec<(f32, u8)> = scenarios.iter().map(|s| best_fixed(s, 1)).collect();
+    let refs: Vec<(f32, TxChoice)> = scenarios.iter().map(|s| best_fixed(s, 1)).collect();
     let mut rows: Vec<(f32, f32, f32, RateConfig)> = Vec::new();
     for &p_min in &[0.7f32, 0.8, 0.85, 0.9, 0.95] {
         for &alpha in &[0.1f32, 0.2, 0.3] {
@@ -435,7 +563,7 @@ fn sweep() {
     let d = RateConfig::default();
     let s = evaluate(&d, &scenarios, &refs, 1);
     println!("\ndefaults: mean {:.3} min {:.3} timeouts {:.3}  {}", s.mean(), s.min(), s.timeout_share(), describe(&d));
-    let old = RateConfig { p_min: 0.7, alpha: 0.2, probe_interval: 8, probe_backoff_max: 512, snr_margin_db: 0.0, ..Default::default() };
-    let s = evaluate(&old, &scenarios, &refs, 1);
-    println!("pre-tuning constants: mean {:.3} min {:.3} timeouts {:.3}  {}", s.mean(), s.min(), s.timeout_share(), describe(&old));
+    let mcs_only = RateConfig { gi: Adapt::Fixed(GuardInterval::Long), fec_coding: Adapt::Fixed(Coding::Bcc), ..Default::default() };
+    let s = evaluate(&mcs_only, &scenarios, &refs, 1);
+    println!("MCS only (long GI, BCC): mean {:.3} min {:.3} timeouts {:.3}", s.mean(), s.min(), s.timeout_share());
 }
